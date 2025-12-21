@@ -1,0 +1,63 @@
+# Build artifacts
+target/
+build/
+dist/
+*.egg-info/
+*.so
+*.dylib
+*.dll
+*.pyd
+wheels/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+*.cover
+.cache
+
+# Rust
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Credentials
+*.pem
+*.key
+*.crt
+*.p12
+secrets.yaml
+credentials.json
+.netrc
+
+# Large files
+*.csv
+*.parquet
+*.feather
+*.arrow
+data/
+datasets/

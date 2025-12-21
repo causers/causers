@@ -1,0 +1,27 @@
+[package]
+name = "causers"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT"
+description = "High-performance statistical operations for Polars DataFrames"
+repository = "https://github.com/yourusername/causers"
+readme = "README.md"
+
+[lib]
+name = "causers"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }
+polars = { version = "0.44", default-features = false }
+numpy = "0.21"
+ndarray = "0.16"
+
+[dev-dependencies]
+approx = "0.5"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
