@@ -5,10 +5,10 @@ A Python package with Rust backend for fast statistical computations
 on Polars DataFrames.
 """
 
-from typing import List, Union
-import polars as pl
+from typing import List as _List, Union as _Union
+import polars as _polars
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Import the Rust extension module
 from causers._causers import LinearRegressionResult, linear_regression as _linear_regression_rust
@@ -21,8 +21,8 @@ __all__ = [
 
 
 def linear_regression(
-    df: pl.DataFrame,
-    x_cols: Union[str, List[str]],
+    df: _polars.DataFrame,
+    x_cols: _Union[str, _List[str]],
     y_col: str,
     include_intercept: bool = True
 ) -> LinearRegressionResult:
@@ -61,11 +61,19 @@ def linear_regression(
             Number of samples used in the regression
         - slope : float or None
             For single covariate only, same as coefficients[0]
+        - standard_errors : List[float]
+            HC3 robust standard errors for each coefficient. These are
+            heteroskedasticity-consistent and recommended for inference
+            when error variance may not be constant.
+        - intercept_se : float or None
+            HC3 robust standard error for intercept (None if include_intercept=False)
     
     Raises
     ------
     ValueError
-        If x_cols is empty, columns don't exist, or data is invalid
+        If x_cols is empty, columns don't exist, or data is invalid.
+        Also raised if any observation has extreme leverage (>= 0.99),
+        which would make HC3 standard errors unreliable.
     
     Examples
     --------
@@ -77,6 +85,15 @@ def linear_regression(
     >>> result = causers.linear_regression(df, "x", "y")
     >>> print(f"y = {result.slope:.2f}x + {result.intercept:.2f}")
     y = 2.00x + 0.00
+    
+    Accessing standard errors:
+    
+    >>> df = pl.DataFrame({"x": [1, 2, 3, 4, 5], "y": [2.1, 3.9, 6.2, 7.8, 10.1]})
+    >>> result = causers.linear_regression(df, "x", "y")
+    >>> print(f"Coefficient: {result.coefficients[0]:.4f} ± {result.standard_errors[0]:.4f}")
+    Coefficient: 1.9900 ± 0.0682
+    >>> print(f"Intercept: {result.intercept:.4f} ± {result.intercept_se:.4f}")
+    Intercept: 0.0500 ± 0.1896
     
     Multiple covariate regression:
     
@@ -97,6 +114,11 @@ def linear_regression(
     
     Notes
     -----
+    Standard errors are computed using the HC3 (heteroskedasticity-consistent)
+    estimator, which provides robust inference even when the assumption of
+    constant error variance is violated. HC3 is recommended for general use
+    as it has good finite-sample properties (MacKinnon & White, 1985).
+    
     - For multiple covariates, ensure they are not perfectly collinear
     - NaN and infinite values may cause errors or unexpected results
     - Requires at least as many samples as parameters (including intercept)

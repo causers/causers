@@ -5,6 +5,56 @@ All notable changes to the causers project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2025-12-23
+
+### ✨ Features
+
+- **HC3 Robust Standard Errors**: Heteroskedasticity-consistent standard errors computed automatically
+  - `standard_errors` (List[float]): HC3 SE for each coefficient
+  - `intercept_se` (float | None): HC3 SE for intercept (None if `include_intercept=False`)
+  - Matches statsmodels HC3 implementation to 1e-6 relative tolerance
+  - Based on MacKinnon & White (1985) formulation
+
+- **Extreme Leverage Detection**: Automatic detection of high-leverage observations
+  - Raises `ValueError` if any observation has leverage ≥ 0.99
+  - Prevents unreliable standard error computation
+
+### 🛠️ Technical Details
+
+- Matrix inversion using Gauss-Jordan elimination with partial pivoting
+- Singularity tolerance: 1e-10
+- Leverage threshold: 0.99
+- Full backward compatibility with v0.1.0 API
+
+### 📖 API Changes
+
+**New Result Attributes:**
+- `standard_errors` (List[float]): HC3 robust standard errors for each coefficient
+- `intercept_se` (float | None): HC3 standard error for intercept
+
+**New Errors:**
+- `ValueError`: "Observation X has leverage ≥ 0.99; HC3 standard errors may be unreliable"
+
+### 📊 Performance
+
+With HC3 computation enabled:
+- 1,000 rows: ~1ms
+- 100,000 rows: ~25ms
+- 1,000,000 rows: ~250ms (regression + HC3 SE)
+- 5,000,000 rows: ~1,200ms
+
+### ⚠️ Breaking Changes
+
+- Two-observation regressions with intercept now raise `ValueError` due to extreme leverage
+- Very small values (1e-15) may trigger singular matrix errors due to stricter tolerance
+
+### 📦 Dependencies
+
+- **Test dependency**: statsmodels 0.14.0-0.16.0 (for HC3 validation tests only)
+  - Install with: `pip install causers[test]`
+
+---
+
 ## [0.1.0] - 2025-12-21
 
 ### 🎉 Initial Release
@@ -114,7 +164,7 @@ pip install causers
 
 ### 🐛 Bug Reports
 
-Please report issues at: https://github.com/yourusername/causers/issues
+Please report issues at: https://github.com/causers/causers/issues
 
 ### 📜 License
 
@@ -122,4 +172,5 @@ MIT License - see LICENSE file for details.
 
 ---
 
-[0.1.0]: https://github.com/yourusername/causers/releases/tag/v0.1.0
+[0.2.0]: https://github.com/causers/causers/releases/tag/v0.2.0
+[0.1.0]: https://github.com/causers/causers/releases/tag/v0.1.0

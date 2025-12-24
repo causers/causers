@@ -1,11 +1,11 @@
 [package]
 name = "causers"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["James Nordlund"]
 license = "MIT"
 description = "High-performance statistical operations for Polars DataFrames"
-repository = "https://github.com/yourusername/causers"
+repository = "https://github.com/causers/causers"
 readme = "README.md"
 
 [lib]

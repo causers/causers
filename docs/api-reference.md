@@ -45,7 +45,7 @@ Features:
 - 100% test coverage
 - Cross-platform support
 
-For documentation, visit: https://github.com/yourusername/causers
+For documentation, visit: https://github.com/causers/causers
 ```
 
 ## Statistical Functions
@@ -636,9 +636,9 @@ pl.Config.set_tbl_rows(10)
 
 ## Support
 
-- **Documentation**: https://github.com/yourusername/causers
-- **Issues**: https://github.com/yourusername/causers/issues
-- **Discussions**: https://github.com/yourusername/causers/discussions
+- **Documentation**: https://github.com/causers/causers
+- **Issues**: https://github.com/causers/causers/issues
+- **Discussions**: https://github.com/causers/causers/discussions
 - **Security**: Report to security@example.com
 
 ---

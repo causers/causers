@@ -98,8 +98,6 @@ python examples/basic_regression.py
 
 ## Documentation
 
-- **AGENTS.md**: Complete operating manual for AI agents
-- **constitution.md**: Core invariants that must never be violated
 - **CONTRIBUTING.md**: Development workflow and guidelines
 - **README.md**: User-facing documentation with examples
 

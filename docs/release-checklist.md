@@ -227,8 +227,8 @@ pip install causers
 ```
 
 ## 📖 Documentation
-- [README](https://github.com/yourusername/causers#readme)
-- [CHANGELOG](https://github.com/yourusername/causers/blob/main/CHANGELOG.md)
+- [README](https://github.com/causers/causers#readme)
+- [CHANGELOG](https://github.com/causers/causers/blob/main/CHANGELOG.md)
 - [API Docs](https://causers.readthedocs.io)
 
 ## 🔒 Security
@@ -254,7 +254,7 @@ pip install causers
 
 ### 2. Create GitHub Release
 
-1. Go to: https://github.com/yourusername/causers/releases/new
+1. Go to: https://github.com/causers/causers/releases/new
 2. Choose tag: `v0.1.0`
 3. Release title: `causers v0.1.0 - Initial Release`
 4. Paste release notes
@@ -370,7 +370,7 @@ Copy this for each release:
 
 - **Release Manager**: [Your Name]
 - **Security Issues**: security@example.com
-- **General Support**: https://github.com/yourusername/causers/issues
+- **General Support**: https://github.com/causers/causers/issues
 
 ---
 

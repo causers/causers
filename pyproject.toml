@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "causers"
-version = "0.1.0"
+version = "0.2.0"
 description = "High-performance statistical operations for Polars DataFrames"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -43,11 +43,16 @@ dev = [
     "mypy>=1.0",
     "maturin>=1.4",
 ]
+test = [
+    "pytest>=7.0",
+    "numpy>=1.20",
+    "statsmodels>=0.14.0,<0.16.0",
+]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/causers"
-Repository = "https://github.com/yourusername/causers"
-Issues = "https://github.com/yourusername/causers/issues"
+Homepage = "https://github.com/causers/causers"
+Repository = "https://github.com/causers/causers"
+Issues = "https://github.com/causers/causers/issues"
 
 [tool.maturin]
 # Python source directory

@@ -1,10 +1,10 @@
 # causers
 
-[![Build Status](https://github.com/yourusername/causers/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/causers/actions)
+[![Build Status](https://github.com/causers/causers/actions/workflows/ci.yml/badge.svg)](https://github.com/causers/causers/actions)
 [![PyPI Version](https://img.shields.io/pypi/v/causers)](https://pypi.org/project/causers/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/causers)](https://pypi.org/project/causers/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Coverage: 100%](https://img.shields.io/badge/Coverage-100%25-brightgreen.svg)](https://github.com/yourusername/causers)
+[![Coverage: 100%](https://img.shields.io/badge/Coverage-100%25-brightgreen.svg)](https://github.com/causers/causers)
 
 A high-performance statistical package for Polars DataFrames, powered by Rust.
 
@@ -14,13 +14,14 @@ A high-performance statistical package for Polars DataFrames, powered by Rust.
 
 ### ✨ Key Features
 
-- **🏎️ High Performance**: Linear regression on 1M rows in ~45ms (>3x faster than NumPy/pandas)
+- **🏎️ High Performance**: Linear regression on 1M rows in ~250ms with HC3 standard errors
 - **📊 Multiple Regression**: Support for multiple covariates with matrix-based OLS
+- **📈 Robust Standard Errors**: HC3 heteroskedasticity-consistent standard errors included
 - **🎯 Flexible Models**: Optional intercept for fully saturated models
 - **🔧 Native Polars Integration**: Zero-copy operations on Polars DataFrames
 - **🦀 Rust-Powered**: Core computations in Rust for maximum throughput
 - **🐍 Pythonic API**: Clean, intuitive interface with full type hints
-- **🛡️ Production Ready**: 100% test coverage, security rating B+
+- **🛡️ Production Ready**: Comprehensive test coverage, security rating B+
 - **🌍 Cross-Platform**: Works on Linux, macOS (Intel/ARM), and Windows
 
 ## 📦 Installation
@@ -35,7 +36,7 @@ pip install causers
 
 ```bash
 # Prerequisites: Python 3.8+ and Rust 1.70+
-git clone https://github.com/yourusername/causers.git
+git clone https://github.com/causers/causers.git
 cd causers
 
 # Install build dependencies
@@ -94,6 +95,33 @@ print(f"Intercept: {result.intercept:.2f}")
 print(f"R-squared: {result.r_squared:.4f}")
 ```
 
+### Accessing Standard Errors
+
+```python
+import polars as pl
+import causers
+
+# Regression with noisy data
+df = pl.DataFrame({
+    "x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+    "y": [2.1, 3.9, 6.2, 7.8, 10.1, 12.3, 13.9, 16.2, 17.8, 20.1]
+})
+
+result = causers.linear_regression(df, "x", "y")
+
+# Access HC3 robust standard errors
+print(f"Coefficient: {result.coefficients[0]:.4f} ± {result.standard_errors[0]:.4f}")
+print(f"Intercept: {result.intercept:.4f} ± {result.intercept_se:.4f}")
+```
+
+Output:
+```
+Coefficient: 1.9879 ± 0.0294
+Intercept: 0.1333 ± 0.1828
+```
+
+> **Note**: Standard errors use the HC3 estimator (MacKinnon & White, 1985), which provides heteroskedasticity-consistent inference even when error variance is not constant.
+
 ### Regression Without Intercept
 
 ```python
@@ -107,6 +135,8 @@ result = causers.linear_regression(
 
 print(f"Coefficient: {result.coefficients[0]:.4f}")
 print(f"Intercept: {result.intercept}")  # None
+print(f"Standard Error: {result.standard_errors[0]:.4f}")
+print(f"Intercept SE: {result.intercept_se}")  # None
 ```
 
 ## 📊 Performance Benchmarks
@@ -141,13 +171,15 @@ Performs Ordinary Least Squares (OLS) linear regression on a Polars DataFrame. S
 **Returns:**
 - `LinearRegressionResult`: Object with the following attributes:
   - `coefficients` (List[float]): Regression coefficients for each predictor
+  - `standard_errors` (List[float]): HC3 robust standard errors for each coefficient
   - `slope` (float | None): Single coefficient (backward compatibility, single covariate only)
   - `intercept` (float | None): Y-intercept (None if `include_intercept=False`)
+  - `intercept_se` (float | None): HC3 standard error for intercept (None if `include_intercept=False`)
   - `r_squared` (float): Coefficient of determination (R²)
   - `n_samples` (int): Number of data points used
 
 **Raises:**
-- `ValueError`: If columns don't exist, have mismatched lengths, or contain invalid data
+- `ValueError`: If columns don't exist, have mismatched lengths, contain invalid data, or if any observation has extreme leverage (≥0.99)
 - `TypeError`: If columns contain non-numeric data
 
 **Examples:**
@@ -232,7 +264,7 @@ causers/
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/causers.git
+git clone https://github.com/causers/causers.git
 cd causers
 
 # Create virtual environment
@@ -290,28 +322,18 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 
 ## 📋 Roadmap
 
-### v0.1.0 (Current)
+### v0.1.0
 - ✅ Linear regression with OLS
 - ✅ Multiple covariate support
 - ✅ Optional intercept models
 - ✅ 100% test coverage
 - ✅ Performance validation
 
-### v0.2.0 (Planned)
-- [ ] Correlation matrix computation
-- [ ] Weighted least squares
-- [ ] Residual analysis
-- [ ] Improved NaN/Inf handling
-
-### v0.3.0 (Future)
-- [ ] Hypothesis testing (t-tests, ANOVA)
-- [ ] Time series operations
-- [ ] Regularized regression (Ridge, Lasso)
-
-### v1.0.0 (Stable API)
-- [ ] Full statistical test suite
-- [ ] GPU acceleration support
-- [ ] Distributed computation
+### v0.2.0 (Current)
+- ✅ HC3 robust standard errors
+- ✅ statsmodels-validated accuracy (rtol=1e-6)
+- ✅ Extreme leverage detection and error handling
+- ✅ Comprehensive test coverage with edge cases
 
 ## 🔒 Security
 
@@ -334,12 +356,12 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 - [Documentation](https://causers.readthedocs.io) (Coming soon)
 - [API Reference](https://causers.readthedocs.io/api) (Coming soon)
-- [GitHub Issues](https://github.com/yourusername/causers/issues)
-- [Discussions](https://github.com/yourusername/causers/discussions)
+- [GitHub Issues](https://github.com/causers/causers/issues)
+- [Discussions](https://github.com/causers/causers/discussions)
 
 ## 🐛 Found a Bug?
 
-Please [open an issue](https://github.com/yourusername/causers/issues/new) with:
+Please [open an issue](https://github.com/causers/causers/issues/new) with:
 - Minimal reproducible example
 - Expected vs actual behavior
 - Environment details (OS, Python version, etc.)

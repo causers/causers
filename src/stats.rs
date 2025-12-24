@@ -15,6 +15,12 @@ pub struct LinearRegressionResult {
     // Keep slope for backward compatibility (single covariate case)
     #[pyo3(get)]
     pub slope: Option<f64>,
+    // HC3 robust standard errors for each coefficient
+    #[pyo3(get)]
+    pub standard_errors: Vec<f64>,
+    // HC3 robust standard error for intercept (None if include_intercept=False)
+    #[pyo3(get)]
+    pub intercept_se: Option<f64>,
 }
 
 #[pymethods]
@@ -24,9 +30,13 @@ impl LinearRegressionResult {
             Some(i) => format!("{:.6}", i),
             None => "None".to_string(),
         };
+        let intercept_se_str = match self.intercept_se {
+            Some(se) => format!("{:.6}", se),
+            None => "None".to_string(),
+        };
         format!(
-            "LinearRegressionResult(coefficients={:?}, intercept={}, r_squared={:.6}, n_samples={})",
-            self.coefficients, intercept_str, self.r_squared, self.n_samples
+            "LinearRegressionResult(coefficients={:?}, intercept={}, r_squared={:.6}, n_samples={}, standard_errors={:?}, intercept_se={})",
+            self.coefficients, intercept_str, self.r_squared, self.n_samples, self.standard_errors, intercept_se_str
         )
     }
     
@@ -37,9 +47,15 @@ impl LinearRegressionResult {
         };
         
         if self.coefficients.len() == 1 {
+            // For single covariate, show coefficient with SE
+            let se_str = if !self.standard_errors.is_empty() {
+                format!(" ± {:.6}", self.standard_errors[0])
+            } else {
+                "".to_string()
+            };
             format!(
-                "y = {:.6}x{}(R² = {:.6}, n = {})",
-                self.coefficients[0], intercept_str, self.r_squared, self.n_samples
+                "y = {:.6}{}x{}(R² = {:.6}, n = {})",
+                self.coefficients[0], se_str, intercept_str, self.r_squared, self.n_samples
             )
         } else {
             let terms: Vec<String> = self.coefficients.iter()
@@ -144,34 +160,68 @@ pub fn compute_linear_regression(
         xty[i] = sum;
     }
     
-    // Solve (X'X)β = X'y using Gaussian elimination
-    let coefficients_full = solve_linear_system(&xtx, &xty)?;
+    // Compute (X'X)^-1 and use it for both coefficient estimation and HC3
+    // This enables matrix reuse per REQ-014
+    let xtx_inv = invert_matrix(&xtx)?;
     
-    // Calculate R-squared using full coefficients before extracting
-    let y_mean = y.iter().sum::<f64>() / (n as f64);
-    let mut ss_res = 0.0;
-    let mut ss_tot = 0.0;
+    // Compute coefficients: β = (X'X)^-1 X'y
+    let coefficients_full = matrix_vector_multiply(&xtx_inv, &xty);
     
-    for i in 0..n {
+    // Compute residuals explicitly: e = y - Xβ
+    let residuals: Vec<f64> = (0..n).map(|i| {
         let mut y_pred = 0.0;
         for j in 0..n_params {
             y_pred += coefficients_full[j] * design_matrix[i][j];
         }
-        ss_res += (y[i] - y_pred).powi(2);
-        ss_tot += (y[i] - y_mean).powi(2);
-    }
+        y[i] - y_pred
+    }).collect();
+    
+    // Calculate R-squared
+    let y_mean = y.iter().sum::<f64>() / (n as f64);
+    let ss_res: f64 = residuals.iter().map(|r| r.powi(2)).sum();
+    let ss_tot: f64 = y.iter().map(|yi| (yi - y_mean).powi(2)).sum();
+    
+    let r_squared = if ss_tot == 0.0 {
+        0.0
+    } else {
+        1.0 - (ss_res / ss_tot)
+    };
+    
+    // Compute HC3 standard errors
+    // Handle perfect fit case: when all residuals are zero, SE should be zero
+    let (intercept_se, standard_errors) = if residuals.iter().all(|&r| r == 0.0) {
+        // Perfect fit case (R² = 1.0): all standard errors are zero
+        if include_intercept {
+            (Some(0.0), vec![0.0; n_vars])
+        } else {
+            (None, vec![0.0; n_vars])
+        }
+    } else {
+        // Normal HC3 computation
+        // Compute leverage values h_ii = x_i' (X'X)^-1 x_i
+        let leverages = compute_leverages(&design_matrix, &xtx_inv)?;
+        
+        // Compute HC3 variance-covariance matrix
+        let hc3_vcov = compute_hc3_vcov(&design_matrix, &residuals, &leverages, &xtx_inv);
+        
+        // Extract standard errors from diagonal of variance-covariance matrix
+        if include_intercept {
+            // intercept_se is SE for β_0, standard_errors is SE for β_1, β_2, ...
+            let intercept_se_val = hc3_vcov[0][0].sqrt();
+            let se_vec: Vec<f64> = (1..n_params).map(|i| hc3_vcov[i][i].sqrt()).collect();
+            (Some(intercept_se_val), se_vec)
+        } else {
+            // No intercept: all standard errors for coefficients
+            let se_vec: Vec<f64> = (0..n_params).map(|i| hc3_vcov[i][i].sqrt()).collect();
+            (None, se_vec)
+        }
+    };
     
     // Extract intercept and coefficients
     let (intercept, coefficients) = if include_intercept {
         (Some(coefficients_full[0]), coefficients_full[1..].to_vec())
     } else {
         (None, coefficients_full)
-    };
-    
-    let r_squared = if ss_tot == 0.0 {
-        0.0
-    } else {
-        1.0 - (ss_res / ss_tot)
     };
     
     // For backward compatibility with single covariate
@@ -187,6 +237,8 @@ pub fn compute_linear_regression(
         r_squared,
         n_samples: n,
         slope,
+        standard_errors,
+        intercept_se,
     })
 }
 
@@ -251,6 +303,283 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> PyResult<Vec<f64>> {
     }
     
     Ok(x)
+}
+
+/// Invert a square matrix using Gauss-Jordan elimination with partial pivoting.
+///
+/// This function computes the inverse of a square matrix A by augmenting it with
+/// the identity matrix [A|I] and performing row operations until the left side
+/// becomes the identity, at which point the right side is A^-1.
+///
+/// # Arguments
+/// * `a` - Square matrix to invert (n × n)
+///
+/// # Returns
+/// * `PyResult<Vec<Vec<f64>>>` - Inverse matrix (n × n) or error if singular
+///
+/// # Errors
+/// * `PyValueError` if matrix is singular (pivot element < 1e-10)
+///
+/// # Algorithm
+/// 1. Create augmented matrix [A|I] of size (n × 2n)
+/// 2. Forward elimination with partial pivoting:
+///    - For each column i, find the row with maximum absolute value (pivot row)
+///    - Swap current row with pivot row if needed
+///    - Scale pivot row so diagonal element is 1
+///    - Eliminate all other entries in column i
+/// 3. After processing, left side is I, right side is A^-1
+fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
+    let n = a.len();
+    if n == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Cannot invert empty matrix"
+        ));
+    }
+    
+    // Verify square matrix
+    for row in a.iter() {
+        if row.len() != n {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Cannot invert non-square matrix"
+            ));
+        }
+    }
+    
+    // Create augmented matrix [A|I] of size (n × 2n)
+    let mut aug: Vec<Vec<f64>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut row = Vec::with_capacity(2 * n);
+        // Copy A into left half
+        row.extend_from_slice(&a[i]);
+        // Add identity matrix to right half
+        for j in 0..n {
+            row.push(if i == j { 1.0 } else { 0.0 });
+        }
+        aug.push(row);
+    }
+    
+    // Gauss-Jordan elimination with partial pivoting
+    for col in 0..n {
+        // Find pivot: row with maximum absolute value in current column
+        let mut max_row = col;
+        let mut max_val = aug[col][col].abs();
+        for row in (col + 1)..n {
+            let val = aug[row][col].abs();
+            if val > max_val {
+                max_val = val;
+                max_row = row;
+            }
+        }
+        
+        // Check for singularity (pivot too small)
+        if max_val < 1e-10 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Singular matrix: cannot solve linear regression (X'X is not invertible, check for collinearity)"
+            ));
+        }
+        
+        // Swap rows if needed
+        if max_row != col {
+            aug.swap(col, max_row);
+        }
+        
+        // Scale pivot row so diagonal element becomes 1
+        let pivot = aug[col][col];
+        for j in 0..(2 * n) {
+            aug[col][j] /= pivot;
+        }
+        
+        // Eliminate all other entries in this column (both above and below pivot)
+        for row in 0..n {
+            if row != col {
+                let factor = aug[row][col];
+                for j in 0..(2 * n) {
+                    aug[row][j] -= factor * aug[col][j];
+                }
+            }
+        }
+    }
+    
+    // Extract inverse from right half of augmented matrix
+    let mut inverse: Vec<Vec<f64>> = Vec::with_capacity(n);
+    for i in 0..n {
+        inverse.push(aug[i][n..(2 * n)].to_vec());
+    }
+    
+    Ok(inverse)
+}
+
+/// Multiply a matrix by a vector: result = A × v
+///
+/// Computes the matrix-vector product where A is (m × n) and v is (n,),
+/// producing a result vector of length m.
+///
+/// # Arguments
+/// * `a` - Matrix of shape (m × n)
+/// * `v` - Vector of length n
+///
+/// # Returns
+/// * `Vec<f64>` - Result vector of length m
+fn matrix_vector_multiply(a: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
+    let m = a.len();
+    let mut result = Vec::with_capacity(m);
+    
+    for row in a.iter() {
+        let mut sum = 0.0;
+        for (j, &val) in row.iter().enumerate() {
+            sum += val * v[j];
+        }
+        result.push(sum);
+    }
+    
+    result
+}
+
+/// Multiply two matrices: C = A × B
+///
+/// Computes the matrix product where A is (m × k) and B is (k × n),
+/// producing a result matrix of shape (m × n).
+///
+/// # Arguments
+/// * `a` - Matrix of shape (m × k)
+/// * `b` - Matrix of shape (k × n)
+///
+/// # Returns
+/// * `Vec<Vec<f64>>` - Result matrix of shape (m × n)
+fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let m = a.len();
+    if m == 0 {
+        return vec![];
+    }
+    let k = a[0].len();
+    if k == 0 || b.is_empty() {
+        return vec![vec![]; m];
+    }
+    let n = b[0].len();
+    
+    let mut result = vec![vec![0.0; n]; m];
+    
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0;
+            for l in 0..k {
+                sum += a[i][l] * b[l][j];
+            }
+            result[i][j] = sum;
+        }
+    }
+    
+    result
+}
+
+/// Compute leverage values h_ii = x_i' (X'X)^-1 x_i for each observation.
+///
+/// The leverage of an observation measures its influence on the regression fit.
+/// High leverage points have unusual predictor values and can unduly influence
+/// the fitted model. The leverage values are the diagonal elements of the
+/// hat matrix H = X(X'X)^-1X'.
+///
+/// This implementation uses the efficient formula h_ii = x_i' (X'X)^-1 x_i
+/// which avoids forming the full hat matrix (O(n·k²) instead of O(n²)).
+///
+/// # Arguments
+/// * `design_matrix` - Design matrix X of shape (n × p)
+/// * `xtx_inv` - Inverse of X'X of shape (p × p)
+///
+/// # Returns
+/// * `PyResult<Vec<f64>>` - Leverage values (n,) or error if extreme leverage detected
+///
+/// # Errors
+/// * `PyValueError` if any h_ii >= 0.99 (extreme leverage makes HC3 unreliable)
+fn compute_leverages(
+    design_matrix: &[Vec<f64>],
+    xtx_inv: &[Vec<f64>]
+) -> PyResult<Vec<f64>> {
+    let n = design_matrix.len();
+    let mut leverages = Vec::with_capacity(n);
+    
+    for (i, x_i) in design_matrix.iter().enumerate() {
+        // Compute temp = (X'X)^-1 × x_i (matrix-vector multiply)
+        let temp = matrix_vector_multiply(xtx_inv, x_i);
+        
+        // Compute h_ii = x_i · temp (dot product)
+        let mut h_ii = 0.0;
+        for (j, &x_ij) in x_i.iter().enumerate() {
+            h_ii += x_ij * temp[j];
+        }
+        
+        // Check for extreme leverage (>= 0.99 makes (1 - h_ii)^2 too small)
+        if h_ii >= 0.99 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!(
+                    "Observation {} has leverage ≥ 0.99; HC3 standard errors may be unreliable due to extreme leverage.",
+                    i
+                )
+            ));
+        }
+        
+        leverages.push(h_ii);
+    }
+    
+    Ok(leverages)
+}
+
+/// Compute HC3 variance-covariance matrix using the sandwich formula.
+///
+/// The HC3 estimator is a heteroskedasticity-consistent covariance matrix estimator
+/// that provides robust standard errors even when the error variance is not constant
+/// across observations. It was proposed by MacKinnon & White (1985) and has good
+/// finite-sample properties.
+///
+/// Formula: Var(β) = (X'X)^-1 × meat × (X'X)^-1
+/// where meat = X' Ω X and Ω is diagonal with Ω_ii = e_i² / (1 - h_ii)²
+///
+/// The HC3 adjustment (1 - h_ii)² in the denominator gives more weight to observations
+/// with high leverage, which provides better small-sample performance than HC0-HC2.
+///
+/// # Arguments
+/// * `design_matrix` - Design matrix X of shape (n × p)
+/// * `residuals` - OLS residuals e = y - Xβ of shape (n,)
+/// * `leverages` - Leverage values h_ii of shape (n,)
+/// * `xtx_inv` - Inverse of X'X of shape (p × p)
+///
+/// # Returns
+/// * `Vec<Vec<f64>>` - HC3 variance-covariance matrix (p × p)
+fn compute_hc3_vcov(
+    design_matrix: &[Vec<f64>],
+    residuals: &[f64],
+    leverages: &[f64],
+    xtx_inv: &[Vec<f64>]
+) -> Vec<Vec<f64>> {
+    let n = design_matrix.len();
+    let p = xtx_inv.len();
+    
+    // Compute the "meat" of the sandwich: X' Ω X
+    // where Ω_ii = e_i² / (1 - h_ii)²
+    // This is computed efficiently in a single pass over observations
+    let mut meat = vec![vec![0.0; p]; p];
+    
+    for i in 0..n {
+        // HC3 weight: e_i² / (1 - h_ii)²
+        let one_minus_h = 1.0 - leverages[i];
+        let omega_ii = residuals[i].powi(2) / one_minus_h.powi(2);
+        
+        // Accumulate x_i' × omega_ii × x_i into meat matrix
+        // meat[j][k] += x_ij * omega_ii * x_ik
+        for j in 0..p {
+            for k in 0..p {
+                meat[j][k] += design_matrix[i][j] * omega_ii * design_matrix[i][k];
+            }
+        }
+    }
+    
+    // Compute sandwich: (X'X)^-1 × meat × (X'X)^-1
+    // First: temp = (X'X)^-1 × meat
+    let temp = matrix_multiply(xtx_inv, &meat);
+    // Then: result = temp × (X'X)^-1
+    let hc3_vcov = matrix_multiply(&temp, xtx_inv);
+    
+    hc3_vcov
 }
 
 #[cfg(test)]
