@@ -19,7 +19,7 @@ The current version of the package as a string.
 ```python
 >>> import causers
 >>> print(causers.__version__)
-'0.1.0'
+'0.3.0'
 ```
 
 #### `causers.about()`
@@ -34,18 +34,14 @@ def about() -> None
 **Example:**
 ```python
 >>> causers.about()
-causers version 0.1.0
+causers version 0.3.0
 High-performance statistical operations for Polars DataFrames
 Powered by Rust via PyO3/maturin
 
 Features:
-- Linear regression (OLS)
-- Native Polars integration
-- >3x faster than NumPy/pandas
-- 100% test coverage
-- Cross-platform support
-
-For documentation, visit: https://github.com/causers/causers
+  - Linear regression with HC3 robust standard errors
+  - Cluster-robust standard errors (analytical and bootstrap)
+  - Wild cluster bootstrap for small cluster counts
 ```
 
 ## Statistical Functions
@@ -60,7 +56,11 @@ def linear_regression(
     df: polars.DataFrame,
     x_cols: str | List[str],
     y_col: str,
-    include_intercept: bool = True
+    include_intercept: bool = True,
+    cluster: str | None = None,
+    bootstrap: bool = False,
+    bootstrap_iterations: int = 1000,
+    seed: int | None = None
 ) -> LinearRegressionResult
 ```
 
@@ -72,6 +72,10 @@ def linear_regression(
 | `x_cols` | `str \| List[str]` | Name(s) of independent variable column(s). Single covariate: `"feature"`. Multiple covariates: `["size", "age", "bedrooms"]`. Must contain numeric data. |
 | `y_col` | `str` | Name of the dependent variable column (response). Must contain numeric data. |
 | `include_intercept` | `bool` | Whether to include an intercept term. Default: `True`. Set to `False` for regression through origin (fully saturated models). |
+| `cluster` | `str \| None` | Column name for cluster identifiers. When specified, computes cluster-robust standard errors instead of HC3. Supports integer, string, or categorical columns. Default: `None`. |
+| `bootstrap` | `bool` | If `True` and `cluster` is specified, use wild cluster bootstrap for standard error computation. Requires `cluster` to be specified. Recommended when number of clusters is less than 42. Default: `False`. |
+| `bootstrap_iterations` | `int` | Number of bootstrap replications when `bootstrap=True`. Default: `1000`. |
+| `seed` | `int \| None` | Random seed for reproducibility when using bootstrap. When `None`, uses a random seed which may produce different results each call. Default: `None`. |
 
 **Returns:**
 
@@ -81,14 +85,32 @@ def linear_regression(
 - `intercept` (float | None): Y-intercept (β₀). `None` when `include_intercept=False`
 - `r_squared` (float): Coefficient of determination (R²) ∈ [0, 1]
 - `n_samples` (int): Number of data points used
+- `standard_errors` (List[float]): Robust standard errors for each coefficient. Uses HC3 by default, or cluster-robust SE if `cluster` is specified.
+- `intercept_se` (float | None): Robust standard error for intercept. `None` when `include_intercept=False`.
+- `n_clusters` (int | None): Number of unique clusters. `None` if `cluster` not specified.
+- `cluster_se_type` (str | None): Type of clustered SE: `"analytical"` or `"bootstrap"`. `None` if not clustered.
+- `bootstrap_iterations_used` (int | None): Number of bootstrap iterations. `None` if not bootstrap.
 
 **Raises:**
 
 | Exception | Condition |
 |-----------|-----------|
 | `ValueError` | Column doesn't exist, data is empty, or x values have zero variance |
+| `ValueError` | Cluster column contains null values |
+| `ValueError` | `bootstrap=True` without `cluster` specified |
+| `ValueError` | Fewer than 2 clusters detected |
+| `ValueError` | Single-observation clusters exist (analytical mode only) |
+| `ValueError` | Numerical instability detected (condition number > 1e10) |
+| `ValueError` | `bootstrap_iterations < 1` |
 | `TypeError` | Column contains non-numeric data |
 | `RuntimeError` | Unexpected error in Rust implementation |
+
+**Warns:**
+
+| Warning | Condition |
+|---------|-----------|
+| `UserWarning` | Fewer than 42 clusters with `bootstrap=False`: recommends using wild cluster bootstrap for more accurate inference. |
+| `UserWarning` | Cluster column has float dtype: implicit cast to string. |
 
 **Examples:**
 
@@ -177,6 +199,47 @@ print(f"Processed {result.n_samples:,} samples")
 print(f"Coefficients: {result.coefficients}")
 ```
 
+**Clustered standard errors (analytical):**
+```python
+# Panel data with firm-level clustering
+panel_df = pl.DataFrame({
+    "treatment": [0, 0, 1, 1, 0, 0, 1, 1, 0, 1],
+    "outcome": [5, 6, 12, 14, 4, 7, 11, 15, 5, 13],
+    "firm_id": [1, 1, 1, 1, 2, 2, 2, 2, 3, 3]
+})
+
+result = causers.linear_regression(
+    panel_df,
+    x_cols="treatment",
+    y_col="outcome",
+    cluster="firm_id"
+)
+
+print(f"Treatment effect: {result.coefficients[0]:.4f}")
+print(f"Clustered SE: {result.standard_errors[0]:.4f}")
+print(f"Number of clusters: {result.n_clusters}")
+print(f"SE type: {result.cluster_se_type}")
+```
+
+**Wild cluster bootstrap (recommended for <42 clusters):**
+```python
+# When you have few clusters, use bootstrap for more reliable inference
+result = causers.linear_regression(
+    panel_df,
+    x_cols="treatment",
+    y_col="outcome",
+    cluster="firm_id",
+    bootstrap=True,
+    bootstrap_iterations=1000,
+    seed=42  # For reproducibility
+)
+
+print(f"Treatment effect: {result.coefficients[0]:.4f}")
+print(f"Bootstrap SE: {result.standard_errors[0]:.4f}")
+print(f"SE type: {result.cluster_se_type}")  # "bootstrap"
+print(f"Iterations used: {result.bootstrap_iterations_used}")
+```
+
 **Mathematical Details:**
 
 The linear regression fits the model:
@@ -229,6 +292,11 @@ Container for linear regression results.
 | `intercept` | `float \| None` | Y-intercept (β₀) representing predicted y when all x = 0. `None` when `include_intercept=False` |
 | `r_squared` | `float` | Coefficient of determination, proportion of variance explained ∈ [0, 1] |
 | `n_samples` | `int` | Number of valid data points used in regression |
+| `standard_errors` | `List[float]` | Robust standard errors for each coefficient. HC3 (default) or cluster-robust when `cluster` specified. |
+| `intercept_se` | `float \| None` | Robust standard error for intercept. `None` when `include_intercept=False`. |
+| `n_clusters` | `int \| None` | Number of unique clusters. `None` if `cluster` not specified. |
+| `cluster_se_type` | `str \| None` | Type of clustered SE: `"analytical"` or `"bootstrap"`. `None` if not clustered. |
+| `bootstrap_iterations_used` | `int \| None` | Number of bootstrap iterations used. `None` if not bootstrap. |
 
 **Methods:**
 
@@ -574,13 +642,13 @@ result = causers.linear_regression(df, x_cols=["x1", "x2"], y_col="y")
 
 ## Limitations
 
-### Current Limitations (v0.1.0)
+### Current Limitations (v0.3.0)
 
-1. **NaN/Inf handling**: Special values not fully validated (fix in v0.2.0)
+1. **Single-way clustering only**: Multi-way clustering (e.g., two-way by firm and time) not yet supported
 2. **No weights**: Weighted least squares not implemented
 3. **No regularization**: Ridge/Lasso regression not available
-4. **No confidence intervals**: Statistical inference not included
-5. **No standard errors**: Coefficient uncertainty not provided
+4. **No confidence intervals**: P-values and confidence intervals not included (SE available)
+5. **Bootstrap parallelization**: Bootstrap iterations run sequentially (parallelization planned)
 
 ### Memory Limitations
 
@@ -643,4 +711,4 @@ pl.Config.set_tbl_rows(10)
 
 ---
 
-Last updated: 2025-12-21 | causers v0.1.0
+Last updated: 2025-12-24 | causers v0.3.0

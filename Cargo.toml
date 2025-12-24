@@ -10,16 +10,21 @@ readme = "README.md"
 
 [lib]
 name = "causers"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }
+pyo3 = { version = "0.21", features = ["abi3-py38"] }
 polars = { version = "0.44", default-features = false }
 numpy = "0.21"
 ndarray = "0.16"
 
 [dev-dependencies]
 approx = "0.5"
+pyo3 = { version = "0.21", features = ["auto-initialize"] }
 
 [profile.release]
 lto = true

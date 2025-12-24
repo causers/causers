@@ -15,12 +15,21 @@ pub struct LinearRegressionResult {
     // Keep slope for backward compatibility (single covariate case)
     #[pyo3(get)]
     pub slope: Option<f64>,
-    // HC3 robust standard errors for each coefficient
+    // HC3 robust standard errors for each coefficient (or clustered SE if cluster specified)
     #[pyo3(get)]
     pub standard_errors: Vec<f64>,
     // HC3 robust standard error for intercept (None if include_intercept=False)
     #[pyo3(get)]
     pub intercept_se: Option<f64>,
+    // NEW: Number of unique clusters (None if not clustered)
+    #[pyo3(get)]
+    pub n_clusters: Option<usize>,
+    // NEW: Type of clustered SE ("analytical" or "bootstrap", None if not clustered)
+    #[pyo3(get)]
+    pub cluster_se_type: Option<String>,
+    // NEW: Number of bootstrap iterations used (None if not bootstrap)
+    #[pyo3(get)]
+    pub bootstrap_iterations_used: Option<usize>,
 }
 
 #[pymethods]
@@ -34,18 +43,30 @@ impl LinearRegressionResult {
             Some(se) => format!("{:.6}", se),
             None => "None".to_string(),
         };
+        let n_clusters_str = match self.n_clusters {
+            Some(n) => n.to_string(),
+            None => "None".to_string(),
+        };
+        let cluster_se_type_str = match &self.cluster_se_type {
+            Some(s) => format!("\"{}\"", s),
+            None => "None".to_string(),
+        };
+        let bootstrap_iter_str = match self.bootstrap_iterations_used {
+            Some(b) => b.to_string(),
+            None => "None".to_string(),
+        };
         format!(
-            "LinearRegressionResult(coefficients={:?}, intercept={}, r_squared={:.6}, n_samples={}, standard_errors={:?}, intercept_se={})",
-            self.coefficients, intercept_str, self.r_squared, self.n_samples, self.standard_errors, intercept_se_str
+            "LinearRegressionResult(coefficients={:?}, intercept={}, r_squared={:.6}, n_samples={}, standard_errors={:?}, intercept_se={}, n_clusters={}, cluster_se_type={}, bootstrap_iterations_used={})",
+            self.coefficients, intercept_str, self.r_squared, self.n_samples, self.standard_errors, intercept_se_str, n_clusters_str, cluster_se_type_str, bootstrap_iter_str
         )
     }
-    
+
     fn __str__(&self) -> String {
         let intercept_str = match self.intercept {
             Some(i) => format!(" + {:.6}", i),
             None => "".to_string(),
         };
-        
+
         if self.coefficients.len() == 1 {
             // For single covariate, show coefficient with SE
             let se_str = if !self.standard_errors.is_empty() {
@@ -58,13 +79,18 @@ impl LinearRegressionResult {
                 self.coefficients[0], se_str, intercept_str, self.r_squared, self.n_samples
             )
         } else {
-            let terms: Vec<String> = self.coefficients.iter()
+            let terms: Vec<String> = self
+                .coefficients
+                .iter()
                 .enumerate()
                 .map(|(i, &c)| format!("{:.6}*x{}", c, i + 1))
                 .collect();
             format!(
                 "y = {}{}(R² = {:.6}, n = {})",
-                terms.join(" + "), intercept_str, self.r_squared, self.n_samples
+                terms.join(" + "),
+                intercept_str,
+                self.r_squared,
+                self.n_samples
             )
         }
     }
@@ -85,39 +111,44 @@ pub fn compute_linear_regression(
 ) -> PyResult<LinearRegressionResult> {
     if x.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "Cannot perform regression on empty data"
+            "Cannot perform regression on empty data",
         ));
     }
-    
+
     let n = x.len();
     if n != y.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            format!("x and y must have the same number of rows: x has {}, y has {}", n, y.len())
-        ));
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "x and y must have the same number of rows: x has {}, y has {}",
+            n,
+            y.len()
+        )));
     }
-    
+
     if n == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "Cannot perform regression on empty data"
+            "Cannot perform regression on empty data",
         ));
     }
-    
+
     let n_vars = x[0].len();
     if n_vars == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "x must have at least one variable"
+            "x must have at least one variable",
         ));
     }
-    
+
     // Check all rows have same number of variables
     for (i, row) in x.iter().enumerate() {
         if row.len() != n_vars {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("All rows in x must have the same number of variables: row {} has {}, expected {}", i, row.len(), n_vars)
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "All rows in x must have the same number of variables: row {} has {}, expected {}",
+                i,
+                row.len(),
+                n_vars
+            )));
         }
     }
-    
+
     // Build design matrix X
     let mut design_matrix = Vec::new();
     for i in 0..n {
@@ -128,16 +159,17 @@ pub fn compute_linear_regression(
         row.extend_from_slice(&x[i]);
         design_matrix.push(row);
     }
-    
+
     let n_params = design_matrix[0].len();
-    
+
     // Check if we have enough samples
     if n < n_params {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            format!("Not enough samples: need at least {} samples for {} parameters", n_params, n_params)
-        ));
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Not enough samples: need at least {} samples for {} parameters",
+            n_params, n_params
+        )));
     }
-    
+
     // Compute X'X
     let mut xtx = vec![vec![0.0; n_params]; n_params];
     for i in 0..n_params {
@@ -149,7 +181,7 @@ pub fn compute_linear_regression(
             xtx[i][j] = sum;
         }
     }
-    
+
     // Compute X'y
     let mut xty = vec![0.0; n_params];
     for i in 0..n_params {
@@ -159,34 +191,36 @@ pub fn compute_linear_regression(
         }
         xty[i] = sum;
     }
-    
+
     // Compute (X'X)^-1 and use it for both coefficient estimation and HC3
     // This enables matrix reuse per REQ-014
     let xtx_inv = invert_matrix(&xtx)?;
-    
+
     // Compute coefficients: β = (X'X)^-1 X'y
     let coefficients_full = matrix_vector_multiply(&xtx_inv, &xty);
-    
+
     // Compute residuals explicitly: e = y - Xβ
-    let residuals: Vec<f64> = (0..n).map(|i| {
-        let mut y_pred = 0.0;
-        for j in 0..n_params {
-            y_pred += coefficients_full[j] * design_matrix[i][j];
-        }
-        y[i] - y_pred
-    }).collect();
-    
+    let residuals: Vec<f64> = (0..n)
+        .map(|i| {
+            let mut y_pred = 0.0;
+            for j in 0..n_params {
+                y_pred += coefficients_full[j] * design_matrix[i][j];
+            }
+            y[i] - y_pred
+        })
+        .collect();
+
     // Calculate R-squared
     let y_mean = y.iter().sum::<f64>() / (n as f64);
     let ss_res: f64 = residuals.iter().map(|r| r.powi(2)).sum();
     let ss_tot: f64 = y.iter().map(|yi| (yi - y_mean).powi(2)).sum();
-    
+
     let r_squared = if ss_tot == 0.0 {
         0.0
     } else {
         1.0 - (ss_res / ss_tot)
     };
-    
+
     // Compute HC3 standard errors
     // Handle perfect fit case: when all residuals are zero, SE should be zero
     let (intercept_se, standard_errors) = if residuals.iter().all(|&r| r == 0.0) {
@@ -200,10 +234,10 @@ pub fn compute_linear_regression(
         // Normal HC3 computation
         // Compute leverage values h_ii = x_i' (X'X)^-1 x_i
         let leverages = compute_leverages(&design_matrix, &xtx_inv)?;
-        
+
         // Compute HC3 variance-covariance matrix
         let hc3_vcov = compute_hc3_vcov(&design_matrix, &residuals, &leverages, &xtx_inv);
-        
+
         // Extract standard errors from diagonal of variance-covariance matrix
         if include_intercept {
             // intercept_se is SE for β_0, standard_errors is SE for β_1, β_2, ...
@@ -216,21 +250,21 @@ pub fn compute_linear_regression(
             (None, se_vec)
         }
     };
-    
+
     // Extract intercept and coefficients
     let (intercept, coefficients) = if include_intercept {
         (Some(coefficients_full[0]), coefficients_full[1..].to_vec())
     } else {
         (None, coefficients_full)
     };
-    
+
     // For backward compatibility with single covariate
     let slope = if coefficients.len() == 1 {
         Some(coefficients[0])
     } else {
         None
     };
-    
+
     Ok(LinearRegressionResult {
         coefficients,
         intercept,
@@ -239,6 +273,10 @@ pub fn compute_linear_regression(
         slope,
         standard_errors,
         intercept_se,
+        // Cluster-related fields default to None for non-clustered regression
+        n_clusters: None,
+        cluster_se_type: None,
+        bootstrap_iterations_used: None,
     })
 }
 
@@ -247,10 +285,10 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> PyResult<Vec<f64>> {
     let n = a.len();
     if n == 0 || a[0].len() != n || b.len() != n {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "Invalid matrix dimensions for linear system"
+            "Invalid matrix dimensions for linear system",
         ));
     }
-    
+
     // Create augmented matrix [A|b]
     let mut aug = Vec::new();
     for i in 0..n {
@@ -258,7 +296,7 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> PyResult<Vec<f64>> {
         row.push(b[i]);
         aug.push(row);
     }
-    
+
     // Forward elimination with partial pivoting
     for i in 0..n {
         // Find pivot
@@ -271,18 +309,18 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> PyResult<Vec<f64>> {
                 max_row = k;
             }
         }
-        
+
         if max_val < 1e-10 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "Singular matrix: cannot solve linear regression (X'X is not invertible, check for collinearity)"
             ));
         }
-        
+
         // Swap rows
         if max_row != i {
             aug.swap(i, max_row);
         }
-        
+
         // Eliminate column
         for k in (i + 1)..n {
             let factor = aug[k][i] / aug[i][i];
@@ -291,7 +329,7 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> PyResult<Vec<f64>> {
             }
         }
     }
-    
+
     // Back substitution
     let mut x = vec![0.0; n];
     for i in (0..n).rev() {
@@ -301,7 +339,7 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> PyResult<Vec<f64>> {
         }
         x[i] = sum / aug[i][i];
     }
-    
+
     Ok(x)
 }
 
@@ -332,19 +370,19 @@ fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
     let n = a.len();
     if n == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "Cannot invert empty matrix"
+            "Cannot invert empty matrix",
         ));
     }
-    
+
     // Verify square matrix
     for row in a.iter() {
         if row.len() != n {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "Cannot invert non-square matrix"
+                "Cannot invert non-square matrix",
             ));
         }
     }
-    
+
     // Create augmented matrix [A|I] of size (n × 2n)
     let mut aug: Vec<Vec<f64>> = Vec::with_capacity(n);
     for i in 0..n {
@@ -357,7 +395,7 @@ fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
         }
         aug.push(row);
     }
-    
+
     // Gauss-Jordan elimination with partial pivoting
     for col in 0..n {
         // Find pivot: row with maximum absolute value in current column
@@ -370,25 +408,25 @@ fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
                 max_row = row;
             }
         }
-        
+
         // Check for singularity (pivot too small)
         if max_val < 1e-10 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "Singular matrix: cannot solve linear regression (X'X is not invertible, check for collinearity)"
             ));
         }
-        
+
         // Swap rows if needed
         if max_row != col {
             aug.swap(col, max_row);
         }
-        
+
         // Scale pivot row so diagonal element becomes 1
         let pivot = aug[col][col];
         for j in 0..(2 * n) {
             aug[col][j] /= pivot;
         }
-        
+
         // Eliminate all other entries in this column (both above and below pivot)
         for row in 0..n {
             if row != col {
@@ -399,13 +437,13 @@ fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
             }
         }
     }
-    
+
     // Extract inverse from right half of augmented matrix
     let mut inverse: Vec<Vec<f64>> = Vec::with_capacity(n);
     for i in 0..n {
         inverse.push(aug[i][n..(2 * n)].to_vec());
     }
-    
+
     Ok(inverse)
 }
 
@@ -423,7 +461,7 @@ fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
 fn matrix_vector_multiply(a: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
     let m = a.len();
     let mut result = Vec::with_capacity(m);
-    
+
     for row in a.iter() {
         let mut sum = 0.0;
         for (j, &val) in row.iter().enumerate() {
@@ -431,7 +469,7 @@ fn matrix_vector_multiply(a: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
         }
         result.push(sum);
     }
-    
+
     result
 }
 
@@ -456,9 +494,9 @@ fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
         return vec![vec![]; m];
     }
     let n = b[0].len();
-    
+
     let mut result = vec![vec![0.0; n]; m];
-    
+
     for i in 0..m {
         for j in 0..n {
             let mut sum = 0.0;
@@ -468,7 +506,7 @@ fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
             result[i][j] = sum;
         }
     }
-    
+
     result
 }
 
@@ -491,23 +529,20 @@ fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
 ///
 /// # Errors
 /// * `PyValueError` if any h_ii >= 0.99 (extreme leverage makes HC3 unreliable)
-fn compute_leverages(
-    design_matrix: &[Vec<f64>],
-    xtx_inv: &[Vec<f64>]
-) -> PyResult<Vec<f64>> {
+fn compute_leverages(design_matrix: &[Vec<f64>], xtx_inv: &[Vec<f64>]) -> PyResult<Vec<f64>> {
     let n = design_matrix.len();
     let mut leverages = Vec::with_capacity(n);
-    
+
     for (i, x_i) in design_matrix.iter().enumerate() {
         // Compute temp = (X'X)^-1 × x_i (matrix-vector multiply)
         let temp = matrix_vector_multiply(xtx_inv, x_i);
-        
+
         // Compute h_ii = x_i · temp (dot product)
         let mut h_ii = 0.0;
         for (j, &x_ij) in x_i.iter().enumerate() {
             h_ii += x_ij * temp[j];
         }
-        
+
         // Check for extreme leverage (>= 0.99 makes (1 - h_ii)^2 too small)
         if h_ii >= 0.99 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -517,10 +552,10 @@ fn compute_leverages(
                 )
             ));
         }
-        
+
         leverages.push(h_ii);
     }
-    
+
     Ok(leverages)
 }
 
@@ -549,21 +584,21 @@ fn compute_hc3_vcov(
     design_matrix: &[Vec<f64>],
     residuals: &[f64],
     leverages: &[f64],
-    xtx_inv: &[Vec<f64>]
+    xtx_inv: &[Vec<f64>],
 ) -> Vec<Vec<f64>> {
     let n = design_matrix.len();
     let p = xtx_inv.len();
-    
+
     // Compute the "meat" of the sandwich: X' Ω X
     // where Ω_ii = e_i² / (1 - h_ii)²
     // This is computed efficiently in a single pass over observations
     let mut meat = vec![vec![0.0; p]; p];
-    
+
     for i in 0..n {
         // HC3 weight: e_i² / (1 - h_ii)²
         let one_minus_h = 1.0 - leverages[i];
         let omega_ii = residuals[i].powi(2) / one_minus_h.powi(2);
-        
+
         // Accumulate x_i' × omega_ii × x_i into meat matrix
         // meat[j][k] += x_ij * omega_ii * x_ik
         for j in 0..p {
@@ -572,13 +607,13 @@ fn compute_hc3_vcov(
             }
         }
     }
-    
+
     // Compute sandwich: (X'X)^-1 × meat × (X'X)^-1
     // First: temp = (X'X)^-1 × meat
     let temp = matrix_multiply(xtx_inv, &meat);
     // Then: result = temp × (X'X)^-1
     let hc3_vcov = matrix_multiply(&temp, xtx_inv);
-    
+
     hc3_vcov
 }
 
@@ -591,9 +626,9 @@ mod tests {
     fn test_single_covariate_regression() {
         let x = vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0]];
         let y = vec![2.0, 4.0, 6.0, 8.0, 10.0];
-        
+
         let result = compute_linear_regression(&x, &y, true).unwrap();
-        
+
         assert_eq!(result.coefficients.len(), 1);
         assert_relative_eq!(result.coefficients[0], 2.0, epsilon = 1e-10);
         assert!(result.intercept.is_some());
@@ -603,7 +638,7 @@ mod tests {
         assert!(result.slope.is_some());
         assert_relative_eq!(result.slope.unwrap(), 2.0, epsilon = 1e-10);
     }
-    
+
     #[test]
     fn test_multiple_covariate_regression() {
         // y = 2*x1 + 3*x2 + 1
@@ -615,9 +650,9 @@ mod tests {
             vec![5.0, 3.0],
         ];
         let y = vec![6.0, 8.0, 13.0, 15.0, 20.0];
-        
+
         let result = compute_linear_regression(&x, &y, true).unwrap();
-        
+
         assert_eq!(result.coefficients.len(), 2);
         assert_relative_eq!(result.coefficients[0], 2.0, epsilon = 1e-10);
         assert_relative_eq!(result.coefficients[1], 3.0, epsilon = 1e-10);
@@ -626,49 +661,45 @@ mod tests {
         assert_relative_eq!(result.r_squared, 1.0, epsilon = 1e-10);
         assert_eq!(result.n_samples, 5);
     }
-    
+
     #[test]
     fn test_regression_without_intercept() {
         // y = 2*x (no intercept)
         let x = vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0]];
         let y = vec![2.0, 4.0, 6.0, 8.0, 10.0];
-        
+
         let result = compute_linear_regression(&x, &y, false).unwrap();
-        
+
         assert_eq!(result.coefficients.len(), 1);
         assert_relative_eq!(result.coefficients[0], 2.0, epsilon = 1e-10);
         assert!(result.intercept.is_none());
         assert_relative_eq!(result.r_squared, 1.0, epsilon = 1e-10);
     }
-    
+
     #[test]
     fn test_empty_data() {
         let x: Vec<Vec<f64>> = vec![];
         let y: Vec<f64> = vec![];
-        
+
         let result = compute_linear_regression(&x, &y, true);
         assert!(result.is_err());
     }
-    
+
     #[test]
     fn test_mismatched_lengths() {
         let x = vec![vec![1.0], vec![2.0], vec![3.0]];
         let y = vec![2.0, 4.0];
-        
+
         let result = compute_linear_regression(&x, &y, true);
         assert!(result.is_err());
     }
-    
+
     #[test]
     fn test_singular_matrix() {
         // x1 and x2 are perfectly correlated (collinear)
-        let x = vec![
-            vec![1.0, 2.0],
-            vec![2.0, 4.0],
-            vec![3.0, 6.0],
-        ];
+        let x = vec![vec![1.0, 2.0], vec![2.0, 4.0], vec![3.0, 6.0]];
         let y = vec![1.0, 2.0, 3.0];
-        
+
         let result = compute_linear_regression(&x, &y, true);
         assert!(result.is_err());
     }

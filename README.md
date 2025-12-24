@@ -18,6 +18,8 @@ A high-performance statistical package for Polars DataFrames, powered by Rust.
 - **📊 Multiple Regression**: Support for multiple covariates with matrix-based OLS
 - **📈 Robust Standard Errors**: HC3 heteroskedasticity-consistent standard errors included
 - **🎯 Flexible Models**: Optional intercept for fully saturated models
+- **🏢 Clustered Standard Errors**: Cluster-robust SE for panel/grouped data
+- **🔄 Wild Bootstrap**: Wild cluster bootstrap for reliable inference with few clusters
 - **🔧 Native Polars Integration**: Zero-copy operations on Polars DataFrames
 - **🦀 Rust-Powered**: Core computations in Rust for maximum throughput
 - **🐍 Pythonic API**: Clean, intuitive interface with full type hints
@@ -121,6 +123,38 @@ Intercept: 0.1333 ± 0.1828
 ```
 
 > **Note**: Standard errors use the HC3 estimator (MacKinnon & White, 1985), which provides heteroskedasticity-consistent inference even when error variance is not constant.
+
+### Clustered Standard Errors
+
+When observations are clustered (e.g., students within schools, employees within firms), use cluster-robust standard errors:
+
+```python
+# Panel data with firm-level clustering
+df = pl.DataFrame({
+    "treatment": [0, 0, 1, 1, 0, 0, 1, 1],
+    "outcome": [5, 6, 12, 14, 4, 7, 11, 15],
+    "firm_id": [1, 1, 1, 1, 2, 2, 2, 2]
+})
+
+result = causers.linear_regression(
+    df,
+    x_cols="treatment",
+    y_col="outcome",
+    cluster="firm_id"
+)
+
+print(f"Treatment effect: {result.coefficients[0]:.4f}")
+print(f"Clustered SE: {result.standard_errors[0]:.4f}")
+print(f"Number of clusters: {result.n_clusters}")
+```
+
+> **Tip**: When you have fewer than 42 clusters, use `bootstrap=True` for more reliable inference:
+> ```python
+> result = causers.linear_regression(
+>     df, "treatment", "outcome",
+>     cluster="firm_id", bootstrap=True, seed=42
+> )
+> ```
 
 ### Regression Without Intercept
 
@@ -329,11 +363,18 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 - ✅ 100% test coverage
 - ✅ Performance validation
 
-### v0.2.0 (Current)
+### v0.2.0
 - ✅ HC3 robust standard errors
 - ✅ statsmodels-validated accuracy (rtol=1e-6)
 - ✅ Extreme leverage detection and error handling
 - ✅ Comprehensive test coverage with edge cases
+
+### v0.3.0 (Current)
+- ✅ Clustered standard errors (analytical)
+- ✅ Wild cluster bootstrap for small cluster counts
+- ✅ Configurable bootstrap iterations and seed
+- ✅ Small-cluster warning (G < 42)
+- ✅ statsmodels/wildboottest-validated accuracy
 
 ## 🔒 Security
 

@@ -5,6 +5,82 @@ All notable changes to the causers project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2025-12-24
+
+### ✨ Features
+
+- **Clustered Standard Errors**: Cluster-robust standard errors for panel and grouped data
+  - New `cluster` parameter: specify column containing cluster identifiers
+  - Analytical clustered SE using sandwich estimator with small-sample adjustment
+  - Matches statsmodels `get_robustcov_results(cov_type='cluster')` to `rtol=1e-6`
+
+- **Wild Cluster Bootstrap**: Bootstrap-based standard errors for small cluster counts
+  - New `bootstrap` parameter: enable wild cluster bootstrap
+  - New `bootstrap_iterations` parameter: control number of replications (default: 1000)
+  - New `seed` parameter: ensure reproducibility
+  - Uses Rademacher weights (±1 with equal probability)
+  - Matches wildboottest package results to `rtol=1e-2`
+
+- **Small-Cluster Warning**: Automatic recommendation for bootstrap
+  - Emits `UserWarning` when G < 42 clusters with analytical SE
+  - Guides users toward more reliable inference methods
+
+- **New Result Attributes**:
+  - `n_clusters` (int | None): Number of unique clusters
+  - `cluster_se_type` (str | None): "analytical" or "bootstrap"
+  - `bootstrap_iterations_used` (int | None): Actual iterations used
+
+### 🛠️ Technical Details
+
+- New `src/cluster.rs` module for all clustering logic
+- SplitMix64 PRNG for Rademacher weight generation (no external RNG dependency)
+- Welford's online algorithm for O(1) memory bootstrap variance
+- Condition number check (> 1e10) for numerical stability
+
+### 📖 API Changes
+
+**New Parameters:**
+- `cluster: Optional[str] = None` — Column name for cluster identifiers
+- `bootstrap: bool = False` — Enable wild cluster bootstrap
+- `bootstrap_iterations: int = 1000` — Number of bootstrap replications
+- `seed: Optional[int] = None` — Random seed for reproducibility
+
+**New Result Fields:**
+- `n_clusters` — Cluster count (None if not clustered)
+- `cluster_se_type` — "analytical" or "bootstrap" (None if not clustered)
+- `bootstrap_iterations_used` — Iterations used (None if not bootstrap)
+
+**New Errors:**
+- `ValueError`: "bootstrap=True requires cluster to be specified"
+- `ValueError`: "Clustered standard errors require at least 2 clusters"
+- `ValueError`: "Cluster column contains null values"
+
+**New Warnings:**
+- `UserWarning`: "Only N clusters detected. Wild cluster bootstrap is recommended when clusters < 42."
+- `UserWarning`: "Cluster column 'X' is float; will be cast to string for grouping."
+
+### 📊 Performance
+
+With clustered SE computation:
+- Analytical clustered SE: ≤2× HC3 baseline runtime
+- Bootstrap (B=1000) on 100K rows: ~3-5 seconds
+
+### ⚠️ Breaking Changes
+
+None. All existing code continues to work unchanged.
+
+### 📦 Dependencies
+
+- **No new runtime dependencies**: statsmodels and wildboottest are test-only
+- Install test dependencies with: `pip install causers[test]`
+
+### 📚 References
+
+- Cameron, A. C., & Miller, D. L. (2015). A Practitioner's Guide to Cluster-Robust Inference. *Journal of Human Resources*, 50(2), 317-372.
+- MacKinnon, J. G., & Webb, M. D. (2018). The wild bootstrap for few (treated) clusters. *The Econometrics Journal*, 21(2), 114-135.
+
+---
+
 ## [0.2.0] - 2025-12-23
 
 ### ✨ Features
@@ -172,5 +248,6 @@ MIT License - see LICENSE file for details.
 
 ---
 
+[0.3.0]: https://github.com/causers/causers/releases/tag/v0.3.0
 [0.2.0]: https://github.com/causers/causers/releases/tag/v0.2.0
 [0.1.0]: https://github.com/causers/causers/releases/tag/v0.1.0
