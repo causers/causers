@@ -68,6 +68,40 @@ pub struct ClusterInfo {
     pub sizes: Vec<usize>,
 }
 
+/// Bootstrap weight distribution type for wild cluster bootstrap.
+///
+/// Controls the random weight distribution used to perturb residuals
+/// in wild cluster bootstrap standard error computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapWeightType {
+    /// Rademacher weights: ±1 with equal probability (P=0.5 each).
+    /// This is the default and most commonly used distribution.
+    Rademacher,
+    /// Webb six-point distribution for improved small-sample properties.
+    /// Selects from {-√(3/2), -√(1/2), -√(1/6), √(1/6), √(1/2), √(3/2)}
+    /// with equal probability 1/6 each.
+    ///
+    /// Reference: MacKinnon & Webb (2018), Webb (2014)
+    Webb,
+}
+
+/// Webb six-point distribution weight values.
+///
+/// Values: {-√(3/2), -√(1/2), -√(1/6), √(1/6), √(1/2), √(3/2)}
+/// Each selected with probability 1/6.
+///
+/// Properties: E[w] = 0, E[w²] = 1, E[w³] = 0 (three-point matching)
+///
+/// Reference: MacKinnon & Webb (2018), Webb (2014)
+pub const WEBB_WEIGHTS: [f64; 6] = [
+    -1.224744871391589,  // -√(3/2)
+    -0.7071067811865476, // -√(1/2)
+    -0.4082482904638631, // -√(1/6)
+    0.4082482904638631,  //  √(1/6)
+    0.7071067811865476,  //  √(1/2)
+    1.224744871391589,   //  √(3/2)
+];
+
 /// Simple PRNG using SplitMix64 algorithm.
 ///
 /// This is good enough for Rademacher weight generation (±1 with equal probability)
@@ -99,6 +133,28 @@ impl SplitMix64 {
             -1.0
         } else {
             1.0
+        }
+    }
+
+    /// Generate Webb weight: one of six values with equal probability 1/6.
+    ///
+    /// Uses modulo 6 selection on the random u64 value.
+    /// The modulo bias is negligible for u64 (6 divides evenly into 2^64 with
+    /// remainder 4, giving bias of 4/2^64 ≈ 2.2×10⁻¹⁹).
+    pub fn webb(&mut self) -> f64 {
+        let idx = (self.next() % 6) as usize;
+        WEBB_WEIGHTS[idx]
+    }
+
+    /// Generate a weight based on the specified weight type.
+    ///
+    /// Dispatches to the appropriate weight generation method based on
+    /// the `weight_type` parameter.
+    #[inline]
+    pub fn weight(&mut self, weight_type: BootstrapWeightType) -> f64 {
+        match weight_type {
+            BootstrapWeightType::Rademacher => self.rademacher(),
+            BootstrapWeightType::Webb => self.webb(),
         }
     }
 }
@@ -359,9 +415,10 @@ pub fn compute_cluster_se_analytical(
     }
 }
 
-/// Compute wild cluster bootstrap standard errors with Rademacher weights.
+/// Compute wild cluster bootstrap standard errors.
 ///
-/// Uses the "type 11" bootstrap: y* = ŷ + w_g × e where w_g ∈ {-1, +1}
+/// Uses the "type 11" bootstrap: y* = ŷ + w_g × e where w_g is drawn from
+/// the specified weight distribution (Rademacher or Webb).
 ///
 /// # Arguments
 /// * `design_matrix` - Design matrix X (n × p)
@@ -372,6 +429,7 @@ pub fn compute_cluster_se_analytical(
 /// * `bootstrap_iterations` - Number of bootstrap replications (B)
 /// * `seed` - Random seed for reproducibility (None for random)
 /// * `include_intercept` - Whether intercept is included
+/// * `weight_type` - Bootstrap weight distribution (Rademacher or Webb)
 ///
 /// # Returns
 /// * `Result<(Vec<f64>, Option<f64>), ClusterError>` - (coefficient_se, intercept_se)
@@ -386,6 +444,7 @@ pub fn compute_cluster_se_bootstrap(
     bootstrap_iterations: usize,
     seed: Option<u64>,
     include_intercept: bool,
+    weight_type: BootstrapWeightType,
 ) -> Result<(Vec<f64>, Option<f64>), ClusterError> {
     let n = residuals.len();
     let p = xtx_inv.len();
@@ -410,9 +469,9 @@ pub fn compute_cluster_se_bootstrap(
     let mut weights = vec![0.0; g];
 
     for _ in 0..bootstrap_iterations {
-        // Generate Rademacher weights for each cluster
+        // Generate weights for each cluster using specified distribution
         for w in weights.iter_mut() {
-            *w = rng.rademacher();
+            *w = rng.weight(weight_type);
         }
 
         // Create bootstrap response y*
@@ -650,6 +709,7 @@ mod tests {
             100,
             Some(42),
             true,
+            BootstrapWeightType::Rademacher,
         )
         .unwrap();
 
@@ -662,6 +722,7 @@ mod tests {
             100,
             Some(42),
             true,
+            BootstrapWeightType::Rademacher,
         )
         .unwrap();
 
@@ -695,6 +756,7 @@ mod tests {
             100,
             Some(1), // Different seed
             true,
+            BootstrapWeightType::Rademacher,
         )
         .unwrap();
 
@@ -707,6 +769,7 @@ mod tests {
             100,
             Some(999), // Different seed
             true,
+            BootstrapWeightType::Rademacher,
         )
         .unwrap();
 
@@ -764,6 +827,7 @@ mod tests {
             100,
             Some(42),
             true,
+            BootstrapWeightType::Rademacher,
         );
 
         // Should succeed

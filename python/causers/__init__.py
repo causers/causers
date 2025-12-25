@@ -64,6 +64,7 @@ def linear_regression(
     bootstrap: bool = False,
     bootstrap_iterations: int = 1000,
     seed: _Optional[int] = None,
+    bootstrap_method: str = "rademacher",
 ) -> LinearRegressionResult:
     """
     Perform linear regression on Polars DataFrame columns.
@@ -98,6 +99,11 @@ def linear_regression(
     seed : int, optional
         Random seed for reproducibility when using bootstrap. When None,
         uses a random seed which may produce different results each call.
+    bootstrap_method : str, default "rademacher"
+        Weight distribution for wild bootstrap. Options:
+        - "rademacher": Standard Rademacher weights (±1 with equal probability)
+        - "webb": Webb's 6-point distribution for improved small-sample performance
+        Only used when bootstrap=True and cluster is specified.
     
     Returns
     -------
@@ -121,7 +127,8 @@ def linear_regression(
         - n_clusters : int or None
             Number of unique clusters (None if cluster not specified)
         - cluster_se_type : str or None
-            Type of clustered SE: "analytical" or "bootstrap" (None if not clustered)
+            Type of clustered SE: "analytical", "bootstrap_rademacher", or
+            "bootstrap_webb" (None if not clustered)
         - bootstrap_iterations_used : int or None
             Number of bootstrap iterations (None if not bootstrap)
     
@@ -244,6 +251,9 @@ def linear_regression(
         except Exception:
             pass  # Let the Rust layer handle column not found errors
     
+    # Normalize bootstrap_method to lowercase for case-insensitive matching
+    bootstrap_method_normalized = bootstrap_method.lower()
+    
     # Call the Rust implementation
     result = _linear_regression_rust(
         df,
@@ -254,6 +264,7 @@ def linear_regression(
         bootstrap,
         bootstrap_iterations,
         seed,
+        bootstrap_method_normalized,
     )
     
     # Check for small cluster count and emit warning (REQ-030)
@@ -284,6 +295,7 @@ def logistic_regression(
     bootstrap: bool = False,
     bootstrap_iterations: int = 1000,
     seed: _Optional[int] = None,
+    bootstrap_method: str = "rademacher",
 ) -> LogisticRegressionResult:
     """
     Perform logistic regression on binary outcome with robust standard errors.
@@ -317,6 +329,11 @@ def logistic_regression(
     seed : int, optional
         Random seed for reproducibility when using bootstrap. When None,
         uses a random seed which may produce different results each call.
+    bootstrap_method : str, default "rademacher"
+        Weight distribution for score bootstrap. Options:
+        - "rademacher": Standard Rademacher weights (±1 with equal probability)
+        - "webb": Webb's 6-point distribution for improved small-sample performance
+        Only used when bootstrap=True and cluster is specified.
     
     Returns
     -------
@@ -336,7 +353,8 @@ def logistic_regression(
         - n_clusters : int or None
             Number of unique clusters (None if cluster not specified)
         - cluster_se_type : str or None
-            Type of clustered SE: "analytical" or "bootstrap" (None if not clustered)
+            Type of clustered SE: "analytical", "bootstrap_rademacher", or
+            "bootstrap_webb" (None if not clustered)
         - bootstrap_iterations_used : int or None
             Number of bootstrap iterations (None if not bootstrap)
         - converged : bool
@@ -483,6 +501,9 @@ def logistic_regression(
         except Exception:
             pass  # Let the Rust layer handle column not found errors
     
+    # Normalize bootstrap_method to lowercase for case-insensitive matching
+    bootstrap_method_normalized = bootstrap_method.lower()
+    
     # Call the Rust implementation
     result = _logistic_regression_rust(
         df,
@@ -493,6 +514,7 @@ def logistic_regression(
         bootstrap,
         bootstrap_iterations,
         seed,
+        bootstrap_method_normalized,
     )
     
     # Check for small cluster count and emit warning (REQ-060)

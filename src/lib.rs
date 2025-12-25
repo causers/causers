@@ -6,7 +6,7 @@ mod stats;
 
 use cluster::{
     build_cluster_indices, compute_cluster_se_analytical, compute_cluster_se_bootstrap,
-    ClusterError, ClusterInfo,
+    BootstrapWeightType, ClusterError, ClusterInfo,
 };
 use logistic::{
     compute_hc3_logistic, compute_logistic_mle, compute_null_log_likelihood,
@@ -35,6 +35,28 @@ fn validate_column_name(name: &str) -> PyResult<()> {
     Ok(())
 }
 
+/// Parse bootstrap_method string to BootstrapWeightType enum.
+///
+/// Accepts case-insensitive "rademacher" or "webb".
+fn parse_bootstrap_method(method: &str) -> PyResult<BootstrapWeightType> {
+    match method.to_lowercase().as_str() {
+        "rademacher" => Ok(BootstrapWeightType::Rademacher),
+        "webb" => Ok(BootstrapWeightType::Webb),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "bootstrap_method must be 'rademacher' or 'webb', got: '{}'",
+            method
+        ))),
+    }
+}
+
+/// Get the cluster_se_type string based on the weight type.
+fn get_cluster_se_type(weight_type: BootstrapWeightType) -> String {
+    match weight_type {
+        BootstrapWeightType::Rademacher => "bootstrap_rademacher".to_string(),
+        BootstrapWeightType::Webb => "bootstrap_webb".to_string(),
+    }
+}
+
 /// Perform linear regression on Polars DataFrame columns
 ///
 /// Args:
@@ -46,11 +68,12 @@ fn validate_column_name(name: &str) -> PyResult<()> {
 ///     bootstrap: Whether to use wild cluster bootstrap (requires cluster)
 ///     bootstrap_iterations: Number of bootstrap iterations (default: 1000)
 ///     seed: Random seed for reproducibility (None for random)
+///     bootstrap_method: Weight distribution for bootstrap ("rademacher" or "webb", default: "rademacher")
 ///
 /// Returns:
 ///     LinearRegressionResult with coefficients, intercept, r_squared, and standard errors
 #[pyfunction]
-#[pyo3(signature = (df, x_cols, y_col, include_intercept=true, cluster=None, bootstrap=false, bootstrap_iterations=1000, seed=None))]
+#[pyo3(signature = (df, x_cols, y_col, include_intercept=true, cluster=None, bootstrap=false, bootstrap_iterations=1000, seed=None, bootstrap_method="rademacher"))]
 // Statistical functions commonly require many parameters for configuration.
 // Refactoring into a config struct would reduce API clarity for Python users.
 #[allow(clippy::too_many_arguments)]
@@ -64,6 +87,7 @@ fn linear_regression(
     bootstrap: bool,
     bootstrap_iterations: usize,
     seed: Option<u64>,
+    bootstrap_method: &str,
 ) -> PyResult<LinearRegressionResult> {
     // Validate inputs
     if x_cols.is_empty() {
@@ -83,6 +107,23 @@ fn linear_regression(
     if bootstrap_iterations < 1 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "bootstrap_iterations must be at least 1",
+        ));
+    }
+
+    // Parse and validate bootstrap_method
+    let weight_type = parse_bootstrap_method(bootstrap_method)?;
+
+    // Validate bootstrap_method requires bootstrap=True (REQ-006)
+    if weight_type != BootstrapWeightType::Rademacher && !bootstrap {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "bootstrap_method requires bootstrap=True",
+        ));
+    }
+
+    // Validate bootstrap_method requires cluster (REQ-007)
+    if weight_type != BootstrapWeightType::Rademacher && cluster.is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "bootstrap_method requires cluster to be specified",
         ));
     }
 
@@ -207,6 +248,7 @@ fn linear_regression(
         bootstrap,
         bootstrap_iterations,
         seed,
+        weight_type,
     )
 }
 
@@ -219,6 +261,7 @@ fn compute_linear_regression_with_cluster(
     bootstrap: bool,
     bootstrap_iterations: usize,
     seed: Option<u64>,
+    weight_type: BootstrapWeightType,
 ) -> PyResult<LinearRegressionResult> {
     if x.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -380,6 +423,7 @@ fn compute_linear_regression_with_cluster(
                     bootstrap_iterations,
                     seed,
                     include_intercept,
+                    weight_type,
                 ).map_err(|e| {
                     match e {
                         ClusterError::InvalidStandardErrors => {
@@ -395,7 +439,7 @@ fn compute_linear_regression_with_cluster(
                 int_se,
                 coef_se,
                 Some(n_clusters),
-                Some("bootstrap".to_string()),
+                Some(get_cluster_se_type(weight_type)),
                 Some(bootstrap_iterations),
             )
         } else {
@@ -680,11 +724,12 @@ fn compute_hc3_vcov(
 ///     bootstrap: Whether to use score bootstrap for SE (requires cluster)
 ///     bootstrap_iterations: Number of bootstrap iterations (default: 1000)
 ///     seed: Random seed for reproducibility (None for random)
+///     bootstrap_method: Weight distribution for bootstrap ("rademacher" or "webb", default: "rademacher")
 ///
 /// Returns:
 ///     LogisticRegressionResult with coefficients, standard errors, and diagnostics
 #[pyfunction]
-#[pyo3(signature = (df, x_cols, y_col, include_intercept=true, cluster=None, bootstrap=false, bootstrap_iterations=1000, seed=None))]
+#[pyo3(signature = (df, x_cols, y_col, include_intercept=true, cluster=None, bootstrap=false, bootstrap_iterations=1000, seed=None, bootstrap_method="rademacher"))]
 // Statistical functions commonly require many parameters for configuration.
 // Refactoring into a config struct would reduce API clarity for Python users.
 #[allow(clippy::too_many_arguments)]
@@ -698,6 +743,7 @@ fn logistic_regression(
     bootstrap: bool,
     bootstrap_iterations: usize,
     seed: Option<u64>,
+    bootstrap_method: &str,
 ) -> PyResult<LogisticRegressionResult> {
     // Validate inputs
     if x_cols.is_empty() {
@@ -717,6 +763,23 @@ fn logistic_regression(
     if bootstrap_iterations < 1 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "bootstrap_iterations must be at least 1",
+        ));
+    }
+
+    // Parse and validate bootstrap_method
+    let weight_type = parse_bootstrap_method(bootstrap_method)?;
+
+    // Validate bootstrap_method requires bootstrap=True (REQ-006)
+    if weight_type != BootstrapWeightType::Rademacher && !bootstrap {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "bootstrap_method requires bootstrap=True",
+        ));
+    }
+
+    // Validate bootstrap_method requires cluster (REQ-007)
+    if weight_type != BootstrapWeightType::Rademacher && cluster.is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "bootstrap_method requires cluster to be specified",
         ));
     }
 
@@ -863,6 +926,7 @@ fn logistic_regression(
         bootstrap,
         bootstrap_iterations,
         seed,
+        weight_type,
     )
 }
 
@@ -875,6 +939,7 @@ fn compute_logistic_regression_with_cluster(
     bootstrap: bool,
     bootstrap_iterations: usize,
     seed: Option<u64>,
+    weight_type: BootstrapWeightType,
 ) -> PyResult<LogisticRegressionResult> {
     let n = x.len();
 
@@ -955,6 +1020,7 @@ fn compute_logistic_regression_with_cluster(
                 bootstrap_iterations,
                 seed,
                 include_intercept,
+                weight_type,
             )
             .map_err(|e| match e {
                 ClusterError::InvalidStandardErrors => pyo3::exceptions::PyValueError::new_err(
@@ -967,7 +1033,7 @@ fn compute_logistic_regression_with_cluster(
                 int_se,
                 coef_se,
                 Some(n_clusters),
-                Some("bootstrap".to_string()),
+                Some(get_cluster_se_type(weight_type)),
                 Some(bootstrap_iterations),
             )
         } else {
@@ -1143,7 +1209,7 @@ fn compute_cluster_se_logistic(
 
 /// Compute score bootstrap standard errors for logistic regression.
 ///
-/// Implements the Kline & Santos (2012) score bootstrap with Rademacher weights.
+/// Implements the Kline & Santos (2012) score bootstrap with configurable weight distribution.
 // Score bootstrap requires all statistical context parameters. Struct would reduce clarity.
 #[allow(clippy::too_many_arguments)]
 fn compute_score_bootstrap_logistic(
@@ -1155,6 +1221,7 @@ fn compute_score_bootstrap_logistic(
     bootstrap_iterations: usize,
     seed: Option<u64>,
     include_intercept: bool,
+    weight_type: BootstrapWeightType,
 ) -> Result<(Vec<f64>, Option<f64>), ClusterError> {
     let p = info_inv.len();
     let g = cluster_info.n_clusters;
@@ -1198,9 +1265,9 @@ fn compute_score_bootstrap_logistic(
     let mut perturbed_score = vec![0.0; p];
 
     for _ in 0..bootstrap_iterations {
-        // Generate Rademacher weights for each cluster
+        // Generate weights for each cluster using specified distribution
         for w in weights.iter_mut() {
-            *w = rng.rademacher();
+            *w = rng.weight(weight_type);
         }
 
         // Compute perturbed score: S* = Σ_g w_g S_g

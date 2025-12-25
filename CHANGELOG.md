@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Uses Rademacher weights (±1 with equal probability)
   - Matches wildboottest package results to `rtol=1e-2`
 
+- **Webb Weights for Bootstrap**: New `bootstrap_method` parameter for `linear_regression()` and `logistic_regression()`
+  - `bootstrap_method="rademacher"` (default): Standard Rademacher weights (±1 with equal probability)
+  - `bootstrap_method="webb"`: Webb six-point distribution for improved small-sample properties
+  - Case-insensitive parameter values ("Webb", "WEBB", "webb" all work)
+  - Recommended for very few clusters (G < 10)
+  - Based on MacKinnon & Webb (2018) methodology
+
 - **Small-Cluster Warning**: Automatic recommendation for bootstrap
   - Emits `UserWarning` when G < 42 clusters with analytical SE
   - Guides users toward more reliable inference methods
@@ -51,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **New LinearRegressionResult Attributes**:
   - `n_clusters` (int | None): Number of unique clusters
-  - `cluster_se_type` (str | None): "analytical" or "bootstrap"
+  - `cluster_se_type` (str | None): "analytical", "bootstrap_rademacher", or "bootstrap_webb"
   - `bootstrap_iterations_used` (int | None): Actual iterations used
 
 ### 🛠️ Technical Details
@@ -77,6 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `bootstrap: bool = False` — Enable bootstrap SE (wild for linear, score for logistic)
 - `bootstrap_iterations: int = 1000` — Number of bootstrap replications
 - `seed: Optional[int] = None` — Random seed for reproducibility
+- `bootstrap_method: str = "rademacher"` — Weight distribution for wild cluster/score bootstrap ("rademacher" or "webb")
 
 **LogisticRegressionResult Fields:**
 - `coefficients`, `intercept` — MLE estimates (log-odds scale)
@@ -88,7 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 **New LinearRegressionResult Fields:**
 - `n_clusters` — Cluster count (None if not clustered)
-- `cluster_se_type` — "analytical" or "bootstrap" (None if not clustered)
+- `cluster_se_type` — "analytical", "bootstrap_rademacher", or "bootstrap_webb" (None if not clustered)
 - `bootstrap_iterations_used` — Iterations used (None if not bootstrap)
 
 **New Errors:**
@@ -100,6 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ValueError`: "bootstrap=True requires cluster to be specified"
 - `ValueError`: "Clustered standard errors require at least 2 clusters"
 - `ValueError`: "Cluster column contains null values"
+- `ValueError`: "bootstrap_method must be 'rademacher' or 'webb', got: '{value}'"
 
 **New Warnings:**
 - `UserWarning`: "Only N clusters detected. [Wild cluster/Score] bootstrap is recommended when clusters < 42."

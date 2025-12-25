@@ -179,6 +179,33 @@ print(f"Number of clusters: {result.n_clusters}")
 > )
 > ```
 
+### Bootstrap Weight Methods
+
+When using wild cluster bootstrap with very few clusters (G < 10), the Webb six-point distribution can provide improved small-sample properties:
+
+```python
+# Wild cluster bootstrap with Webb weights (recommended for very few clusters)
+result = causers.linear_regression(
+    df,
+    x_cols="treatment",
+    y_col="outcome",
+    cluster="firm_id",
+    bootstrap=True,
+    bootstrap_method="webb",  # Use Webb six-point distribution
+    seed=42
+)
+
+print(f"Treatment effect: {result.coefficients[0]:.4f}")
+print(f"Bootstrap SE: {result.standard_errors[0]:.4f}")
+print(f"SE type: {result.cluster_se_type}")  # "bootstrap_webb"
+```
+
+**When to use each method:**
+- **Rademacher** (default): Standard choice, works well with moderate to many clusters
+- **Webb**: Recommended when you have very few clusters (G < 10). Uses a six-point distribution that better approximates the normal distribution with small samples.
+
+> **Reference**: MacKinnon, J. G., & Webb, M. D. (2018). "The wild bootstrap for few (treated) clusters." *The Econometrics Journal*, 21(2), 114-135.
+
 ### Regression Without Intercept
 
 ```python
@@ -289,6 +316,7 @@ Performs logistic regression on binary outcomes using Maximum Likelihood Estimat
 - `bootstrap` (bool, optional): Enable score bootstrap for clustered SE. Default: `False`
 - `bootstrap_iterations` (int, optional): Number of bootstrap replications. Default: `1000`
 - `seed` (int, optional): Random seed for reproducibility. Default: `None`
+- `bootstrap_method` (str, optional): Weight distribution: `"rademacher"` (default) or `"webb"`. Webb recommended for G < 10 clusters.
 
 **Returns:**
 - `LogisticRegressionResult`: Object with the following attributes:
@@ -302,7 +330,7 @@ Performs logistic regression on binary outcomes using Maximum Likelihood Estimat
   - `log_likelihood` (float): Log-likelihood at MLE
   - `pseudo_r_squared` (float): McFadden's pseudo R²
   - `n_clusters` (int | None): Number of clusters (if clustered)
-  - `cluster_se_type` (str | None): "analytical" or "bootstrap"
+  - `cluster_se_type` (str | None): Type of SE: `"analytical"`, `"bootstrap_rademacher"`, or `"bootstrap_webb"`
 
 **Raises:**
 - `ValueError`: If y contains values other than 0/1, perfect separation is detected, or convergence fails
@@ -435,6 +463,8 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 - ✅ Configurable bootstrap iterations and seed
 - ✅ Small-cluster warning (G < 42)
 - ✅ statsmodels/wildboottest-validated accuracy
+- ✅ **Webb weights for bootstrap** (`bootstrap_method="webb"`)
+- ✅ Method-specific `cluster_se_type` values (`"bootstrap_rademacher"`, `"bootstrap_webb"`)
 
 ### v0.4.0 (Planned)
 - 🔲 Weighted least squares

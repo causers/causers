@@ -62,7 +62,8 @@ def linear_regression(
     cluster: str | None = None,
     bootstrap: bool = False,
     bootstrap_iterations: int = 1000,
-    seed: int | None = None
+    seed: int | None = None,
+    bootstrap_method: str = "rademacher"
 ) -> LinearRegressionResult
 ```
 
@@ -78,6 +79,7 @@ def linear_regression(
 | `bootstrap` | `bool` | If `True` and `cluster` is specified, use wild cluster bootstrap for standard error computation. Requires `cluster` to be specified. Recommended when number of clusters is less than 42. Default: `False`. |
 | `bootstrap_iterations` | `int` | Number of bootstrap replications when `bootstrap=True`. Default: `1000`. |
 | `seed` | `int \| None` | Random seed for reproducibility when using bootstrap. When `None`, uses a random seed which may produce different results each call. Default: `None`. |
+| `bootstrap_method` | `str` | Weight distribution for wild cluster bootstrap. Case-insensitive. `"rademacher"` (default): Rademacher weights (±1). `"webb"`: Webb six-point distribution, recommended for very few clusters (G < 10). See MacKinnon & Webb (2018). |
 
 **Returns:**
 
@@ -90,7 +92,7 @@ def linear_regression(
 - `standard_errors` (List[float]): Robust standard errors for each coefficient. Uses HC3 by default, or cluster-robust SE if `cluster` is specified.
 - `intercept_se` (float | None): Robust standard error for intercept. `None` when `include_intercept=False`.
 - `n_clusters` (int | None): Number of unique clusters. `None` if `cluster` not specified.
-- `cluster_se_type` (str | None): Type of clustered SE: `"analytical"` or `"bootstrap"`. `None` if not clustered.
+- `cluster_se_type` (str | None): Type of clustered SE: `"analytical"`, `"bootstrap_rademacher"`, or `"bootstrap_webb"`. `None` if not clustered.
 - `bootstrap_iterations_used` (int | None): Number of bootstrap iterations. `None` if not bootstrap.
 
 **Raises:**
@@ -239,9 +241,30 @@ result = causers.linear_regression(
 
 print(f"Treatment effect: {result.coefficients[0]:.4f}")
 print(f"Bootstrap SE: {result.standard_errors[0]:.4f}")
-print(f"SE type: {result.cluster_se_type}")  # "bootstrap"
+print(f"SE type: {result.cluster_se_type}")  # "bootstrap_rademacher"
 print(f"Iterations used: {result.bootstrap_iterations_used}")
 ```
+
+**Webb weights for very few clusters (recommended for G < 10):**
+```python
+# When you have very few clusters, Webb weights may improve inference
+result = causers.linear_regression(
+    panel_df,
+    x_cols="treatment",
+    y_col="outcome",
+    cluster="firm_id",
+    bootstrap=True,
+    bootstrap_method="webb",  # Webb six-point distribution
+    bootstrap_iterations=1000,
+    seed=42
+)
+
+print(f"Treatment effect: {result.coefficients[0]:.4f}")
+print(f"Webb Bootstrap SE: {result.standard_errors[0]:.4f}")
+print(f"SE type: {result.cluster_se_type}")  # "bootstrap_webb"
+```
+
+> **Reference**: MacKinnon, J. G., & Webb, M. D. (2018). "The wild bootstrap for few (treated) clusters." *The Econometrics Journal*, 21(2), 114-135.
 
 **Mathematical Details:**
 
@@ -294,7 +317,8 @@ def logistic_regression(
     cluster: str | None = None,
     bootstrap: bool = False,
     bootstrap_iterations: int = 1000,
-    seed: int | None = None
+    seed: int | None = None,
+    bootstrap_method: str = "rademacher"
 ) -> LogisticRegressionResult
 ```
 
@@ -310,6 +334,7 @@ def logistic_regression(
 | `bootstrap` | `bool` | If `True` and `cluster` is specified, use score bootstrap for standard error computation. Requires `cluster` to be specified. Recommended when number of clusters is less than 42. Default: `False`. |
 | `bootstrap_iterations` | `int` | Number of bootstrap replications when `bootstrap=True`. Default: `1000`. |
 | `seed` | `int \| None` | Random seed for reproducibility when using bootstrap. When `None`, uses a random seed which may produce different results each call. Default: `None`. |
+| `bootstrap_method` | `str` | Weight distribution for score bootstrap. Case-insensitive. `"rademacher"` (default): Rademacher weights (±1). `"webb"`: Webb six-point distribution, recommended for very few clusters (G < 10). See MacKinnon & Webb (2018). |
 
 **Returns:**
 
@@ -320,7 +345,7 @@ def logistic_regression(
 - `intercept_se` (float | None): Robust standard error for intercept. `None` when `include_intercept=False`.
 - `n_samples` (int): Number of observations used
 - `n_clusters` (int | None): Number of unique clusters. `None` if `cluster` not specified.
-- `cluster_se_type` (str | None): Type of clustered SE: `"analytical"` or `"bootstrap"`. `None` if not clustered.
+- `cluster_se_type` (str | None): Type of clustered SE: `"analytical"`, `"bootstrap_rademacher"`, or `"bootstrap_webb"`. `None` if not clustered.
 - `bootstrap_iterations_used` (int | None): Number of bootstrap iterations used. `None` if not bootstrap.
 - `converged` (bool): Whether the MLE optimizer converged
 - `iterations` (int): Number of Newton-Raphson iterations used
@@ -428,9 +453,30 @@ result = causers.logistic_regression(
 
 print(f"Treatment effect: {result.coefficients[0]:.4f}")
 print(f"Bootstrap SE: {result.standard_errors[0]:.4f}")
-print(f"SE type: {result.cluster_se_type}")  # "bootstrap"
+print(f"SE type: {result.cluster_se_type}")  # "bootstrap_rademacher"
 print(f"Iterations used: {result.bootstrap_iterations_used}")
 ```
+
+**Webb weights for very few clusters (recommended for G < 10):**
+```python
+# When you have very few clusters, Webb weights may improve inference
+result = causers.logistic_regression(
+    df,
+    x_cols="treatment",
+    y_col="outcome",
+    cluster="firm_id",
+    bootstrap=True,
+    bootstrap_method="webb",  # Webb six-point distribution
+    bootstrap_iterations=1000,
+    seed=42
+)
+
+print(f"Treatment effect: {result.coefficients[0]:.4f}")
+print(f"Webb Bootstrap SE: {result.standard_errors[0]:.4f}")
+print(f"SE type: {result.cluster_se_type}")  # "bootstrap_webb"
+```
+
+> **Reference**: MacKinnon, J. G., & Webb, M. D. (2018). "The wild bootstrap for few (treated) clusters." *The Econometrics Journal*, 21(2), 114-135.
 
 **Interpreting coefficients:**
 ```python
@@ -502,7 +548,7 @@ Container for linear regression results.
 | `standard_errors` | `List[float]` | Robust standard errors for each coefficient. HC3 (default) or cluster-robust when `cluster` specified. |
 | `intercept_se` | `float \| None` | Robust standard error for intercept. `None` when `include_intercept=False`. |
 | `n_clusters` | `int \| None` | Number of unique clusters. `None` if `cluster` not specified. |
-| `cluster_se_type` | `str \| None` | Type of clustered SE: `"analytical"` or `"bootstrap"`. `None` if not clustered. |
+| `cluster_se_type` | `str \| None` | Type of clustered SE: `"analytical"`, `"bootstrap_rademacher"`, or `"bootstrap_webb"`. `None` if not clustered. |
 | `bootstrap_iterations_used` | `int \| None` | Number of bootstrap iterations used. `None` if not bootstrap. |
 
 **Methods:**
@@ -607,7 +653,7 @@ Container for logistic regression results.
 | `intercept_se` | `float \| None` | Robust standard error for intercept. `None` when `include_intercept=False`. |
 | `n_samples` | `int` | Number of observations used |
 | `n_clusters` | `int \| None` | Number of unique clusters. `None` if `cluster` not specified. |
-| `cluster_se_type` | `str \| None` | Type of clustered SE: `"analytical"` or `"bootstrap"`. `None` if not clustered. |
+| `cluster_se_type` | `str \| None` | Type of clustered SE: `"analytical"`, `"bootstrap_rademacher"`, or `"bootstrap_webb"`. `None` if not clustered. |
 | `bootstrap_iterations_used` | `int \| None` | Number of bootstrap iterations used. `None` if not bootstrap. |
 | `converged` | `bool` | Whether the Newton-Raphson optimizer converged |
 | `iterations` | `int` | Number of iterations used to reach convergence |

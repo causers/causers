@@ -172,7 +172,11 @@ class TestLogisticRegressionClusteredSE:
         assert result.bootstrap_iterations_used is None
 
     def test_score_bootstrap(self):
-        """Test score bootstrap standard errors."""
+        """Test score bootstrap standard errors.
+        
+        Note: With the bootstrap_method parameter, cluster_se_type is now
+        'bootstrap_rademacher' (default) or 'bootstrap_webb'.
+        """
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0],
             "y": [0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1],
@@ -181,15 +185,15 @@ class TestLogisticRegressionClusteredSE:
         
         from causers import logistic_regression
         result = logistic_regression(
-            df, "x", "y", 
-            cluster="cluster", 
-            bootstrap=True, 
+            df, "x", "y",
+            cluster="cluster",
+            bootstrap=True,
             bootstrap_iterations=500,
             seed=42
         )
         
         assert result.n_clusters == 6
-        assert result.cluster_se_type == "bootstrap"
+        assert result.cluster_se_type == "bootstrap_rademacher"
         assert result.bootstrap_iterations_used == 500
 
     def test_bootstrap_reproducibility(self):
@@ -394,3 +398,198 @@ class TestLogisticRegressionImmutability:
         _ = logistic_regression(df, "x", "y")
         
         assert df.equals(df_original)
+
+
+# =============================================================================
+# TASK-016: Webb Bootstrap Tests for Logistic Regression (REQ-030)
+# =============================================================================
+
+
+class TestLogisticWebbBootstrap:
+    """Tests for Webb bootstrap in logistic regression (REQ-030)."""
+    
+    @pytest.fixture
+    def logistic_webb_data(self):
+        """Create test data for logistic regression Webb tests."""
+        np.random.seed(42)
+        n_clusters = 10
+        n_per_cluster = 20
+        n = n_clusters * n_per_cluster
+        
+        cluster_ids = []
+        x = []
+        y = []
+        
+        for g in range(n_clusters):
+            cluster_effect = np.random.randn() * 0.2
+            for _ in range(n_per_cluster):
+                cluster_ids.append(g)
+                xi = np.random.randn()
+                prob = 1 / (1 + np.exp(-(0.5 + xi + cluster_effect)))
+                yi = float(np.random.rand() < prob)
+                x.append(xi)
+                y.append(yi)
+        
+        return pl.DataFrame({
+            "x": x,
+            "y": y,
+            "cluster_id": cluster_ids,
+        })
+    
+    def test_logistic_webb_produces_finite_se(self, logistic_webb_data):
+        """Verify Webb bootstrap produces finite, positive SE for logistic regression."""
+        from causers import logistic_regression
+        
+        result = logistic_regression(
+            logistic_webb_data, "x", "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_method="webb",
+            bootstrap_iterations=500,
+            seed=42
+        )
+        
+        assert result.converged
+        assert all(np.isfinite(se) for se in result.standard_errors)
+        assert all(se > 0 for se in result.standard_errors)
+        assert np.isfinite(result.intercept_se)
+        assert result.intercept_se > 0
+    
+    def test_logistic_webb_cluster_se_type(self, logistic_webb_data):
+        """Verify cluster_se_type is 'bootstrap_webb' for logistic regression."""
+        from causers import logistic_regression
+        
+        result = logistic_regression(
+            logistic_webb_data, "x", "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_method="webb",
+            seed=42
+        )
+        
+        assert result.cluster_se_type == "bootstrap_webb"
+    
+    def test_logistic_webb_reproducibility(self, logistic_webb_data):
+        """Same seed should produce identical Webb results for logistic regression."""
+        from causers import logistic_regression
+        
+        result1 = logistic_regression(
+            logistic_webb_data, "x", "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_method="webb",
+            seed=12345
+        )
+        
+        result2 = logistic_regression(
+            logistic_webb_data, "x", "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_method="webb",
+            seed=12345
+        )
+        
+        np.testing.assert_array_equal(
+            result1.standard_errors,
+            result2.standard_errors,
+            err_msg="Same seed produced different Webb SEs for logistic regression"
+        )
+        assert result1.intercept_se == result2.intercept_se
+    
+    def test_logistic_webb_different_from_rademacher(self, logistic_webb_data):
+        """Webb and Rademacher should produce different SE values for logistic."""
+        from causers import logistic_regression
+        
+        result_webb = logistic_regression(
+            logistic_webb_data, "x", "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_method="webb",
+            bootstrap_iterations=500,
+            seed=42
+        )
+        
+        result_rademacher = logistic_regression(
+            logistic_webb_data, "x", "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_method="rademacher",
+            bootstrap_iterations=500,
+            seed=42
+        )
+        
+        # SEs should differ
+        assert result_webb.standard_errors != result_rademacher.standard_errors, \
+            "Webb and Rademacher produced identical SEs for logistic regression"
+    
+    def test_logistic_webb_case_insensitive(self, logistic_webb_data):
+        """Verify bootstrap_method='webb' is case-insensitive for logistic."""
+        from causers import logistic_regression
+        
+        for method in ["webb", "Webb", "WEBB"]:
+            result = logistic_regression(
+                logistic_webb_data, "x", "y",
+                cluster="cluster_id",
+                bootstrap=True,
+                bootstrap_method=method,
+                bootstrap_iterations=100,
+                seed=42
+            )
+            assert result.cluster_se_type == "bootstrap_webb", \
+                f"Failed for bootstrap_method='{method}'"
+    
+    def test_logistic_rademacher_case_insensitive(self, logistic_webb_data):
+        """Verify bootstrap_method='rademacher' is case-insensitive for logistic."""
+        from causers import logistic_regression
+        
+        for method in ["rademacher", "Rademacher", "RADEMACHER"]:
+            result = logistic_regression(
+                logistic_webb_data, "x", "y",
+                cluster="cluster_id",
+                bootstrap=True,
+                bootstrap_method=method,
+                bootstrap_iterations=100,
+                seed=42
+            )
+            assert result.cluster_se_type == "bootstrap_rademacher", \
+                f"Failed for bootstrap_method='{method}'"
+    
+    def test_logistic_invalid_bootstrap_method(self, logistic_webb_data):
+        """Invalid bootstrap_method should raise ValueError for logistic."""
+        from causers import logistic_regression
+        
+        with pytest.raises(ValueError, match=r"bootstrap_method"):
+            logistic_regression(
+                logistic_webb_data, "x", "y",
+                cluster="cluster_id",
+                bootstrap=True,
+                bootstrap_method="invalid_method",
+                seed=42
+            )
+    
+    def test_logistic_bootstrap_method_without_bootstrap_flag(self, logistic_webb_data):
+        """bootstrap_method='webb' with bootstrap=False should raise ValueError."""
+        from causers import logistic_regression
+        
+        with pytest.raises(ValueError, match=r"bootstrap"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                logistic_regression(
+                    logistic_webb_data, "x", "y",
+                    cluster="cluster_id",
+                    bootstrap=False,
+                    bootstrap_method="webb"
+                )
+    
+    def test_logistic_default_bootstrap_method(self, logistic_webb_data):
+        """Default bootstrap_method should be 'rademacher' for logistic."""
+        from causers import logistic_regression
+        
+        result = logistic_regression(
+            logistic_webb_data, "x", "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            seed=42
+        )
+        
+        assert result.cluster_se_type == "bootstrap_rademacher"
