@@ -5,6 +5,103 @@ All notable changes to the causers project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2025-12-25
+
+### ✨ Features
+
+- **Synthetic Difference-in-Differences (SDID)**: New causal inference method
+  - New `synthetic_did()` function for panel data treatment effect estimation
+  - Implements Arkhangelsky et al. (2021) SDID estimator
+  - Combines synthetic control weighting with difference-in-differences
+
+- **SyntheticDIDResult**: New result class with comprehensive diagnostics
+  - `att`: Average Treatment Effect on the Treated
+  - `standard_error`: Bootstrap standard error
+  - `unit_weights`, `time_weights`: Optimized weights for synthetic control
+  - `n_units_control`, `n_units_treated`: Panel structure info
+  - `n_periods_pre`, `n_periods_post`: Time structure info
+  - `solver_iterations`, `solver_converged`: Optimization diagnostics
+  - `pre_treatment_fit`: RMSE of pre-treatment fit
+  - `bootstrap_iterations_used`: Number of successful bootstrap iterations
+
+- **Frank-Wolfe Solver**: Simplex-constrained optimization in Rust
+  - High-performance implementation for unit and time weight optimization
+  - Convergence tolerance: 1e-6 with max 10,000 iterations
+
+- **Placebo Bootstrap SE**: Standard error estimation via placebo resampling
+  - Default 200 bootstrap iterations
+  - Random control unit selection as placebo treated
+
+- **Input Validation**: Comprehensive validation with clear error messages
+  - Balanced panel check
+  - Treatment indicator validation (0/1 only)
+  - Minimum control units (≥2) and pre-periods (≥2) checks
+  - Float type detection for unit/time columns
+
+- **Weight Concentration Warnings**: Automatic detection of concentrated weights
+  - Warns if any unit weight > 50%
+  - Warns if any time weight > 50%
+  - Warns if bootstrap_iterations < 100
+
+### 🛠️ Technical Details
+
+- New `src/sdid.rs` module for SDID implementation
+- All numerical optimization implemented in Rust for performance
+- Matches azcausal reference implementation (ATT to rtol=1e-6, SE to rtol=1e-2)
+- 38+ unit tests covering SDID functionality
+
+### 📖 API Changes
+
+**New Functions:**
+- `synthetic_did(df, unit_col, time_col, outcome_col, treatment_col, ...)` — SDID estimation
+
+**New Classes:**
+- `SyntheticDIDResult` — Container for SDID results and diagnostics
+
+**New Parameters:**
+- `unit_col: str` — Column identifying panel units
+- `time_col: str` — Column identifying time periods
+- `outcome_col: str` — Outcome variable column
+- `treatment_col: str` — Treatment indicator column (0/1)
+- `bootstrap_iterations: int = 200` — Bootstrap replications for SE
+- `seed: Optional[int] = None` — Random seed for reproducibility
+
+**New Errors:**
+- `ValueError`: "Cannot perform SDID on empty DataFrame"
+- `ValueError`: "Column 'X' not found in DataFrame"
+- `ValueError`: "unit_col must be integer or string, not float"
+- `ValueError`: "time_col must be integer or string, not float"
+- `ValueError`: "outcome_col must be numeric"
+- `ValueError`: "outcome_col 'X' contains null values"
+- `ValueError`: "treatment_col must contain only 0 and 1 values"
+- `ValueError`: "Panel is not balanced: expected N rows, found M"
+- `ValueError`: "At least 2 control units required; found N"
+- `ValueError`: "No treated units found in data"
+- `ValueError`: "At least 2 pre-treatment periods required; found N"
+- `ValueError`: "No post-treatment periods found"
+- `ValueError`: "bootstrap_iterations must be at least 1"
+
+**New Warnings:**
+- `UserWarning`: "Unit weight concentration: control unit at index X has weight Y%"
+- `UserWarning`: "Time weight concentration: pre-period at index X has weight Y%"
+- `UserWarning`: "bootstrap_iterations=N is less than 100. Standard error estimates may be unreliable."
+
+### 📦 Dependencies
+
+- **New test dependency**: `azcausal>=0.2` for SDID validation tests
+  - Install with: `pip install causers[test]`
+
+### ⚠️ Breaking Changes
+
+None. All existing code continues to work unchanged.
+
+### 📚 References
+
+- Arkhangelsky, D., Athey, S., Hirshberg, D. A., Imbens, G. W., & Wager, S. (2021).
+  Synthetic difference-in-differences. *American Economic Review*, 111(12), 4088-4118.
+
+---
+
 ## [0.3.0] - 2025-12-25
 
 ### ✨ Features
@@ -311,6 +408,7 @@ MIT License - see LICENSE file for details.
 
 ---
 
+[0.4.0]: https://github.com/causers/causers/releases/tag/v0.4.0
 [0.3.0]: https://github.com/causers/causers/releases/tag/v0.3.0
 [0.2.0]: https://github.com/causers/causers/releases/tag/v0.2.0
 [0.1.0]: https://github.com/causers/causers/releases/tag/v0.1.0

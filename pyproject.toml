@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "causers"
-version = "0.2.0"
+version = "0.4.0"
 description = "High-performance statistical operations for Polars DataFrames"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -47,6 +47,7 @@ test = [
     "pytest>=7.0",
     "numpy>=1.20",
     "statsmodels>=0.14.0,<0.16.0",
+    "azcausal>=0.2",
 ]
 
 [project.urls]
@@ -70,6 +71,11 @@ target-version = ["py38"]
 line-length = 100
 target-version = "py38"
 select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
 
 [tool.mypy]
 python_version = "3.8"

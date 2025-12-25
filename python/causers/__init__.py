@@ -9,22 +9,26 @@ from typing import List as _List, Optional as _Optional, Union as _Union
 import warnings as _warnings
 import polars as _polars
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Import the Rust extension module
 from causers._causers import (
     LinearRegressionResult,
     LogisticRegressionResult,
+    SyntheticDIDResult,
     linear_regression as _linear_regression_rust,
     logistic_regression as _logistic_regression_rust,
+    synthetic_did_impl as _synthetic_did_impl,
 )
 
 # Re-export main functions
 __all__ = [
     "LinearRegressionResult",
     "LogisticRegressionResult",
+    "SyntheticDIDResult",
     "linear_regression",
     "logistic_regression",
+    "synthetic_did",
 ]
 
 
@@ -530,6 +534,382 @@ def logistic_regression(
     return result
 
 
+def synthetic_did(
+    df: _polars.DataFrame,
+    unit_col: str,
+    time_col: str,
+    outcome_col: str,
+    treatment_col: str,
+    bootstrap_iterations: int = 200,
+    seed: _Optional[int] = None,
+) -> SyntheticDIDResult:
+    """
+    Compute Synthetic Difference-in-Differences (SDID) estimator.
+    
+    Implements the SDID estimator from Arkhangelsky et al. (2021), which combines
+    synthetic control weighting with difference-in-differences to estimate the
+    Average Treatment Effect on the Treated (ATT).
+    
+    The estimator uses two-stage optimization:
+    1. **Unit weights**: Find control unit weights that match pre-treatment trends
+    2. **Time weights**: Find pre-period weights that predict post-period outcomes
+    
+    Standard errors are computed via placebo bootstrap.
+    
+    Parameters
+    ----------
+    df : pl.DataFrame
+        Panel data in long format with one row per unit-time observation.
+        Must be a balanced panel (all units observed in all time periods).
+    unit_col : str
+        Column name identifying unique units (e.g., "state", "firm_id").
+        Must be integer or string type.
+    time_col : str
+        Column name identifying time periods (e.g., "year", "quarter").
+        Must be integer or string type.
+    outcome_col : str
+        Column name for the outcome variable. Must be numeric.
+    treatment_col : str
+        Column name for treatment indicator. Must contain only 0 and 1 values.
+        Value of 1 indicates the unit is treated in that period.
+    bootstrap_iterations : int, default=200
+        Number of placebo bootstrap iterations for standard error estimation.
+        Must be at least 1. Values < 100 will emit a warning.
+    seed : int, optional
+        Random seed for reproducibility. If None, uses system time.
+    
+    Returns
+    -------
+    SyntheticDIDResult
+        Result object with the following attributes:
+        
+        - att : float
+            Average Treatment Effect on the Treated
+        - standard_error : float
+            Bootstrap standard error of the ATT
+        - unit_weights : List[float]
+            Weights assigned to each control unit (sums to 1)
+        - time_weights : List[float]
+            Weights assigned to each pre-treatment period (sums to 1)
+        - n_units_control : int
+            Number of control units
+        - n_units_treated : int
+            Number of treated units
+        - n_periods_pre : int
+            Number of pre-treatment periods
+        - n_periods_post : int
+            Number of post-treatment periods
+        - solver_iterations : Tuple[int, int]
+            Number of iterations for (unit_weights, time_weights) optimization
+        - solver_converged : bool
+            Whether the Frank-Wolfe solver converged
+        - pre_treatment_fit : float
+            RMSE of pre-treatment fit (lower is better)
+        - bootstrap_iterations_used : int
+            Number of successful bootstrap iterations
+    
+    Raises
+    ------
+    ValueError
+        - If DataFrame is empty
+        - If any specified column doesn't exist
+        - If unit_col or time_col is float type
+        - If outcome_col is not numeric
+        - If outcome_col contains null values
+        - If treatment_col contains values other than 0 and 1
+        - If bootstrap_iterations < 1
+        - If fewer than 2 control units found
+        - If fewer than 2 pre-treatment periods found
+        - If no treated units found
+        - If no post-treatment periods found
+        - If panel is not balanced
+    
+    Warns
+    -----
+    UserWarning
+        - If any unit weight > 0.5 (weight concentration on single unit)
+        - If any time weight > 0.5 (weight concentration on single period)
+        - If bootstrap_iterations < 100 (may be unreliable)
+    
+    Examples
+    --------
+    Basic usage with panel data:
+    
+    >>> import polars as pl
+    >>> import causers
+    >>> df = pl.DataFrame({
+    ...     'unit': [1, 1, 1, 2, 2, 2, 3, 3, 3],
+    ...     'time': [1, 2, 3, 1, 2, 3, 1, 2, 3],
+    ...     'y': [1.0, 2.0, 5.0, 1.5, 2.5, 3.0, 1.2, 2.2, 2.8],
+    ...     'treated': [0, 0, 1, 0, 0, 0, 0, 0, 0]
+    ... })
+    >>> result = causers.synthetic_did(df, 'unit', 'time', 'y', 'treated', seed=42)
+    >>> print(f"ATT: {result.att:.4f} ± {result.standard_error:.4f}")
+    ATT: ... ± ...
+    
+    Accessing weights and diagnostics:
+    
+    >>> print(f"Control unit weights: {result.unit_weights}")
+    Control unit weights: [...]
+    >>> print(f"Pre-treatment fit RMSE: {result.pre_treatment_fit:.4f}")
+    Pre-treatment fit RMSE: ...
+    
+    Notes
+    -----
+    **Panel Structure Detection**
+    
+    The function automatically detects:
+    - **Control units**: Units where treatment=0 in all periods
+    - **Treated units**: Units where treatment=1 in at least one period
+    - **Pre-periods**: Periods where all observations have treatment=0
+    - **Post-periods**: Periods where at least one treated unit has treatment=1
+    
+    **Algorithm**
+    
+    The SDID estimator is:
+    
+    .. math::
+    
+        \\hat{\\tau}_{sdid} = (\\bar{Y}_{tr,post} - \\bar{Y}_{synth,post})
+                            - \\sum_t \\lambda_t (\\bar{Y}_{tr,t} - \\bar{Y}_{synth,t})
+    
+    where :math:`\\bar{Y}_{synth,t} = \\sum_i \\omega_i Y_{i,t}` uses optimized
+    unit weights :math:`\\omega` on control units.
+    
+    **Standard Errors**
+    
+    Standard errors are computed via placebo bootstrap:
+    1. Randomly select a control unit as "placebo treated"
+    2. Re-run SDID with this unit treated
+    3. Repeat for bootstrap_iterations
+    4. SE = standard deviation of placebo ATTs
+    
+    References
+    ----------
+    Arkhangelsky, D., Athey, S., Hirshberg, D. A., Imbens, G. W., & Wager, S. (2021).
+    Synthetic difference-in-differences. *American Economic Review*, 111(12), 4088-4118.
+    
+    See Also
+    --------
+    SyntheticDIDResult : Result class with ATT and diagnostics.
+    linear_regression : For standard regression analysis.
+    """
+    # ========================================================================
+    # Input Validation
+    # ========================================================================
+    
+    # Check DataFrame is not empty
+    if len(df) == 0:
+        raise ValueError("Cannot perform SDID on empty DataFrame")
+    
+    # Check all required columns exist
+    for col_name, col_label in [
+        (unit_col, "unit_col"),
+        (time_col, "time_col"),
+        (outcome_col, "outcome_col"),
+        (treatment_col, "treatment_col"),
+    ]:
+        if col_name not in df.columns:
+            raise ValueError(f"Column '{col_name}' not found in DataFrame")
+    
+    # Check unit_col is not float
+    unit_dtype = df[unit_col].dtype
+    if unit_dtype in (_polars.Float32, _polars.Float64):
+        raise ValueError(f"unit_col must be integer or string, not float")
+    
+    # Check time_col is not float
+    time_dtype = df[time_col].dtype
+    if time_dtype in (_polars.Float32, _polars.Float64):
+        raise ValueError(f"time_col must be integer or string, not float")
+    
+    # Check outcome_col is numeric
+    outcome_dtype = df[outcome_col].dtype
+    numeric_types = (
+        _polars.Float32, _polars.Float64,
+        _polars.Int8, _polars.Int16, _polars.Int32, _polars.Int64,
+        _polars.UInt8, _polars.UInt16, _polars.UInt32, _polars.UInt64,
+    )
+    if outcome_dtype not in numeric_types:
+        raise ValueError(f"outcome_col must be numeric")
+    
+    # Check for nulls in outcome_col
+    null_count = df[outcome_col].null_count()
+    if null_count > 0:
+        raise ValueError(f"outcome_col '{outcome_col}' contains null values")
+    
+    # Check treatment_col contains only 0 and 1
+    treatment_values = df[treatment_col].unique().to_list()
+    valid_treatment_values = {0, 1, 0.0, 1.0}
+    for val in treatment_values:
+        if val not in valid_treatment_values:
+            raise ValueError("treatment_col must contain only 0 and 1 values")
+    
+    # Check bootstrap_iterations >= 1
+    if bootstrap_iterations < 1:
+        raise ValueError("bootstrap_iterations must be at least 1")
+    
+    # ========================================================================
+    # Panel Structure Detection
+    # ========================================================================
+    
+    # Get unique units and periods
+    unique_units = df[unit_col].unique().sort().to_list()
+    unique_periods = df[time_col].unique().sort().to_list()
+    n_units = len(unique_units)
+    n_periods = len(unique_periods)
+    
+    # Create mappings from unit/period values to indices
+    unit_to_idx = {unit: idx for idx, unit in enumerate(unique_units)}
+    period_to_idx = {period: idx for idx, period in enumerate(unique_periods)}
+    
+    # Validate balanced panel
+    expected_rows = n_units * n_periods
+    if len(df) != expected_rows:
+        raise ValueError(
+            f"Panel is not balanced: expected {expected_rows} rows "
+            f"({n_units} units × {n_periods} periods), found {len(df)}"
+        )
+    
+    # Identify control vs treated units
+    # Control units: treatment=0 in ALL periods
+    # Treated units: treatment=1 in at least one period
+    unit_max_treatment = (
+        df.group_by(unit_col)
+        .agg(_polars.col(treatment_col).max().alias("max_treatment"))
+    )
+    
+    control_units = []
+    treated_units = []
+    for row in unit_max_treatment.iter_rows():
+        unit_val, max_treat = row[0], row[1]
+        if max_treat == 0 or max_treat == 0.0:
+            control_units.append(unit_val)
+        else:
+            treated_units.append(unit_val)
+    
+    # Sort for deterministic ordering
+    control_units = sorted(control_units, key=lambda x: unit_to_idx[x])
+    treated_units = sorted(treated_units, key=lambda x: unit_to_idx[x])
+    
+    # Validate sufficient control units
+    n_control = len(control_units)
+    if n_control < 2:
+        raise ValueError(f"At least 2 control units required; found {n_control}")
+    
+    # Validate at least 1 treated unit
+    n_treated = len(treated_units)
+    if n_treated == 0:
+        raise ValueError("No treated units found in data")
+    
+    # Identify pre vs post periods
+    # Pre-periods: all observations have treatment=0
+    # Post-periods: at least one treated unit has treatment=1
+    period_max_treatment = (
+        df.group_by(time_col)
+        .agg(_polars.col(treatment_col).max().alias("max_treatment"))
+    )
+    
+    pre_periods = []
+    post_periods = []
+    for row in period_max_treatment.iter_rows():
+        period_val, max_treat = row[0], row[1]
+        if max_treat == 0 or max_treat == 0.0:
+            pre_periods.append(period_val)
+        else:
+            post_periods.append(period_val)
+    
+    # Sort for deterministic ordering
+    pre_periods = sorted(pre_periods, key=lambda x: period_to_idx[x])
+    post_periods = sorted(post_periods, key=lambda x: period_to_idx[x])
+    
+    # Validate sufficient pre-periods
+    n_pre = len(pre_periods)
+    if n_pre < 2:
+        raise ValueError(f"At least 2 pre-treatment periods required; found {n_pre}")
+    
+    # Validate at least 1 post-period
+    n_post = len(post_periods)
+    if n_post == 0:
+        raise ValueError("No post-treatment periods found")
+    
+    # ========================================================================
+    # Extract Outcome Matrix (Row-Major Order)
+    # ========================================================================
+    
+    # Sort DataFrame by unit, then time for consistent ordering
+    df_sorted = df.sort([unit_col, time_col])
+    
+    # Create outcome array in row-major order: outcomes[unit_idx * n_periods + period_idx]
+    outcomes = []
+    for unit in unique_units:
+        unit_df = df_sorted.filter(_polars.col(unit_col) == unit).sort(time_col)
+        outcomes.extend(unit_df[outcome_col].to_list())
+    
+    # Convert to flat list of floats
+    outcomes = [float(v) for v in outcomes]
+    
+    # Create index arrays
+    control_indices = [unit_to_idx[u] for u in control_units]
+    treated_indices = [unit_to_idx[u] for u in treated_units]
+    pre_period_indices = [period_to_idx[p] for p in pre_periods]
+    post_period_indices = [period_to_idx[p] for p in post_periods]
+    
+    # ========================================================================
+    # Call Rust Implementation
+    # ========================================================================
+    
+    result = _synthetic_did_impl(
+        outcomes=outcomes,
+        n_units=n_units,
+        n_periods=n_periods,
+        control_indices=control_indices,
+        treated_indices=treated_indices,
+        pre_period_indices=pre_period_indices,
+        post_period_indices=post_period_indices,
+        bootstrap_iterations=bootstrap_iterations,
+        seed=seed,
+    )
+    
+    # ========================================================================
+    # Post-Processing Warnings
+    # ========================================================================
+    
+    # Check for unit weight concentration
+    if result.unit_weights:
+        max_unit_weight = max(result.unit_weights)
+        if max_unit_weight > 0.5:
+            max_idx = result.unit_weights.index(max_unit_weight)
+            _warnings.warn(
+                f"Unit weight concentration: control unit at index {max_idx} has "
+                f"weight {max_unit_weight:.2%}. Results may be sensitive to this unit.",
+                UserWarning,
+                stacklevel=2
+            )
+    
+    # Check for time weight concentration
+    if result.time_weights:
+        max_time_weight = max(result.time_weights)
+        if max_time_weight > 0.5:
+            max_idx = result.time_weights.index(max_time_weight)
+            _warnings.warn(
+                f"Time weight concentration: pre-period at index {max_idx} has "
+                f"weight {max_time_weight:.2%}. Results may be sensitive to this period.",
+                UserWarning,
+                stacklevel=2
+            )
+    
+    # Check for low bootstrap iterations
+    if bootstrap_iterations < 100:
+        _warnings.warn(
+            f"bootstrap_iterations={bootstrap_iterations} is less than 100. "
+            f"Standard error estimates may be unreliable.",
+            UserWarning,
+            stacklevel=2
+        )
+    
+    return result
+
+
 def about():
     """Print information about the causers package."""
     print(f"causers version {__version__}")
@@ -542,3 +922,4 @@ def about():
     print("  - Cluster-robust standard errors (analytical and bootstrap)")
     print("  - Wild cluster bootstrap for small cluster counts (linear)")
     print("  - Score bootstrap for small cluster counts (logistic)")
+    print("  - Synthetic Difference-in-Differences (SDID)")

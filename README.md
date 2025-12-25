@@ -21,6 +21,7 @@ A high-performance statistical package for Polars DataFrames, powered by Rust.
 - **🎯 Flexible Models**: Optional intercept for fully saturated models
 - **🏢 Clustered Standard Errors**: Cluster-robust SE for panel/grouped data
 - **🔄 Bootstrap Methods**: Wild cluster bootstrap (linear) and score bootstrap (logistic)
+- **🧪 Synthetic DID**: Synthetic Difference-in-Differences for causal inference with panel data
 - **🔧 Native Polars Integration**: Zero-copy operations on Polars DataFrames
 - **🦀 Rust-Powered**: Core computations in Rust for maximum throughput
 - **🐍 Pythonic API**: Clean, intuitive interface with full type hints
@@ -223,6 +224,51 @@ print(f"Standard Error: {result.standard_errors[0]:.4f}")
 print(f"Intercept SE: {result.intercept_se}")  # None
 ```
 
+### Synthetic Difference-in-Differences
+
+Estimate causal effects from panel data using Synthetic DID (Arkhangelsky et al., 2021):
+
+```python
+import polars as pl
+import causers
+
+# Panel data: units observed over time, with treatment in post-period
+df = pl.DataFrame({
+    "unit": [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
+    "time": [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3],
+    "outcome": [1.0, 2.0, 3.0, 9.0,   # Unit 0: treated (effect = 5)
+                1.0, 2.0, 3.0, 4.0,   # Unit 1: control
+                1.5, 2.5, 3.5, 4.5,   # Unit 2: control
+                0.5, 1.5, 2.5, 3.5],  # Unit 3: control
+    "treated": [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+})
+
+result = causers.synthetic_did(
+    df,
+    unit_col="unit",
+    time_col="time",
+    outcome_col="outcome",
+    treatment_col="treated",
+    bootstrap_iterations=200,
+    seed=42
+)
+
+print(f"ATT: {result.att:.4f} ± {result.standard_error:.4f}")
+print(f"Panel: {result.n_units_control} control, {result.n_units_treated} treated")
+print(f"Periods: {result.n_periods_pre} pre, {result.n_periods_post} post")
+print(f"Pre-treatment fit (RMSE): {result.pre_treatment_fit:.4f}")
+```
+
+Output:
+```
+ATT: 5.0000 ± 0.0000
+Panel: 3 control, 1 treated
+Periods: 3 pre, 1 post
+Pre-treatment fit (RMSE): 0.0000
+```
+
+> **Note**: The Frank-Wolfe algorithm solves for optimal unit and time weights constrained to the unit simplex. Placebo bootstrap is used by default for standard error estimation.
+
 ## 📊 Performance Benchmarks
 
 Benchmarked on Apple M1 Pro with 16GB RAM:
@@ -335,6 +381,59 @@ Performs logistic regression on binary outcomes using Maximum Likelihood Estimat
 **Raises:**
 - `ValueError`: If y contains values other than 0/1, perfect separation is detected, or convergence fails
 - `TypeError`: If columns contain non-numeric data
+
+### `synthetic_did(df, unit_col, time_col, outcome_col, treatment_col, ...)`
+
+Performs Synthetic Difference-in-Differences (SDID) estimation on balanced panel data (Arkhangelsky et al., 2021).
+
+**Parameters:**
+- `df` (pl.DataFrame): Balanced panel data in long format
+- `unit_col` (str): Column name for unit identifiers
+- `time_col` (str): Column name for time period identifiers
+- `outcome_col` (str): Column name for the outcome variable
+- `treatment_col` (str): Column name for treatment indicator (0/1)
+- `bootstrap_iterations` (int, optional): Number of placebo bootstrap iterations. Default: `200`
+- `seed` (int, optional): Random seed for reproducibility. Default: `None`
+
+**Returns:**
+- `SyntheticDIDResult`: Object with the following attributes:
+  - `att` (float): Average Treatment Effect on the Treated
+  - `standard_error` (float): Placebo bootstrap standard error
+  - `unit_weights` (List[float]): Weights for control units (sum to 1.0)
+  - `time_weights` (List[float]): Weights for pre-treatment periods (sum to 1.0)
+  - `n_units_control` (int): Number of control units
+  - `n_units_treated` (int): Number of treated units
+  - `n_periods_pre` (int): Number of pre-treatment periods
+  - `n_periods_post` (int): Number of post-treatment periods
+  - `solver_converged` (bool): Whether Frank-Wolfe solver converged
+  - `solver_iterations` (tuple): Iterations used for (unit, time) weight optimization
+  - `pre_treatment_fit` (float): RMSE of synthetic control in pre-treatment period
+  - `bootstrap_iterations_used` (int): Number of bootstrap iterations used
+
+**Raises:**
+- `ValueError`: If panel is unbalanced, < 2 control units, < 2 pre-periods, no treated units, or treatment values not 0/1
+
+**Example:**
+
+```python
+import polars as pl
+import causers
+
+# Estimate treatment effect with SDID
+result = causers.synthetic_did(
+    panel_data,
+    unit_col="state",
+    time_col="year",
+    outcome_col="gdp_growth",
+    treatment_col="policy_adopted",
+    bootstrap_iterations=500,
+    seed=42
+)
+
+print(f"Estimated ATT: {result.att:.4f}")
+print(f"95% CI: [{result.att - 1.96*result.standard_error:.4f}, "
+      f"{result.att + 1.96*result.standard_error:.4f}]")
+```
 
 For full API documentation, see [docs/api-reference.md](docs/api-reference.md).
 
@@ -454,7 +553,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 - ✅ Extreme leverage detection and error handling
 - ✅ Comprehensive test coverage with edge cases
 
-### v0.3.0 (Current)
+### v0.3.0
 - ✅ **Logistic regression** with Newton-Raphson MLE
 - ✅ Score bootstrap for logistic regression (Kline & Santos, 2012)
 - ✅ Clustered standard errors (analytical)
@@ -466,10 +565,12 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 - ✅ **Webb weights for bootstrap** (`bootstrap_method="webb"`)
 - ✅ Method-specific `cluster_se_type` values (`"bootstrap_rademacher"`, `"bootstrap_webb"`)
 
-### v0.4.0 (Planned)
-- 🔲 Weighted least squares
-- 🔲 Two-way clustering
-- 🔲 Confidence intervals and p-values
+### v0.4.0 (Current)
+- ✅ **Synthetic Difference-in-Differences** (Arkhangelsky et al., 2021)
+- ✅ Frank-Wolfe algorithm for simplex-constrained weight optimization
+- ✅ Placebo bootstrap for standard error estimation
+- ✅ azcausal-validated accuracy (ATT rtol=1e-6, SE rtol=0.5)
+- ✅ Performance: 1000×100 panel < 1 second
 
 ## 🔒 Security
 
@@ -505,7 +606,7 @@ Please [open an issue](https://github.com/causers/causers/issues/new) with:
 ## 📊 Status
 
 - **Build**: ✅ Passing
-- **Tests**: ✅ 64/64 passing
+- **Tests**: ✅ 193/193 passing
 - **Coverage**: ✅ 100%
 - **Performance**: ✅ <100ms for 1M rows
 - **Security**: ✅ B+ rating

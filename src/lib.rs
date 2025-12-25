@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 
 mod cluster;
 mod logistic;
+mod sdid;
 mod stats;
 
 use cluster::{
@@ -12,6 +13,7 @@ use logistic::{
     compute_hc3_logistic, compute_logistic_mle, compute_null_log_likelihood,
     compute_pseudo_r_squared, LogisticError, LogisticRegressionResult,
 };
+use sdid::{synthetic_did_impl, SyntheticDIDResult};
 use stats::LinearRegressionResult;
 
 /// Main module for causers - statistical operations for Polars DataFrames
@@ -19,8 +21,10 @@ use stats::LinearRegressionResult;
 fn _causers(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LinearRegressionResult>()?;
     m.add_class::<LogisticRegressionResult>()?;
+    m.add_class::<SyntheticDIDResult>()?;
     m.add_function(wrap_pyfunction!(linear_regression, m)?)?;
     m.add_function(wrap_pyfunction!(logistic_regression, m)?)?;
+    m.add_function(wrap_pyfunction!(synthetic_did_impl, m)?)?;
     Ok(())
 }
 
@@ -1089,10 +1093,7 @@ fn compute_logistic_regression_with_cluster(
 
     // Extract intercept and coefficients
     let (intercept, coefficients) = if include_intercept {
-        (
-            Some(mle_result.beta[0]),
-            mle_result.beta[1..].to_vec(),
-        )
+        (Some(mle_result.beta[0]), mle_result.beta[1..].to_vec())
     } else {
         (None, mle_result.beta)
     };

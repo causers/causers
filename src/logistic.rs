@@ -136,7 +136,12 @@ impl LogisticRegressionResult {
         }
 
         // Print coefficients
-        for (i, (&coef, &se)) in self.coefficients.iter().zip(&self.standard_errors).enumerate() {
+        for (i, (&coef, &se)) in self
+            .coefficients
+            .iter()
+            .zip(&self.standard_errors)
+            .enumerate()
+        {
             output.push_str(&format!("  β{} = {:.4} ± {:.4}\n", i + 1, coef, se));
         }
 
@@ -149,7 +154,10 @@ impl LogisticRegressionResult {
         // Add clustering info if present
         if let Some(n_clusters) = self.n_clusters {
             let method = self.cluster_se_type.as_deref().unwrap_or("unknown");
-            output.push_str(&format!("\n  Clustered SE ({}): {} clusters", method, n_clusters));
+            output.push_str(&format!(
+                "\n  Clustered SE ({}): {} clusters",
+                method, n_clusters
+            ));
         }
 
         output
@@ -422,9 +430,10 @@ pub fn compute_null_log_likelihood(y: &[f64]) -> f64 {
     let epsilon = 1e-15;
     let mean_clipped = mean_y.max(epsilon).min(1.0 - epsilon);
 
-    let ll_null = y.iter().map(|&yi| {
-        yi * mean_clipped.ln() + (1.0 - yi) * (1.0 - mean_clipped).ln()
-    }).sum();
+    let ll_null = y
+        .iter()
+        .map(|&yi| yi * mean_clipped.ln() + (1.0 - yi) * (1.0 - mean_clipped).ln())
+        .sum();
 
     ll_null
 }
@@ -485,12 +494,7 @@ fn has_invalid_values(v: &[f64]) -> bool {
 /// Compute Newton step with step halving for numerical stability.
 ///
 /// Returns true if a valid step was found, false otherwise.
-fn newton_step_with_halving(
-    beta: &mut [f64],
-    delta: &[f64],
-    x: &[Vec<f64>],
-    y: &[f64],
-) -> bool {
+fn newton_step_with_halving(beta: &mut [f64], delta: &[f64], x: &[Vec<f64>], y: &[f64]) -> bool {
     let old_ll = compute_log_likelihood(x, y, beta);
     let p = beta.len();
 
@@ -555,10 +559,7 @@ pub fn compute_logistic_mle(x: &[Vec<f64>], y: &[f64]) -> Result<MleResult, Logi
         iterations = iter + 1;
 
         // Compute π = sigmoid(Xβ)
-        pi = x
-            .iter()
-            .map(|xi| sigmoid(dot(xi, &beta)))
-            .collect();
+        pi = x.iter().map(|xi| sigmoid(dot(xi, &beta))).collect();
 
         // Check for perfect separation
         if detect_separation(&beta, &pi) {
