@@ -104,6 +104,10 @@ impl LinearRegressionResult {
 /// * `x` - Matrix of predictor variables (rows are observations, columns are variables)
 /// * `y` - Vector of response variable
 /// * `include_intercept` - Whether to include an intercept term
+///
+/// Note: This function is kept for standalone module use and unit tests.
+/// The main library uses compute_linear_regression_with_cluster in lib.rs.
+#[allow(dead_code)]
 pub fn compute_linear_regression(
     x: &[Vec<f64>],
     y: &[f64],
@@ -151,12 +155,12 @@ pub fn compute_linear_regression(
 
     // Build design matrix X
     let mut design_matrix = Vec::new();
-    for i in 0..n {
+    for x_row in x.iter() {
         let mut row = Vec::new();
         if include_intercept {
             row.push(1.0); // Add intercept column
         }
-        row.extend_from_slice(&x[i]);
+        row.extend_from_slice(x_row);
         design_matrix.push(row);
     }
 
@@ -172,24 +176,24 @@ pub fn compute_linear_regression(
 
     // Compute X'X
     let mut xtx = vec![vec![0.0; n_params]; n_params];
-    for i in 0..n_params {
+    for (i, xtx_row) in xtx.iter_mut().enumerate() {
         for j in 0..n_params {
             let mut sum = 0.0;
-            for k in 0..n {
-                sum += design_matrix[k][i] * design_matrix[k][j];
+            for dm_row in design_matrix.iter() {
+                sum += dm_row[i] * dm_row[j];
             }
-            xtx[i][j] = sum;
+            xtx_row[j] = sum;
         }
     }
 
     // Compute X'y
     let mut xty = vec![0.0; n_params];
-    for i in 0..n_params {
+    for (i, xty_val) in xty.iter_mut().enumerate() {
         let mut sum = 0.0;
-        for k in 0..n {
-            sum += design_matrix[k][i] * y[k];
+        for (dm_row, &y_val) in design_matrix.iter().zip(y.iter()) {
+            sum += dm_row[i] * y_val;
         }
-        xty[i] = sum;
+        *xty_val = sum;
     }
 
     // Compute (X'X)^-1 and use it for both coefficient estimation and HC3
@@ -200,13 +204,16 @@ pub fn compute_linear_regression(
     let coefficients_full = matrix_vector_multiply(&xtx_inv, &xty);
 
     // Compute residuals explicitly: e = y - Xβ
-    let residuals: Vec<f64> = (0..n)
-        .map(|i| {
-            let mut y_pred = 0.0;
-            for j in 0..n_params {
-                y_pred += coefficients_full[j] * design_matrix[i][j];
-            }
-            y[i] - y_pred
+    let residuals: Vec<f64> = design_matrix
+        .iter()
+        .zip(y.iter())
+        .map(|(dm_row, &y_val)| {
+            let y_pred: f64 = coefficients_full
+                .iter()
+                .zip(dm_row.iter())
+                .map(|(&coef, &dm_val)| coef * dm_val)
+                .sum();
+            y_val - y_pred
         })
         .collect();
 
@@ -281,6 +288,9 @@ pub fn compute_linear_regression(
 }
 
 /// Solve a linear system Ax = b using Gaussian elimination with partial pivoting
+///
+/// Note: Kept for potential future use in the stats module.
+#[allow(dead_code)]
 fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> PyResult<Vec<f64>> {
     let n = a.len();
     if n == 0 || a[0].len() != n || b.len() != n {
@@ -302,7 +312,9 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> PyResult<Vec<f64>> {
         // Find pivot
         let mut max_row = i;
         let mut max_val = aug[i][i].abs();
+        #[allow(clippy::needless_range_loop)]
         for k in (i + 1)..n {
+            // Index k needed for row swapping and in-place modification
             let val = aug[k][i].abs();
             if val > max_val {
                 max_val = val;
@@ -334,7 +346,9 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> PyResult<Vec<f64>> {
     let mut x = vec![0.0; n];
     for i in (0..n).rev() {
         let mut sum = aug[i][n];
+        #[allow(clippy::needless_range_loop)]
         for j in (i + 1)..n {
+            // Index j needed for random access to x
             sum -= aug[i][j] * x[j];
         }
         x[i] = sum / aug[i][i];
@@ -366,6 +380,9 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> PyResult<Vec<f64>> {
 ///    - Scale pivot row so diagonal element is 1
 ///    - Eliminate all other entries in column i
 /// 3. After processing, left side is I, right side is A^-1
+///
+/// Note: Used internally by compute_linear_regression and tests.
+#[allow(dead_code)]
 fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
     let n = a.len();
     if n == 0 {
@@ -385,10 +402,10 @@ fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
 
     // Create augmented matrix [A|I] of size (n × 2n)
     let mut aug: Vec<Vec<f64>> = Vec::with_capacity(n);
-    for i in 0..n {
+    for (i, a_row) in a.iter().enumerate() {
         let mut row = Vec::with_capacity(2 * n);
         // Copy A into left half
-        row.extend_from_slice(&a[i]);
+        row.extend_from_slice(a_row);
         // Add identity matrix to right half
         for j in 0..n {
             row.push(if i == j { 1.0 } else { 0.0 });
@@ -401,7 +418,9 @@ fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
         // Find pivot: row with maximum absolute value in current column
         let mut max_row = col;
         let mut max_val = aug[col][col].abs();
+        #[allow(clippy::needless_range_loop)]
         for row in (col + 1)..n {
+            // Index row needed for row swapping and in-place modification
             let val = aug[row][col].abs();
             if val > max_val {
                 max_val = val;
@@ -440,8 +459,8 @@ fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
 
     // Extract inverse from right half of augmented matrix
     let mut inverse: Vec<Vec<f64>> = Vec::with_capacity(n);
-    for i in 0..n {
-        inverse.push(aug[i][n..(2 * n)].to_vec());
+    for aug_row in aug.iter() {
+        inverse.push(aug_row[n..(2 * n)].to_vec());
     }
 
     Ok(inverse)
@@ -458,6 +477,9 @@ fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
 ///
 /// # Returns
 /// * `Vec<f64>` - Result vector of length m
+///
+/// Note: Used internally by compute_linear_regression and tests.
+#[allow(dead_code)]
 fn matrix_vector_multiply(a: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
     let m = a.len();
     let mut result = Vec::with_capacity(m);
@@ -484,6 +506,9 @@ fn matrix_vector_multiply(a: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
 ///
 /// # Returns
 /// * `Vec<Vec<f64>>` - Result matrix of shape (m × n)
+///
+/// Note: Used internally by compute_hc3_vcov and tests.
+#[allow(dead_code)]
 fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let m = a.len();
     if m == 0 {
@@ -497,11 +522,11 @@ fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
 
     let mut result = vec![vec![0.0; n]; m];
 
-    for i in 0..m {
+    for (i, a_row) in a.iter().enumerate() {
         for j in 0..n {
             let mut sum = 0.0;
-            for l in 0..k {
-                sum += a[i][l] * b[l][j];
+            for (l, &a_val) in a_row.iter().enumerate() {
+                sum += a_val * b[l][j];
             }
             result[i][j] = sum;
         }
@@ -529,6 +554,9 @@ fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
 ///
 /// # Errors
 /// * `PyValueError` if any h_ii >= 0.99 (extreme leverage makes HC3 unreliable)
+///
+/// Note: Used internally by compute_linear_regression and tests.
+#[allow(dead_code)]
 fn compute_leverages(design_matrix: &[Vec<f64>], xtx_inv: &[Vec<f64>]) -> PyResult<Vec<f64>> {
     let n = design_matrix.len();
     let mut leverages = Vec::with_capacity(n);
@@ -580,13 +608,16 @@ fn compute_leverages(design_matrix: &[Vec<f64>], xtx_inv: &[Vec<f64>]) -> PyResu
 ///
 /// # Returns
 /// * `Vec<Vec<f64>>` - HC3 variance-covariance matrix (p × p)
+///
+/// Note: Used internally by compute_linear_regression and tests.
+#[allow(dead_code)]
 fn compute_hc3_vcov(
     design_matrix: &[Vec<f64>],
     residuals: &[f64],
     leverages: &[f64],
     xtx_inv: &[Vec<f64>],
 ) -> Vec<Vec<f64>> {
-    let n = design_matrix.len();
+    let _n = design_matrix.len();
     let p = xtx_inv.len();
 
     // Compute the "meat" of the sandwich: X' Ω X
@@ -594,16 +625,16 @@ fn compute_hc3_vcov(
     // This is computed efficiently in a single pass over observations
     let mut meat = vec![vec![0.0; p]; p];
 
-    for i in 0..n {
+    for (i, dm_row) in design_matrix.iter().enumerate() {
         // HC3 weight: e_i² / (1 - h_ii)²
         let one_minus_h = 1.0 - leverages[i];
         let omega_ii = residuals[i].powi(2) / one_minus_h.powi(2);
 
         // Accumulate x_i' × omega_ii × x_i into meat matrix
         // meat[j][k] += x_ij * omega_ii * x_ik
-        for j in 0..p {
+        for (j, meat_row) in meat.iter_mut().enumerate() {
             for k in 0..p {
-                meat[j][k] += design_matrix[i][j] * omega_ii * design_matrix[i][k];
+                meat_row[k] += dm_row[j] * omega_ii * dm_row[k];
             }
         }
     }
@@ -612,9 +643,7 @@ fn compute_hc3_vcov(
     // First: temp = (X'X)^-1 × meat
     let temp = matrix_multiply(xtx_inv, &meat);
     // Then: result = temp × (X'X)^-1
-    let hc3_vcov = matrix_multiply(&temp, xtx_inv);
-
-    hc3_vcov
+    matrix_multiply(&temp, xtx_inv)
 }
 
 #[cfg(test)]

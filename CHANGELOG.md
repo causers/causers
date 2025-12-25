@@ -5,16 +5,35 @@ All notable changes to the causers project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2025-12-24
+## [0.3.0] - 2025-12-25
 
 ### ✨ Features
+
+- **Logistic Regression**: Binary outcome regression with MLE estimation
+  - New `logistic_regression()` function with same API pattern as linear regression
+  - Newton-Raphson optimization with configurable max iterations (35)
+  - McFadden's pseudo R² for model fit assessment
+  - Perfect separation detection with clear error messages
+  - Matches statsmodels `Logit.fit()` coefficients to `rtol=1e-6`
+
+- **LogisticRegressionResult**: New result class with diagnostic fields
+  - `coefficients`, `intercept`, `standard_errors`, `intercept_se`: Estimates and SE
+  - `converged`, `iterations`: Convergence diagnostics
+  - `log_likelihood`, `pseudo_r_squared`: Model fit statistics
+  - `n_clusters`, `cluster_se_type`, `bootstrap_iterations_used`: Clustering info
+
+- **Score Bootstrap for Logistic Regression**: Clustered SE via score-based resampling
+  - Implements Kline & Santos (2012) methodology
+  - Uses Rademacher weights (±1 with equal probability)
+  - Appropriate for MLE models unlike wild bootstrap
+  - See `docs/score_bootstrap.md` for methodology details
 
 - **Clustered Standard Errors**: Cluster-robust standard errors for panel and grouped data
   - New `cluster` parameter: specify column containing cluster identifiers
   - Analytical clustered SE using sandwich estimator with small-sample adjustment
   - Matches statsmodels `get_robustcov_results(cov_type='cluster')` to `rtol=1e-6`
 
-- **Wild Cluster Bootstrap**: Bootstrap-based standard errors for small cluster counts
+- **Wild Cluster Bootstrap (Linear)**: Bootstrap-based standard errors for small cluster counts
   - New `bootstrap` parameter: enable wild cluster bootstrap
   - New `bootstrap_iterations` parameter: control number of replications (default: 1000)
   - New `seed` parameter: ensure reproducibility
@@ -25,45 +44,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Emits `UserWarning` when G < 42 clusters with analytical SE
   - Guides users toward more reliable inference methods
 
-- **New Result Attributes**:
+- **Cluster Balance Warning**: Detection of imbalanced clusters
+  - Emits `UserWarning` when any cluster contains >50% of observations
+  - Warns that clustered SE may be unreliable with such imbalance
+  - Applies to both linear and logistic regression
+
+- **New LinearRegressionResult Attributes**:
   - `n_clusters` (int | None): Number of unique clusters
   - `cluster_se_type` (str | None): "analytical" or "bootstrap"
   - `bootstrap_iterations_used` (int | None): Actual iterations used
 
 ### 🛠️ Technical Details
 
+- New `src/logistic.rs` module for logistic regression MLE
 - New `src/cluster.rs` module for all clustering logic
+- Newton-Raphson optimizer with step halving for stability
 - SplitMix64 PRNG for Rademacher weight generation (no external RNG dependency)
 - Welford's online algorithm for O(1) memory bootstrap variance
 - Condition number check (> 1e10) for numerical stability
+- Perfect separation detection via coefficient divergence monitoring
 
 ### 📖 API Changes
 
-**New Parameters:**
+**New Functions:**
+- `logistic_regression()` — Binary outcome regression with MLE
+
+**New Classes:**
+- `LogisticRegressionResult` — Container for logistic regression results
+
+**New Parameters (both functions):**
 - `cluster: Optional[str] = None` — Column name for cluster identifiers
-- `bootstrap: bool = False` — Enable wild cluster bootstrap
+- `bootstrap: bool = False` — Enable bootstrap SE (wild for linear, score for logistic)
 - `bootstrap_iterations: int = 1000` — Number of bootstrap replications
 - `seed: Optional[int] = None` — Random seed for reproducibility
 
-**New Result Fields:**
+**LogisticRegressionResult Fields:**
+- `coefficients`, `intercept` — MLE estimates (log-odds scale)
+- `standard_errors`, `intercept_se` — Robust SE (HC3 or clustered)
+- `n_samples` — Observation count
+- `n_clusters`, `cluster_se_type`, `bootstrap_iterations_used` — Clustering info
+- `converged`, `iterations` — Optimization diagnostics
+- `log_likelihood`, `pseudo_r_squared` — Model fit statistics
+
+**New LinearRegressionResult Fields:**
 - `n_clusters` — Cluster count (None if not clustered)
 - `cluster_se_type` — "analytical" or "bootstrap" (None if not clustered)
 - `bootstrap_iterations_used` — Iterations used (None if not bootstrap)
 
 **New Errors:**
+- `ValueError`: "y_col must contain only 0 and 1 values"
+- `ValueError`: "y_col must contain both 0 and 1 values"
+- `ValueError`: "Perfect separation detected; logistic regression cannot converge"
+- `ValueError`: "Hessian matrix is singular; check for collinearity"
+- `ValueError`: "Convergence failed after 35 iterations"
 - `ValueError`: "bootstrap=True requires cluster to be specified"
 - `ValueError`: "Clustered standard errors require at least 2 clusters"
 - `ValueError`: "Cluster column contains null values"
 
 **New Warnings:**
-- `UserWarning`: "Only N clusters detected. Wild cluster bootstrap is recommended when clusters < 42."
+- `UserWarning`: "Only N clusters detected. [Wild cluster/Score] bootstrap is recommended when clusters < 42."
 - `UserWarning`: "Cluster column 'X' is float; will be cast to string for grouping."
+- `UserWarning`: "Cluster 'X' contains N% of observations. Clustered standard errors may be unreliable."
 
 ### 📊 Performance
 
-With clustered SE computation:
+**Logistic Regression:**
+- 1M rows, 1 covariate: <500ms (requirement met ✅)
+- 100K rows, 10 covariates: <200ms
+- Typical convergence: 5-8 iterations
+
+**Clustered SE:**
 - Analytical clustered SE: ≤2× HC3 baseline runtime
-- Bootstrap (B=1000) on 100K rows: ~3-5 seconds
+- Score bootstrap (B=1000) on 100K rows: ~3-5 seconds
+- Wild cluster bootstrap (B=1000) on 100K rows: ~2-3 seconds
 
 ### ⚠️ Breaking Changes
 
@@ -76,6 +129,7 @@ None. All existing code continues to work unchanged.
 
 ### 📚 References
 
+- Kline, P., & Santos, A. (2012). A Score Based Approach to Wild Bootstrap Inference. *Journal of Econometric Methods*, 1(1), 23-41. https://doi.org/10.1515/2156-6674.1006
 - Cameron, A. C., & Miller, D. L. (2015). A Practitioner's Guide to Cluster-Robust Inference. *Journal of Human Resources*, 50(2), 317-372.
 - MacKinnon, J. G., & Webb, M. D. (2018). The wild bootstrap for few (treated) clusters. *The Econometrics Journal*, 21(2), 114-135.
 

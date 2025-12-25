@@ -252,11 +252,11 @@ fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
 
     let mut result = vec![vec![0.0; n]; m];
 
-    for i in 0..m {
+    for (i, a_row) in a.iter().enumerate() {
         for j in 0..n {
             let mut sum = 0.0;
-            for l in 0..k {
-                sum += a[i][l] * b[l][j];
+            for (l, &a_val) in a_row.iter().enumerate() {
+                sum += a_val * b[l][j];
             }
             result[i][j] = sum;
         }
@@ -304,8 +304,8 @@ pub fn compute_cluster_se_analytical(
         // Compute score for cluster g: X_g'û_g (p × 1 vector)
         let mut score_g = vec![0.0; p];
         for &i in cluster_indices {
-            for j in 0..p {
-                score_g[j] += design_matrix[i][j] * residuals[i];
+            for (j, score_val) in score_g.iter_mut().enumerate() {
+                *score_val += design_matrix[i][j] * residuals[i];
             }
         }
 
@@ -375,6 +375,8 @@ pub fn compute_cluster_se_analytical(
 ///
 /// # Returns
 /// * `Result<(Vec<f64>, Option<f64>), ClusterError>` - (coefficient_se, intercept_se)
+// Wild cluster bootstrap requires all statistical context parameters. Struct would reduce clarity.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_cluster_se_bootstrap(
     design_matrix: &[Vec<f64>],
     fitted_values: &[f64],
@@ -423,10 +425,10 @@ pub fn compute_cluster_se_bootstrap(
         }
 
         // Compute X'y*
-        for j in 0..p {
-            xty_star[j] = 0.0;
-            for i in 0..n {
-                xty_star[j] += design_matrix[i][j] * y_star[i];
+        for (j, xty_val) in xty_star.iter_mut().enumerate() {
+            *xty_val = 0.0;
+            for (dm_row, &y_val) in design_matrix.iter().zip(y_star.iter()) {
+                *xty_val += dm_row[j] * y_val;
             }
         }
 

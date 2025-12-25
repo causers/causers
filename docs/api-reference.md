@@ -40,8 +40,10 @@ Powered by Rust via PyO3/maturin
 
 Features:
   - Linear regression with HC3 robust standard errors
+  - Logistic regression with Newton-Raphson MLE
   - Cluster-robust standard errors (analytical and bootstrap)
-  - Wild cluster bootstrap for small cluster counts
+  - Wild cluster bootstrap for small cluster counts (linear)
+  - Score bootstrap for small cluster counts (logistic)
 ```
 
 ## Statistical Functions
@@ -111,6 +113,7 @@ def linear_regression(
 |---------|-----------|
 | `UserWarning` | Fewer than 42 clusters with `bootstrap=False`: recommends using wild cluster bootstrap for more accurate inference. |
 | `UserWarning` | Cluster column has float dtype: implicit cast to string. |
+| `UserWarning` | Any cluster contains >50% of observations: clustered SE may be unreliable with imbalanced clusters. |
 
 **Examples:**
 
@@ -277,6 +280,210 @@ R² = 1 - (SS_res / SS_tot)
 - SS_res = Σ[(yi - ŷi)²] (residual sum of squares)
 - SS_tot = Σ[(yi - ȳ)²] (total sum of squares)
 
+### `causers.logistic_regression()`
+
+Perform logistic regression on binary outcomes using Maximum Likelihood Estimation (MLE) with Newton-Raphson optimization. Returns coefficient estimates (log-odds), robust standard errors, and diagnostic information.
+
+**Signature:**
+```python
+def logistic_regression(
+    df: polars.DataFrame,
+    x_cols: str | List[str],
+    y_col: str,
+    include_intercept: bool = True,
+    cluster: str | None = None,
+    bootstrap: bool = False,
+    bootstrap_iterations: int = 1000,
+    seed: int | None = None
+) -> LogisticRegressionResult
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `df` | `polars.DataFrame` | Input DataFrame containing the data. Must have at least 2 rows. |
+| `x_cols` | `str \| List[str]` | Name(s) of independent variable column(s). Single covariate: `"feature"`. Multiple covariates: `["age", "income", "score"]`. Must contain numeric data. |
+| `y_col` | `str` | Name of the binary outcome column (must contain only 0 and 1). |
+| `include_intercept` | `bool` | Whether to include an intercept term. Default: `True`. |
+| `cluster` | `str \| None` | Column name for cluster identifiers. When specified, computes cluster-robust standard errors using the score-based approach. Default: `None`. |
+| `bootstrap` | `bool` | If `True` and `cluster` is specified, use score bootstrap for standard error computation. Requires `cluster` to be specified. Recommended when number of clusters is less than 42. Default: `False`. |
+| `bootstrap_iterations` | `int` | Number of bootstrap replications when `bootstrap=True`. Default: `1000`. |
+| `seed` | `int \| None` | Random seed for reproducibility when using bootstrap. When `None`, uses a random seed which may produce different results each call. Default: `None`. |
+
+**Returns:**
+
+`LogisticRegressionResult` object with the following attributes:
+- `coefficients` (List[float]): Coefficient estimates for each predictor (log-odds scale)
+- `intercept` (float | None): Intercept term. `None` when `include_intercept=False`
+- `standard_errors` (List[float]): Robust standard errors for each coefficient. Uses HC3 by default, or clustered SE if `cluster` is specified.
+- `intercept_se` (float | None): Robust standard error for intercept. `None` when `include_intercept=False`.
+- `n_samples` (int): Number of observations used
+- `n_clusters` (int | None): Number of unique clusters. `None` if `cluster` not specified.
+- `cluster_se_type` (str | None): Type of clustered SE: `"analytical"` or `"bootstrap"`. `None` if not clustered.
+- `bootstrap_iterations_used` (int | None): Number of bootstrap iterations used. `None` if not bootstrap.
+- `converged` (bool): Whether the MLE optimizer converged
+- `iterations` (int): Number of Newton-Raphson iterations used
+- `log_likelihood` (float): Log-likelihood at the MLE solution
+- `pseudo_r_squared` (float): McFadden's pseudo R² = 1 - (LL_model / LL_null)
+
+**Raises:**
+
+| Exception | Condition |
+|-----------|-----------|
+| `ValueError` | `y_col` contains values other than 0 and 1 |
+| `ValueError` | `y_col` contains only 0s or only 1s (no variation) |
+| `ValueError` | Column doesn't exist, data is empty |
+| `ValueError` | Cluster column contains null values |
+| `ValueError` | `bootstrap=True` without `cluster` specified |
+| `ValueError` | Fewer than 2 clusters detected |
+| `ValueError` | Perfect separation detected (predictor perfectly separates outcomes) |
+| `ValueError` | Hessian is singular (collinearity in predictors) |
+| `ValueError` | Convergence fails after 35 iterations |
+| `ValueError` | Numerical instability detected (condition number > 1e10) |
+| `ValueError` | `bootstrap_iterations < 1` |
+| `TypeError` | Column contains non-numeric data |
+
+**Warns:**
+
+| Warning | Condition |
+|---------|-----------|
+| `UserWarning` | Fewer than 42 clusters with `bootstrap=False`: recommends using score bootstrap for more accurate inference. |
+| `UserWarning` | Cluster column has float dtype: implicit cast to string. |
+
+**Examples:**
+
+**Simple logistic regression:**
+```python
+import polars as pl
+import causers
+
+# Binary outcome data
+df = pl.DataFrame({
+    "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+    "y": [0, 0, 0, 1, 0, 1, 1, 1]
+})
+
+result = causers.logistic_regression(df, x_cols="x", y_col="y")
+
+print(f"Coefficient: {result.coefficients[0]:.4f}")
+print(f"Intercept: {result.intercept:.4f}")
+print(f"Converged: {result.converged}")
+print(f"Pseudo R²: {result.pseudo_r_squared:.4f}")
+```
+
+**Multiple covariates:**
+```python
+# Predicting loan default from multiple features
+df = pl.DataFrame({
+    "income": [50, 60, 40, 80, 100, 30, 70, 90],
+    "debt_ratio": [0.4, 0.3, 0.5, 0.2, 0.1, 0.6, 0.3, 0.2],
+    "default": [1, 0, 1, 0, 0, 1, 0, 0]
+})
+
+result = causers.logistic_regression(
+    df,
+    x_cols=["income", "debt_ratio"],
+    y_col="default"
+)
+
+print(f"Income coefficient: {result.coefficients[0]:.4f}")
+print(f"Debt ratio coefficient: {result.coefficients[1]:.4f}")
+print(f"Log-likelihood: {result.log_likelihood:.2f}")
+```
+
+**Clustered standard errors (analytical):**
+```python
+# Panel data with firm-level clustering
+df = pl.DataFrame({
+    "treatment": [0, 0, 1, 1, 0, 0, 1, 1, 0, 1],
+    "outcome": [0, 0, 1, 1, 0, 1, 1, 1, 0, 1],
+    "firm_id": [1, 1, 1, 2, 2, 2, 3, 3, 4, 4]
+})
+
+result = causers.logistic_regression(
+    df,
+    x_cols="treatment",
+    y_col="outcome",
+    cluster="firm_id"
+)
+
+print(f"Treatment effect (log-odds): {result.coefficients[0]:.4f}")
+print(f"Clustered SE: {result.standard_errors[0]:.4f}")
+print(f"Number of clusters: {result.n_clusters}")
+```
+
+**Score bootstrap (recommended for <42 clusters):**
+```python
+# When you have few clusters, use bootstrap for more reliable inference
+result = causers.logistic_regression(
+    df,
+    x_cols="treatment",
+    y_col="outcome",
+    cluster="firm_id",
+    bootstrap=True,
+    bootstrap_iterations=1000,
+    seed=42  # For reproducibility
+)
+
+print(f"Treatment effect: {result.coefficients[0]:.4f}")
+print(f"Bootstrap SE: {result.standard_errors[0]:.4f}")
+print(f"SE type: {result.cluster_se_type}")  # "bootstrap"
+print(f"Iterations used: {result.bootstrap_iterations_used}")
+```
+
+**Interpreting coefficients:**
+```python
+import math
+
+result = causers.logistic_regression(df, "treatment", "outcome")
+
+# Coefficient is in log-odds scale
+log_odds = result.coefficients[0]
+
+# Convert to odds ratio
+odds_ratio = math.exp(log_odds)
+print(f"Odds ratio: {odds_ratio:.2f}")
+
+# Probability change (at mean baseline)
+# For a unit increase in x, odds multiply by exp(β)
+```
+
+**Mathematical Details:**
+
+The logistic regression fits the model:
+
+```
+P(y=1|x) = 1 / (1 + exp(-x'β))
+```
+
+Where:
+- `β` are the log-odds coefficients
+- `exp(β)` gives the odds ratio for a unit increase
+- The model is estimated via Maximum Likelihood using Newton-Raphson
+
+**Standard Errors:**
+
+- **HC3 (default)**: Heteroskedasticity-consistent standard errors adapted for logistic regression, using weighted leverages
+- **Analytical clustered SE**: When `cluster` is specified. Uses sandwich estimator with cluster-level scores
+- **Score bootstrap SE**: When `cluster` and `bootstrap=True`. Uses Rademacher weights following Kline & Santos (2012). Recommended when G < 42 clusters.
+
+For details on the score bootstrap methodology, see [Score Bootstrap for Logistic Regression](score_bootstrap.md).
+
+**Pseudo R-squared:**
+
+McFadden's pseudo R² is computed as:
+```
+R² = 1 - (LL_model / LL_null)
+```
+Where:
+- LL_model = log-likelihood of the fitted model
+- LL_null = log-likelihood of the intercept-only model
+
+Unlike linear regression R², pseudo R² values are typically much lower. Values of 0.2-0.4 are considered excellent fit.
+
+---
+
 ## Result Classes
 
 ### `LinearRegressionResult`
@@ -386,6 +593,81 @@ def predict(x_value):
     return result.coefficients[0] * x_value
 ```
 
+### `LogisticRegressionResult`
+
+Container for logistic regression results.
+
+**Attributes:**
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `coefficients` | `List[float]` | Coefficient estimates for each predictor (log-odds scale) |
+| `intercept` | `float \| None` | Intercept term. `None` when `include_intercept=False` |
+| `standard_errors` | `List[float]` | Robust standard errors for each coefficient. HC3 (default) or cluster-robust when `cluster` specified. |
+| `intercept_se` | `float \| None` | Robust standard error for intercept. `None` when `include_intercept=False`. |
+| `n_samples` | `int` | Number of observations used |
+| `n_clusters` | `int \| None` | Number of unique clusters. `None` if `cluster` not specified. |
+| `cluster_se_type` | `str \| None` | Type of clustered SE: `"analytical"` or `"bootstrap"`. `None` if not clustered. |
+| `bootstrap_iterations_used` | `int \| None` | Number of bootstrap iterations used. `None` if not bootstrap. |
+| `converged` | `bool` | Whether the Newton-Raphson optimizer converged |
+| `iterations` | `int` | Number of iterations used to reach convergence |
+| `log_likelihood` | `float` | Log-likelihood at the MLE solution (negative value) |
+| `pseudo_r_squared` | `float` | McFadden's pseudo R² ∈ [0, 1] |
+
+**Methods:**
+
+#### `__repr__()`
+Returns a string representation suitable for debugging.
+
+```python
+>>> result
+LogisticRegressionResult(coefficients=[1.5], intercept=-2.3, converged=True, pseudo_r_squared=0.32)
+```
+
+**Example Usage:**
+
+```python
+import math
+import polars as pl
+import causers
+
+# Binary outcome data
+df = pl.DataFrame({
+    "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+    "y": [0, 0, 0, 1, 0, 1, 1, 1]
+})
+
+result = causers.logistic_regression(df, x_cols="x", y_col="y")
+
+# Access basic attributes
+print(f"Coefficient (log-odds): {result.coefficients[0]:.4f}")
+print(f"Standard error: {result.standard_errors[0]:.4f}")
+print(f"Intercept: {result.intercept:.4f}")
+
+# Check convergence
+if result.converged:
+    print(f"Converged in {result.iterations} iterations")
+else:
+    print("Warning: Did not converge!")
+
+# Model fit
+print(f"Log-likelihood: {result.log_likelihood:.2f}")
+print(f"McFadden R²: {result.pseudo_r_squared:.4f}")
+
+# Convert to odds ratio
+odds_ratio = math.exp(result.coefficients[0])
+print(f"Odds ratio: {odds_ratio:.2f}")
+
+# With clustered SE
+df_clustered = df.with_columns(pl.Series("cluster", [1, 1, 2, 2, 3, 3, 4, 4]))
+result_clustered = causers.logistic_regression(
+    df_clustered, "x", "y", cluster="cluster"
+)
+print(f"Clustered SE: {result_clustered.standard_errors[0]:.4f}")
+print(f"Number of clusters: {result_clustered.n_clusters}")
+print(f"SE type: {result_clustered.cluster_se_type}")
+```
+
 ## Type Hints
 
 The package includes full type hints for better IDE support and static type checking:
@@ -395,10 +677,13 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import polars as pl
-    from causers import LinearRegressionResult
+    from causers import LinearRegressionResult, LogisticRegressionResult
     
-    def analyze_data(df: pl.DataFrame) -> LinearRegressionResult:
+    def analyze_linear(df: pl.DataFrame) -> LinearRegressionResult:
         return causers.linear_regression(df, "x", "y")
+    
+    def analyze_logistic(df: pl.DataFrame) -> LogisticRegressionResult:
+        return causers.logistic_regression(df, "x", "outcome")
 ```
 
 ## Performance Characteristics
@@ -407,12 +692,15 @@ if TYPE_CHECKING:
 
 | Operation | Complexity | Notes |
 |-----------|------------|--------|
-| `linear_regression()` | O(n) | Linear in number of rows |
-| Memory usage | O(1) | Constant extra memory beyond input |
+| `linear_regression()` | O(n × k²) | n = rows, k = covariates |
+| `logistic_regression()` | O(n × k² × i) | i = iterations (≤35) |
+| Memory usage | O(n × k) | Design matrix storage |
 
 ### Performance Benchmarks
 
 Measured on Apple M1 Pro (16GB RAM):
+
+**Linear Regression:**
 
 | Rows | Time | Memory Peak |
 |------|------|-------------|
@@ -421,6 +709,22 @@ Measured on Apple M1 Pro (16GB RAM):
 | 100K | 4.2ms | ~1.6MB |
 | 1M | 45ms | ~16MB |
 | 10M | 450ms | ~160MB |
+
+**Logistic Regression:**
+
+| Rows | Time | Notes |
+|------|------|-------|
+| 1K | ~2ms | Typical convergence in 5-8 iterations |
+| 10K | ~5ms | |
+| 100K | ~30ms | |
+| 1M | ~300ms | Requirement: <500ms ✅ |
+
+**Bootstrap Performance:**
+
+| Rows | B=1000 | Notes |
+|------|--------|-------|
+| 100K | ~3-5s | Score bootstrap for logistic |
+| 100K | ~2-3s | Wild bootstrap for linear |
 
 ## Error Handling
 
@@ -457,6 +761,36 @@ TypeError: Column 'x' contains non-numeric data
 
 # Solution: Convert to numeric or use different column
 >>> df = df.with_columns(pl.col("x").cast(pl.Int64))
+```
+
+#### ValueError: Binary outcome required (logistic regression)
+```python
+# Error: y contains values other than 0 and 1
+>>> df = pl.DataFrame({"x": [1, 2, 3], "y": [0, 1, 2]})
+>>> causers.logistic_regression(df, "x", "y")
+ValueError: y_col must contain only 0 and 1 values
+
+# Solution: Ensure y is binary
+>>> df = df.filter(pl.col("y").is_in([0, 1]))
+```
+
+#### ValueError: Perfect separation (logistic regression)
+```python
+# Error: x perfectly predicts y
+>>> df = pl.DataFrame({"x": [1, 2, 3, 4], "y": [0, 0, 1, 1]})
+>>> causers.logistic_regression(df, "x", "y")
+ValueError: Perfect separation detected; logistic regression cannot converge
+
+# Solution: Add noise, use different predictors, or use penalized regression
+```
+
+#### ValueError: Convergence failure (logistic regression)
+```python
+# Error: Optimizer fails to converge
+>>> causers.logistic_regression(df, "x", "y")
+ValueError: Convergence failed after 35 iterations
+
+# Solution: Check for collinearity, scale predictors, or simplify model
 ```
 
 ## Best Practices
@@ -711,4 +1045,4 @@ pl.Config.set_tbl_rows(10)
 
 ---
 
-Last updated: 2025-12-24 | causers v0.3.0
+Last updated: 2025-12-25 | causers v0.3.0

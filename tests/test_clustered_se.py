@@ -493,6 +493,42 @@ class TestWarnings:
                 df, "x", "y",
                 cluster="cluster_float"
             )
+    
+    def test_imbalanced_cluster_warning(self):
+        """Warning should be emitted when any cluster has >50% of observations (REQ-032)."""
+        # Create data where cluster 1 has 7/10 observations (70% > 50%)
+        df = pl.DataFrame({
+            "x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            "y": [2.0, 4.0, 5.0, 8.0, 9.0, 12.0, 14.0, 16.0, 18.0, 20.0],
+            "cluster_id": [1, 1, 1, 1, 1, 1, 1, 2, 2, 2]  # 7 in cluster 1, 3 in cluster 2
+        })
+        
+        # Should emit the imbalanced cluster warning (in addition to small cluster warning)
+        with pytest.warns(UserWarning, match=r"70% of observations.*imbalanced"):
+            causers.linear_regression(
+                df, "x", "y",
+                cluster="cluster_id"
+            )
+    
+    def test_no_imbalanced_cluster_warning_when_balanced(self):
+        """No imbalanced cluster warning when clusters are balanced (≤50% each)."""
+        # Create balanced data: each cluster has 50% of observations
+        df = pl.DataFrame({
+            "x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "y": [2.0, 4.0, 5.0, 8.0, 9.0, 12.0],
+            "cluster_id": [1, 1, 1, 2, 2, 2]  # 3 in each cluster (50% each)
+        })
+        
+        # Only the small cluster count warning should be emitted, not imbalanced
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            causers.linear_regression(
+                df, "x", "y",
+                cluster="cluster_id"
+            )
+            # Check that no "imbalanced" warning was emitted
+            imbalanced_warnings = [x for x in w if "imbalanced" in str(x.message)]
+            assert len(imbalanced_warnings) == 0, "Should not emit imbalanced warning for balanced clusters"
 
 
 # =============================================================================

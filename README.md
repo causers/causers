@@ -16,10 +16,11 @@ A high-performance statistical package for Polars DataFrames, powered by Rust.
 
 - **🏎️ High Performance**: Linear regression on 1M rows in ~250ms with HC3 standard errors
 - **📊 Multiple Regression**: Support for multiple covariates with matrix-based OLS
+- **🔮 Logistic Regression**: Binary outcome regression with Newton-Raphson MLE
 - **📈 Robust Standard Errors**: HC3 heteroskedasticity-consistent standard errors included
 - **🎯 Flexible Models**: Optional intercept for fully saturated models
 - **🏢 Clustered Standard Errors**: Cluster-robust SE for panel/grouped data
-- **🔄 Wild Bootstrap**: Wild cluster bootstrap for reliable inference with few clusters
+- **🔄 Bootstrap Methods**: Wild cluster bootstrap (linear) and score bootstrap (logistic)
 - **🔧 Native Polars Integration**: Zero-copy operations on Polars DataFrames
 - **🦀 Rust-Powered**: Core computations in Rust for maximum throughput
 - **🐍 Pythonic API**: Clean, intuitive interface with full type hints
@@ -124,6 +125,28 @@ Intercept: 0.1333 ± 0.1828
 
 > **Note**: Standard errors use the HC3 estimator (MacKinnon & White, 1985), which provides heteroskedasticity-consistent inference even when error variance is not constant.
 
+### Logistic Regression
+
+```python
+import polars as pl
+import causers
+
+# Binary outcome data
+df = pl.DataFrame({
+    "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+    "y": [0, 0, 0, 1, 0, 1, 1, 1]
+})
+
+result = causers.logistic_regression(df, x_cols="x", y_col="y")
+
+print(f"Coefficient (log-odds): {result.coefficients[0]:.4f}")
+print(f"Standard Error: {result.standard_errors[0]:.4f}")
+print(f"Converged: {result.converged} in {result.iterations} iterations")
+print(f"Pseudo R²: {result.pseudo_r_squared:.4f}")
+```
+
+> **Tip**: Coefficients are on the log-odds scale. Use `math.exp(coefficient)` to convert to odds ratios.
+
 ### Clustered Standard Errors
 
 When observations are clustered (e.g., students within schools, employees within firms), use cluster-robust standard errors:
@@ -188,7 +211,7 @@ Benchmarked on Apple M1 Pro with 16GB RAM:
 
 ## 📖 API Documentation
 
-### `linear_regression(df, x_cols, y_col, include_intercept=True)`
+### `linear_regression(df, x_cols, y_col, ...)`
 
 Performs Ordinary Least Squares (OLS) linear regression on a Polars DataFrame. Supports both single and multiple covariate regression.
 
@@ -252,6 +275,40 @@ result = causers.linear_regression(
 )
 print(f"y = {result.coefficients[0]}x (no intercept)")
 ```
+
+### `logistic_regression(df, x_cols, y_col, ...)`
+
+Performs logistic regression on binary outcomes using Maximum Likelihood Estimation with Newton-Raphson optimization.
+
+**Parameters:**
+- `df` (pl.DataFrame): Input DataFrame containing the data
+- `x_cols` (str | List[str]): Name(s) of independent variable column(s)
+- `y_col` (str): Name of the binary outcome column (must contain only 0 and 1)
+- `include_intercept` (bool, optional): Whether to include intercept term. Default: `True`
+- `cluster` (str, optional): Column for cluster identifiers. Default: `None`
+- `bootstrap` (bool, optional): Enable score bootstrap for clustered SE. Default: `False`
+- `bootstrap_iterations` (int, optional): Number of bootstrap replications. Default: `1000`
+- `seed` (int, optional): Random seed for reproducibility. Default: `None`
+
+**Returns:**
+- `LogisticRegressionResult`: Object with the following attributes:
+  - `coefficients` (List[float]): Coefficient estimates (log-odds scale)
+  - `standard_errors` (List[float]): Robust standard errors for each coefficient
+  - `intercept` (float | None): Intercept term
+  - `intercept_se` (float | None): Standard error for intercept
+  - `n_samples` (int): Number of observations used
+  - `converged` (bool): Whether the optimizer converged
+  - `iterations` (int): Number of iterations used
+  - `log_likelihood` (float): Log-likelihood at MLE
+  - `pseudo_r_squared` (float): McFadden's pseudo R²
+  - `n_clusters` (int | None): Number of clusters (if clustered)
+  - `cluster_se_type` (str | None): "analytical" or "bootstrap"
+
+**Raises:**
+- `ValueError`: If y contains values other than 0/1, perfect separation is detected, or convergence fails
+- `TypeError`: If columns contain non-numeric data
+
+For full API documentation, see [docs/api-reference.md](docs/api-reference.md).
 
 ## 🏗️ Architecture
 
@@ -370,11 +427,19 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 - ✅ Comprehensive test coverage with edge cases
 
 ### v0.3.0 (Current)
+- ✅ **Logistic regression** with Newton-Raphson MLE
+- ✅ Score bootstrap for logistic regression (Kline & Santos, 2012)
 - ✅ Clustered standard errors (analytical)
 - ✅ Wild cluster bootstrap for small cluster counts
+- ✅ Cluster balance warning (>50% imbalance detection)
 - ✅ Configurable bootstrap iterations and seed
 - ✅ Small-cluster warning (G < 42)
 - ✅ statsmodels/wildboottest-validated accuracy
+
+### v0.4.0 (Planned)
+- 🔲 Weighted least squares
+- 🔲 Two-way clustering
+- 🔲 Confidence intervals and p-values
 
 ## 🔒 Security
 
