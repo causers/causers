@@ -9,16 +9,18 @@ from typing import List as _List, Optional as _Optional, Union as _Union
 import warnings as _warnings
 import polars as _polars
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # Import the Rust extension module
 from causers._causers import (
     LinearRegressionResult,
     LogisticRegressionResult,
     SyntheticDIDResult,
+    SyntheticControlResult,
     linear_regression as _linear_regression_rust,
     logistic_regression as _logistic_regression_rust,
     synthetic_did_impl as _synthetic_did_impl,
+    synthetic_control_impl as _synthetic_control_impl,
 )
 
 # Re-export main functions
@@ -26,9 +28,11 @@ __all__ = [
     "LinearRegressionResult",
     "LogisticRegressionResult",
     "SyntheticDIDResult",
+    "SyntheticControlResult",
     "linear_regression",
     "logistic_regression",
     "synthetic_did",
+    "synthetic_control",
 ]
 
 
@@ -910,6 +914,462 @@ def synthetic_did(
     return result
 
 
+def synthetic_control(
+    df: _polars.DataFrame,
+    unit_col: str,
+    time_col: str,
+    outcome_col: str,
+    treatment_col: str,
+    method: str = "traditional",
+    lambda_param: _Optional[float] = None,
+    compute_se: bool = True,
+    n_placebo: _Optional[int] = None,
+    max_iter: int = 1000,
+    tol: float = 1e-6,
+    seed: _Optional[int] = None,
+) -> SyntheticControlResult:
+    """
+    Compute Synthetic Control (SC) estimator.
+    
+    Implements the Synthetic Control method from Abadie et al. (2010, 2015),
+    which constructs a weighted combination of control units to create a
+    synthetic control that matches the treated unit's pre-treatment outcomes.
+    
+    Supports four method variants:
+    - **Traditional**: Classic SC with simplex-constrained weights (Abadie et al., 2010)
+    - **Penalized**: L2 regularization for more uniform weights
+    - **Robust**: De-meaned data for matching dynamics instead of levels
+    - **Augmented**: Bias correction via ridge outcome model (Ben-Michael et al., 2021)
+    
+    Parameters
+    ----------
+    df : pl.DataFrame
+        Panel data in long format with one row per unit-time observation.
+        Must be a balanced panel (all units observed in all time periods).
+    unit_col : str
+        Column name identifying unique units (e.g., "state", "firm_id").
+        Must be integer or string type.
+    time_col : str
+        Column name identifying time periods (e.g., "year", "quarter").
+        Must be integer or string type.
+    outcome_col : str
+        Column name for the outcome variable. Must be numeric.
+    treatment_col : str
+        Column name for treatment indicator. Must contain only 0 and 1 values.
+        Exactly one unit must be treated (have treatment=1 in post-period).
+    method : str, default="traditional"
+        Synthetic control method to use. Options:
+        - "traditional": Classic SC minimizing pre-treatment MSE
+        - "penalized": L2 regularized SC for more uniform weights
+        - "robust": De-meaned SC for matching dynamics
+        - "augmented": Bias-corrected SC with ridge adjustment
+    lambda_param : float, optional
+        Regularization parameter for penalized/augmented methods.
+        If None, auto-selected via LOOCV for penalized method.
+        Must be >= 0 when specified.
+    compute_se : bool, default=True
+        Whether to compute standard errors via in-space placebo.
+    n_placebo : int, optional
+        Number of placebo iterations for SE. If None, uses all control units.
+    max_iter : int, default=1000
+        Maximum iterations for Frank-Wolfe optimizer.
+    tol : float, default=1e-6
+        Convergence tolerance for optimizer.
+    seed : int, optional
+        Random seed for reproducibility. If None, uses system time.
+    
+    Returns
+    -------
+    SyntheticControlResult
+        Result object with the following attributes:
+        
+        - att : float
+            Average Treatment Effect on the Treated
+        - standard_error : float or None
+            In-space placebo standard error (None if compute_se=False)
+        - unit_weights : List[float]
+            Weights assigned to each control unit (sums to 1)
+        - pre_treatment_rmse : float
+            Root Mean Squared Error of pre-treatment fit
+        - pre_treatment_mse : float
+            Mean Squared Error of pre-treatment fit
+        - method : str
+            Method used ("traditional", "penalized", "robust", "augmented")
+        - lambda_used : float or None
+            Lambda parameter used (for penalized/augmented methods)
+        - n_units_control : int
+            Number of control units
+        - n_periods_pre : int
+            Number of pre-treatment periods
+        - n_periods_post : int
+            Number of post-treatment periods
+        - solver_converged : bool
+            Whether the Frank-Wolfe solver converged
+        - solver_iterations : int
+            Number of optimizer iterations
+        - n_placebo_used : int or None
+            Number of successful placebo iterations (if SE computed)
+    
+    Raises
+    ------
+    ValueError
+        - If DataFrame is empty
+        - If any specified column doesn't exist
+        - If unit_col or time_col is float type
+        - If outcome_col is not numeric
+        - If outcome_col contains null values
+        - If treatment_col contains values other than 0 and 1
+        - If not exactly one treated unit found
+        - If fewer than 1 control unit found
+        - If fewer than 1 pre-treatment period found
+        - If no post-treatment periods found
+        - If panel is not balanced
+        - If method is not recognized
+        - If lambda_param < 0
+    
+    Warns
+    -----
+    UserWarning
+        - If any unit weight > 0.5 (weight concentration on single unit)
+        - If pre_treatment_rmse > 0.1 × outcome std (poor pre-treatment fit)
+    
+    Examples
+    --------
+    Basic usage with panel data:
+    
+    >>> import polars as pl
+    >>> import causers
+    >>> df = pl.DataFrame({
+    ...     'unit': [1, 1, 1, 2, 2, 2, 3, 3, 3],
+    ...     'time': [1, 2, 3, 1, 2, 3, 1, 2, 3],
+    ...     'y': [1.0, 2.0, 8.0, 1.5, 2.5, 3.0, 1.2, 2.2, 2.8],
+    ...     'treated': [0, 0, 1, 0, 0, 0, 0, 0, 0]
+    ... })
+    >>> result = causers.synthetic_control(df, 'unit', 'time', 'y', 'treated', seed=42)
+    >>> print(f"ATT: {result.att:.4f}")
+    ATT: ...
+    
+    Using penalized method with auto lambda:
+    
+    >>> result = causers.synthetic_control(
+    ...     df, 'unit', 'time', 'y', 'treated',
+    ...     method="penalized", seed=42
+    ... )
+    >>> print(f"Lambda used: {result.lambda_used}")
+    Lambda used: ...
+    
+    Accessing weights and diagnostics:
+    
+    >>> print(f"Control unit weights: {result.unit_weights}")
+    Control unit weights: [...]
+    >>> print(f"Pre-treatment RMSE: {result.pre_treatment_rmse:.4f}")
+    Pre-treatment RMSE: ...
+    
+    Without standard errors (faster):
+    
+    >>> result = causers.synthetic_control(
+    ...     df, 'unit', 'time', 'y', 'treated',
+    ...     compute_se=False
+    ... )
+    >>> print(f"ATT: {result.att:.4f} (SE not computed)")
+    ATT: ... (SE not computed)
+    
+    Notes
+    -----
+    **Key Difference from Synthetic DID**
+    
+    Synthetic Control requires exactly ONE treated unit, while SDID supports
+    multiple treated units. If you have multiple treated units, use
+    `synthetic_did()` instead.
+    
+    **Panel Structure Detection**
+    
+    The function automatically detects:
+    - **Control units**: Units where treatment=0 in all periods
+    - **Treated unit**: The single unit where treatment=1 in post-period
+    - **Pre-periods**: Periods where treatment=0 for all units
+    - **Post-periods**: Periods where the treated unit has treatment=1
+    
+    **Algorithm**
+    
+    The SC estimator finds weights ω such that:
+    
+    .. math::
+    
+        \\hat{\\omega} = \\arg\\min_{\\omega \\geq 0, \\sum \\omega = 1}
+                        \\sum_{t \\in \\text{pre}} (Y_{1t} - \\sum_j \\omega_j Y_{jt})^2
+    
+    Then the ATT is:
+    
+    .. math::
+    
+        \\hat{\\tau}_{SC} = \\frac{1}{|\\text{post}|} \\sum_{t \\in \\text{post}}
+                          (Y_{1t} - \\sum_j \\hat{\\omega}_j Y_{jt})
+    
+    **Standard Errors**
+    
+    Standard errors are computed via in-space placebo:
+    1. For each control unit, treat it as the "placebo treated" unit
+    2. Compute SC weights and ATT using remaining controls
+    3. SE = standard deviation of placebo ATTs
+    
+    References
+    ----------
+    Abadie, A., Diamond, A., & Hainmueller, J. (2010). Synthetic Control Methods
+    for Comparative Case Studies. *Journal of the American Statistical Association*.
+    
+    Abadie, A., Diamond, A., & Hainmueller, J. (2015). Comparative Politics and
+    the Synthetic Control Method. *American Journal of Political Science*.
+    
+    Ben-Michael, E., Feller, A., & Rothstein, J. (2021). The Augmented Synthetic
+    Control Method. *Journal of the American Statistical Association*.
+    
+    See Also
+    --------
+    SyntheticControlResult : Result class with ATT and diagnostics.
+    synthetic_did : For multiple treated units with DID adjustment.
+    """
+    # ========================================================================
+    # Input Validation
+    # ========================================================================
+    
+    # Check DataFrame is not empty
+    if len(df) == 0:
+        raise ValueError("Cannot perform SC on empty DataFrame")
+    
+    # Check all required columns exist
+    for col_name, col_label in [
+        (unit_col, "unit_col"),
+        (time_col, "time_col"),
+        (outcome_col, "outcome_col"),
+        (treatment_col, "treatment_col"),
+    ]:
+        if col_name not in df.columns:
+            raise ValueError(f"Column '{col_name}' not found in DataFrame")
+    
+    # Check unit_col is not float
+    unit_dtype = df[unit_col].dtype
+    if unit_dtype in (_polars.Float32, _polars.Float64):
+        raise ValueError("unit_col must be integer or string, not float")
+    
+    # Check time_col is not float
+    time_dtype = df[time_col].dtype
+    if time_dtype in (_polars.Float32, _polars.Float64):
+        raise ValueError("time_col must be integer or string, not float")
+    
+    # Check outcome_col is numeric
+    outcome_dtype = df[outcome_col].dtype
+    numeric_types = (
+        _polars.Float32, _polars.Float64,
+        _polars.Int8, _polars.Int16, _polars.Int32, _polars.Int64,
+        _polars.UInt8, _polars.UInt16, _polars.UInt32, _polars.UInt64,
+    )
+    if outcome_dtype not in numeric_types:
+        raise ValueError("outcome_col must be numeric")
+    
+    # Check for nulls in outcome_col
+    null_count = df[outcome_col].null_count()
+    if null_count > 0:
+        raise ValueError(f"outcome_col '{outcome_col}' contains null values")
+    
+    # Check treatment_col contains only 0 and 1
+    treatment_values = df[treatment_col].unique().to_list()
+    valid_treatment_values = {0, 1, 0.0, 1.0}
+    for val in treatment_values:
+        if val not in valid_treatment_values:
+            raise ValueError("treatment_col must contain only 0 and 1 values")
+    
+    # Validate method
+    valid_methods = {"traditional", "penalized", "robust", "augmented"}
+    method_lower = method.lower()
+    if method_lower not in valid_methods:
+        raise ValueError(
+            f"method must be one of {valid_methods}, got '{method}'"
+        )
+    
+    # Validate lambda_param
+    if lambda_param is not None and lambda_param < 0:
+        raise ValueError(f"lambda_param must be >= 0, got {lambda_param}")
+    
+    # ========================================================================
+    # Panel Structure Detection
+    # ========================================================================
+    
+    # Get unique units and periods
+    unique_units = df[unit_col].unique().sort().to_list()
+    unique_periods = df[time_col].unique().sort().to_list()
+    n_units = len(unique_units)
+    n_periods = len(unique_periods)
+    
+    # Create mappings from unit/period values to indices
+    unit_to_idx = {unit: idx for idx, unit in enumerate(unique_units)}
+    period_to_idx = {period: idx for idx, period in enumerate(unique_periods)}
+    
+    # Validate balanced panel
+    expected_rows = n_units * n_periods
+    if len(df) != expected_rows:
+        raise ValueError(
+            f"Panel is not balanced: expected {expected_rows} rows "
+            f"({n_units} units × {n_periods} periods), found {len(df)}"
+        )
+    
+    # Identify control vs treated units
+    # Control units: treatment=0 in ALL periods
+    # Treated unit: treatment=1 in at least one period
+    unit_max_treatment = (
+        df.group_by(unit_col)
+        .agg(_polars.col(treatment_col).max().alias("max_treatment"))
+    )
+    
+    control_units = []
+    treated_units = []
+    for row in unit_max_treatment.iter_rows():
+        unit_val, max_treat = row[0], row[1]
+        if max_treat == 0 or max_treat == 0.0:
+            control_units.append(unit_val)
+        else:
+            treated_units.append(unit_val)
+    
+    # Sort for deterministic ordering
+    control_units = sorted(control_units, key=lambda x: unit_to_idx[x])
+    treated_units = sorted(treated_units, key=lambda x: unit_to_idx[x])
+    
+    # Validate exactly 1 treated unit (SC requirement)
+    n_treated = len(treated_units)
+    if n_treated == 0:
+        raise ValueError("No treated units found in data")
+    if n_treated > 1:
+        raise ValueError(
+            f"Synthetic Control requires exactly 1 treated unit; found {n_treated}. "
+            f"For multiple treated units, use synthetic_did() instead."
+        )
+    
+    # Validate sufficient control units
+    n_control = len(control_units)
+    if n_control < 1:
+        raise ValueError(f"At least 1 control unit required; found {n_control}")
+    
+    # For augmented method, need at least 2 controls
+    if method_lower == "augmented" and n_control < 2:
+        raise ValueError(
+            f"Augmented SC requires at least 2 control units; found {n_control}"
+        )
+    
+    # Identify pre vs post periods
+    # Pre-periods: all observations have treatment=0
+    # Post-periods: at least one treated unit has treatment=1
+    period_max_treatment = (
+        df.group_by(time_col)
+        .agg(_polars.col(treatment_col).max().alias("max_treatment"))
+    )
+    
+    pre_periods = []
+    post_periods = []
+    for row in period_max_treatment.iter_rows():
+        period_val, max_treat = row[0], row[1]
+        if max_treat == 0 or max_treat == 0.0:
+            pre_periods.append(period_val)
+        else:
+            post_periods.append(period_val)
+    
+    # Sort for deterministic ordering
+    pre_periods = sorted(pre_periods, key=lambda x: period_to_idx[x])
+    post_periods = sorted(post_periods, key=lambda x: period_to_idx[x])
+    
+    # Validate sufficient pre-periods
+    n_pre = len(pre_periods)
+    if n_pre < 1:
+        raise ValueError(f"At least 1 pre-treatment period required; found {n_pre}")
+    
+    # For augmented method, need at least 2 pre-periods
+    if method_lower == "augmented" and n_pre < 2:
+        raise ValueError(
+            f"Augmented SC requires at least 2 pre-treatment periods; found {n_pre}"
+        )
+    
+    # Validate at least 1 post-period
+    n_post = len(post_periods)
+    if n_post == 0:
+        raise ValueError("No post-treatment periods found")
+    
+    # ========================================================================
+    # Extract Outcome Matrix (Row-Major Order)
+    # ========================================================================
+    
+    # Sort DataFrame by unit, then time for consistent ordering
+    df_sorted = df.sort([unit_col, time_col])
+    
+    # Create outcome array in row-major order: outcomes[unit_idx * n_periods + period_idx]
+    outcomes = []
+    for unit in unique_units:
+        unit_df = df_sorted.filter(_polars.col(unit_col) == unit).sort(time_col)
+        outcomes.extend(unit_df[outcome_col].to_list())
+    
+    # Convert to flat list of floats
+    outcomes = [float(v) for v in outcomes]
+    
+    # Create index arrays
+    control_indices = [unit_to_idx[u] for u in control_units]
+    treated_index = unit_to_idx[treated_units[0]]  # Single treated unit
+    pre_period_indices = [period_to_idx[p] for p in pre_periods]
+    post_period_indices = [period_to_idx[p] for p in post_periods]
+    
+    # Determine n_placebo (default: all control units)
+    actual_n_placebo = n_placebo if n_placebo is not None else n_control
+    
+    # ========================================================================
+    # Call Rust Implementation
+    # ========================================================================
+    
+    result = _synthetic_control_impl(
+        outcomes=outcomes,
+        n_units=n_units,
+        n_periods=n_periods,
+        control_indices=control_indices,
+        treated_index=treated_index,
+        pre_period_indices=pre_period_indices,
+        post_period_indices=post_period_indices,
+        method=method_lower,
+        lambda_param=lambda_param,
+        compute_se=compute_se,
+        n_placebo=actual_n_placebo,
+        max_iter=max_iter,
+        tol=tol,
+        seed=seed,
+    )
+    
+    # ========================================================================
+    # Post-Processing Warnings
+    # ========================================================================
+    
+    # Check for unit weight concentration
+    if result.unit_weights:
+        max_unit_weight = max(result.unit_weights)
+        if max_unit_weight > 0.5:
+            max_idx = result.unit_weights.index(max_unit_weight)
+            _warnings.warn(
+                f"Unit weight concentration: control unit at index {max_idx} has "
+                f"weight {max_unit_weight:.2%}. Results may be sensitive to this unit.",
+                UserWarning,
+                stacklevel=2
+            )
+    
+    # Check for poor pre-treatment fit
+    outcome_std = df[outcome_col].std()
+    if outcome_std is not None and outcome_std > 0:
+        relative_rmse = result.pre_treatment_rmse / outcome_std
+        if relative_rmse > 0.1:
+            _warnings.warn(
+                f"Pre-treatment RMSE ({result.pre_treatment_rmse:.4f}) is "
+                f"{relative_rmse:.1%} of outcome std ({outcome_std:.4f}). "
+                f"Consider using a different method or checking data quality.",
+                UserWarning,
+                stacklevel=2
+            )
+    
+    return result
+
+
 def about():
     """Print information about the causers package."""
     print(f"causers version {__version__}")
@@ -923,3 +1383,4 @@ def about():
     print("  - Wild cluster bootstrap for small cluster counts (linear)")
     print("  - Score bootstrap for small cluster counts (logistic)")
     print("  - Synthetic Difference-in-Differences (SDID)")
+    print("  - Synthetic Control (SC) with multiple method variants")

@@ -4,6 +4,7 @@ mod cluster;
 mod logistic;
 mod sdid;
 mod stats;
+mod synth_control;
 
 use cluster::{
     build_cluster_indices, compute_cluster_se_analytical, compute_cluster_se_bootstrap,
@@ -15,6 +16,10 @@ use logistic::{
 };
 use sdid::{synthetic_did_impl, SyntheticDIDResult};
 use stats::LinearRegressionResult;
+use synth_control::{
+    estimate as synth_control_estimate, SCPanelData, SynthControlConfig, SynthControlError,
+    SynthControlMethod, SyntheticControlResult,
+};
 
 /// Main module for causers - statistical operations for Polars DataFrames
 #[pymodule]
@@ -22,9 +27,11 @@ fn _causers(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LinearRegressionResult>()?;
     m.add_class::<LogisticRegressionResult>()?;
     m.add_class::<SyntheticDIDResult>()?;
+    m.add_class::<SyntheticControlResult>()?;
     m.add_function(wrap_pyfunction!(linear_regression, m)?)?;
     m.add_function(wrap_pyfunction!(logistic_regression, m)?)?;
     m.add_function(wrap_pyfunction!(synthetic_did_impl, m)?)?;
+    m.add_function(wrap_pyfunction!(synthetic_control_impl, m)?)?;
     Ok(())
 }
 
@@ -1330,4 +1337,105 @@ pub fn check_cluster_balance(cluster_info: &ClusterInfo) -> Option<String> {
         }
     }
     None
+}
+
+// ============================================================================
+// Synthetic Control Implementation (TASK-012)
+// ============================================================================
+
+/// Convert SynthControlError to PyErr
+impl From<SynthControlError> for PyErr {
+    fn from(err: SynthControlError) -> PyErr {
+        pyo3::exceptions::PyValueError::new_err(err.to_string())
+    }
+}
+
+/// Synthetic Control implementation exposed to Python.
+///
+/// This function is called from the Python wrapper after input validation
+/// and panel structure detection.
+///
+/// # Arguments
+///
+/// * `outcomes` - Flat outcome matrix in row-major order (n_units × n_periods)
+/// * `n_units` - Number of units in the panel
+/// * `n_periods` - Number of time periods
+/// * `control_indices` - Indices of control units
+/// * `treated_index` - Index of the single treated unit
+/// * `pre_period_indices` - Indices of pre-treatment periods
+/// * `post_period_indices` - Indices of post-treatment periods
+/// * `method` - SC method: "traditional", "penalized", "robust", "augmented"
+/// * `lambda_param` - Regularization parameter for penalized method (None for auto)
+/// * `compute_se` - Whether to compute standard errors via in-space placebo
+/// * `n_placebo` - Number of placebo iterations for SE (None = use all controls)
+/// * `max_iter` - Maximum Frank-Wolfe iterations
+/// * `tol` - Convergence tolerance
+/// * `seed` - Random seed for reproducibility (None for random)
+///
+/// # Returns
+///
+/// SyntheticControlResult with ATT, SE, weights, and diagnostics
+#[pyfunction]
+#[pyo3(signature = (
+    outcomes,
+    n_units,
+    n_periods,
+    control_indices,
+    treated_index,
+    pre_period_indices,
+    post_period_indices,
+    method,
+    lambda_param,
+    compute_se,
+    n_placebo,
+    max_iter,
+    tol,
+    seed
+))]
+#[allow(clippy::too_many_arguments)]
+fn synthetic_control_impl(
+    outcomes: Vec<f64>,
+    n_units: usize,
+    n_periods: usize,
+    control_indices: Vec<usize>,
+    treated_index: usize,
+    pre_period_indices: Vec<usize>,
+    post_period_indices: Vec<usize>,
+    method: &str,
+    lambda_param: Option<f64>,
+    compute_se: bool,
+    n_placebo: Option<usize>,
+    max_iter: usize,
+    tol: f64,
+    seed: Option<u64>,
+) -> PyResult<SyntheticControlResult> {
+    // Parse method string to enum
+    let sc_method = SynthControlMethod::from_str(method)?;
+
+    // Build panel data structure
+    let panel = SCPanelData::new(
+        outcomes,
+        n_units,
+        n_periods,
+        control_indices,
+        treated_index,
+        pre_period_indices,
+        post_period_indices,
+    )?;
+
+    // Build configuration
+    let config = SynthControlConfig {
+        method: sc_method,
+        lambda: lambda_param,
+        compute_se,
+        n_placebo: n_placebo.unwrap_or(panel.n_control()),
+        max_iter,
+        tol,
+        seed,
+    };
+
+    // Run estimation
+    let result = synth_control_estimate(&panel, &config)?;
+
+    Ok(result)
 }

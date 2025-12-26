@@ -5,6 +5,114 @@ All notable changes to the causers project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2025-12-25
+
+### ✨ Features
+
+- **Synthetic Control (SC)**: New causal inference method for single treated unit studies
+  - New `synthetic_control()` function for estimating treatment effects
+  - Implements Abadie et al. (2010, 2015) Synthetic Control methodology
+  - Constructs weighted combination of control units to match pre-treatment outcomes
+
+- **Four SC Method Variants**:
+  - `"traditional"`: Classic SC minimizing pre-treatment MSE with simplex constraints
+  - `"penalized"`: L2 regularization for more uniform weights, auto-lambda via LOOCV
+  - `"robust"`: De-meaned data to match dynamics instead of levels
+  - `"augmented"`: Bias correction via ridge outcome model (Ben-Michael et al., 2021)
+
+- **SyntheticControlResult**: New result class with comprehensive diagnostics
+  - `att`: Average Treatment Effect on the Treated
+  - `standard_error`: In-space placebo standard error
+  - `unit_weights`: Optimized weights for control units (sum to 1)
+  - `pre_treatment_rmse`, `pre_treatment_mse`: Pre-treatment fit quality metrics
+  - `method`: Method used ("traditional", "penalized", "robust", "augmented")
+  - `lambda_used`: Regularization parameter (for penalized/augmented)
+  - `n_units_control`, `n_periods_pre`, `n_periods_post`: Panel structure info
+  - `solver_converged`, `solver_iterations`: Optimization diagnostics
+  - `n_placebo_used`: Number of successful placebo iterations
+
+- **In-Space Placebo Standard Errors**: SE estimation via placebo treatment assignment
+  - Each control unit treated as placebo to compute placebo ATTs
+  - SE = standard deviation of placebo ATT distribution
+
+- **Input Validation**: Comprehensive validation with clear error messages
+  - Single treated unit requirement enforced
+  - Balanced panel validation
+  - Column type checking (no float unit/time columns)
+  - Method name and lambda parameter validation
+
+- **Weight Concentration Warnings**: Automatic detection of concentrated weights
+  - Warns if any unit weight > 50%
+  - Warns if pre-treatment RMSE > 10% of outcome std
+
+### 🛠️ Technical Details
+
+- New `src/synth_control.rs` module for SC implementation
+- Frank-Wolfe optimization reused from SDID module
+- All numerical computation in Rust for performance
+- Matches pysyncon reference implementation for traditional method
+
+### 📖 API Changes
+
+**New Functions:**
+- `synthetic_control(df, unit_col, time_col, outcome_col, treatment_col, ...)` — SC estimation
+
+**New Classes:**
+- `SyntheticControlResult` — Container for SC results and diagnostics
+
+**New Parameters:**
+- `unit_col: str` — Column identifying panel units
+- `time_col: str` — Column identifying time periods
+- `outcome_col: str` — Outcome variable column
+- `treatment_col: str` — Treatment indicator column (0/1)
+- `method: str = "traditional"` — SC method variant
+- `lambda_param: Optional[float] = None` — Regularization for penalized/augmented
+- `compute_se: bool = True` — Whether to compute standard errors
+- `n_placebo: Optional[int] = None` — Number of placebo iterations
+- `max_iter: int = 1000` — Maximum optimizer iterations
+- `tol: float = 1e-6` — Convergence tolerance
+- `seed: Optional[int] = None` — Random seed for reproducibility
+
+**New Errors:**
+- `ValueError`: "Cannot perform SC on empty DataFrame"
+- `ValueError`: "Column 'X' not found in DataFrame"
+- `ValueError`: "unit_col must be integer or string, not float"
+- `ValueError`: "time_col must be integer or string, not float"
+- `ValueError`: "outcome_col must be numeric"
+- `ValueError`: "outcome_col 'X' contains null values"
+- `ValueError`: "treatment_col must contain only 0 and 1 values"
+- `ValueError`: "Synthetic Control requires exactly 1 treated unit; found N"
+- `ValueError`: "At least 1 control unit required; found N"
+- `ValueError`: "At least 1 pre-treatment period required; found N"
+- `ValueError`: "No post-treatment periods found"
+- `ValueError`: "Panel is not balanced"
+- `ValueError`: "method must be one of {traditional, penalized, robust, augmented}"
+- `ValueError`: "lambda_param must be >= 0"
+
+**New Warnings:**
+- `UserWarning`: "Unit weight concentration: control unit at index X has weight Y%"
+- `UserWarning`: "Pre-treatment RMSE (X) is Y% of outcome std (Z)"
+
+### 📦 Dependencies
+
+- **New test dependency**: `pysyncon>=1.0` for SC validation tests
+  - Install with: `pip install causers[test]`
+
+### ⚠️ Breaking Changes
+
+None. All existing code continues to work unchanged.
+
+### 📚 References
+
+- Abadie, A., Diamond, A., & Hainmueller, J. (2010). Synthetic Control Methods for
+  Comparative Case Studies. *Journal of the American Statistical Association*.
+- Abadie, A., Diamond, A., & Hainmueller, J. (2015). Comparative Politics and the
+  Synthetic Control Method. *American Journal of Political Science*.
+- Ben-Michael, E., Feller, A., & Rothstein, J. (2021). The Augmented Synthetic
+  Control Method. *Journal of the American Statistical Association*.
+
+---
+
 ## [0.4.0] - 2025-12-25
 
 ### ✨ Features
@@ -408,6 +516,7 @@ MIT License - see LICENSE file for details.
 
 ---
 
+[0.5.0]: https://github.com/causers/causers/releases/tag/v0.5.0
 [0.4.0]: https://github.com/causers/causers/releases/tag/v0.4.0
 [0.3.0]: https://github.com/causers/causers/releases/tag/v0.3.0
 [0.2.0]: https://github.com/causers/causers/releases/tag/v0.2.0

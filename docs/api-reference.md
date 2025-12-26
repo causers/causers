@@ -19,7 +19,7 @@ The current version of the package as a string.
 ```python
 >>> import causers
 >>> print(causers.__version__)
-'0.3.0'
+'0.5.0'
 ```
 
 #### `causers.about()`
@@ -34,7 +34,7 @@ def about() -> None
 **Example:**
 ```python
 >>> causers.about()
-causers version 0.3.0
+causers version 0.5.0
 High-performance statistical operations for Polars DataFrames
 Powered by Rust via PyO3/maturin
 
@@ -44,6 +44,8 @@ Features:
   - Cluster-robust standard errors (analytical and bootstrap)
   - Wild cluster bootstrap for small cluster counts (linear)
   - Score bootstrap for small cluster counts (logistic)
+  - Synthetic Difference-in-Differences (SDID)
+  - Synthetic Control (SC) with multiple method variants
 ```
 
 ## Statistical Functions
@@ -530,6 +532,359 @@ Unlike linear regression R², pseudo R² values are typically much lower. Values
 
 ---
 
+### `causers.synthetic_did()`
+
+Compute Synthetic Difference-in-Differences (SDID) estimator for causal inference. Combines synthetic control weighting with difference-in-differences to estimate the Average Treatment Effect on the Treated (ATT).
+
+**Signature:**
+```python
+def synthetic_did(
+    df: polars.DataFrame,
+    unit_col: str,
+    time_col: str,
+    outcome_col: str,
+    treatment_col: str,
+    bootstrap_iterations: int = 200,
+    seed: int | None = None,
+) -> SyntheticDIDResult
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `df` | `polars.DataFrame` | Panel data in long format with one row per unit-time observation. Must be a balanced panel. |
+| `unit_col` | `str` | Column name identifying unique units (e.g., "state", "firm_id"). Must be integer or string type. |
+| `time_col` | `str` | Column name identifying time periods (e.g., "year", "quarter"). Must be integer or string type. |
+| `outcome_col` | `str` | Column name for the outcome variable. Must be numeric. |
+| `treatment_col` | `str` | Column name for treatment indicator. Must contain only 0 and 1 values. Value of 1 indicates the unit is treated in that period. |
+| `bootstrap_iterations` | `int` | Number of placebo bootstrap iterations for standard error estimation. Must be at least 1. Values < 100 will emit a warning. Default: `200`. |
+| `seed` | `int \| None` | Random seed for reproducibility. If None, uses system time. Default: `None`. |
+
+**Returns:**
+
+`SyntheticDIDResult` object with the following attributes:
+- `att` (float): Average Treatment Effect on the Treated
+- `standard_error` (float): Bootstrap standard error of the ATT
+- `unit_weights` (List[float]): Weights assigned to each control unit (sums to 1)
+- `time_weights` (List[float]): Weights assigned to each pre-treatment period (sums to 1)
+- `n_units_control` (int): Number of control units
+- `n_units_treated` (int): Number of treated units
+- `n_periods_pre` (int): Number of pre-treatment periods
+- `n_periods_post` (int): Number of post-treatment periods
+- `solver_iterations` (Tuple[int, int]): Number of iterations for (unit_weights, time_weights) optimization
+- `solver_converged` (bool): Whether the Frank-Wolfe solver converged
+- `pre_treatment_fit` (float): RMSE of pre-treatment fit (lower is better)
+- `bootstrap_iterations_used` (int): Number of successful bootstrap iterations
+
+**Raises:**
+
+| Exception | Condition |
+|-----------|-----------|
+| `ValueError` | DataFrame is empty |
+| `ValueError` | Any specified column doesn't exist |
+| `ValueError` | `unit_col` or `time_col` is float type |
+| `ValueError` | `outcome_col` is not numeric or contains null values |
+| `ValueError` | `treatment_col` contains values other than 0 and 1 |
+| `ValueError` | `bootstrap_iterations < 1` |
+| `ValueError` | Fewer than 2 control units found |
+| `ValueError` | Fewer than 2 pre-treatment periods found |
+| `ValueError` | No treated units found |
+| `ValueError` | No post-treatment periods found |
+| `ValueError` | Panel is not balanced |
+
+**Warns:**
+
+| Warning | Condition |
+|---------|-----------|
+| `UserWarning` | Any unit weight > 0.5 (weight concentration on single unit) |
+| `UserWarning` | Any time weight > 0.5 (weight concentration on single period) |
+| `UserWarning` | `bootstrap_iterations < 100` (may be unreliable) |
+
+**Examples:**
+
+**Basic SDID with panel data:**
+```python
+import polars as pl
+import causers
+
+# Panel data with treated and control units
+df = pl.DataFrame({
+    'unit': [1, 1, 1, 2, 2, 2, 3, 3, 3],
+    'time': [1, 2, 3, 1, 2, 3, 1, 2, 3],
+    'y': [1.0, 2.0, 5.0, 1.5, 2.5, 3.0, 1.2, 2.2, 2.8],
+    'treated': [0, 0, 1, 0, 0, 0, 0, 0, 0]
+})
+
+result = causers.synthetic_did(df, 'unit', 'time', 'y', 'treated', seed=42)
+
+print(f"ATT: {result.att:.4f} ± {result.standard_error:.4f}")
+print(f"Control unit weights: {result.unit_weights}")
+print(f"Pre-period weights: {result.time_weights}")
+```
+
+**Accessing diagnostics:**
+```python
+# Check convergence and fit quality
+print(f"Converged: {result.solver_converged}")
+print(f"Pre-treatment fit RMSE: {result.pre_treatment_fit:.4f}")
+print(f"Solver iterations (unit, time): {result.solver_iterations}")
+
+# Panel structure
+print(f"Control units: {result.n_units_control}")
+print(f"Treated units: {result.n_units_treated}")
+print(f"Pre-periods: {result.n_periods_pre}")
+print(f"Post-periods: {result.n_periods_post}")
+```
+
+**Multiple treated units:**
+```python
+# SDID supports multiple treated units (unlike SC)
+df = pl.DataFrame({
+    'unit': [1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4],
+    'time': [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3],
+    'y': [1.0, 2.0, 5.0, 1.1, 2.1, 5.5,  # Units 1,2 treated
+          1.5, 2.5, 3.0, 1.2, 2.2, 2.8],  # Units 3,4 control
+    'treated': [0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+})
+
+result = causers.synthetic_did(df, 'unit', 'time', 'y', 'treated', seed=42)
+print(f"ATT with {result.n_units_treated} treated units: {result.att:.4f}")
+```
+
+**Constructing confidence interval:**
+```python
+result = causers.synthetic_did(df, 'unit', 'time', 'y', 'treated',
+                                bootstrap_iterations=500, seed=42)
+
+# 95% confidence interval
+ci_lower = result.att - 1.96 * result.standard_error
+ci_upper = result.att + 1.96 * result.standard_error
+print(f"95% CI: [{ci_lower:.4f}, {ci_upper:.4f}]")
+```
+
+**Mathematical Details:**
+
+**Algorithm:**
+
+The SDID estimator combines synthetic control weighting with difference-in-differences:
+
+1. **Unit weights (ω)**: Find control unit weights that match pre-treatment trends of treated units
+2. **Time weights (λ)**: Find pre-period weights that predict post-period outcomes
+
+The estimator is:
+```
+τ̂_sdid = (Ȳ_tr,post - Ȳ_synth,post) - Σ_t λ_t (Ȳ_tr,t - Ȳ_synth,t)
+```
+
+Where `Ȳ_synth,t = Σ_i ω_i Y_i,t` uses optimized unit weights on control units.
+
+**Panel Structure Detection:**
+
+The function automatically detects:
+- **Control units**: Units where treatment=0 in all periods
+- **Treated units**: Units where treatment=1 in at least one period
+- **Pre-periods**: Periods where all observations have treatment=0
+- **Post-periods**: Periods where at least one treated unit has treatment=1
+
+**Standard Errors:**
+
+Standard errors are computed via placebo bootstrap:
+1. Randomly select a control unit as "placebo treated"
+2. Re-run SDID with this unit treated
+3. Repeat for `bootstrap_iterations`
+4. SE = standard deviation of placebo ATTs
+
+> **Reference:** Arkhangelsky, D., Athey, S., Hirshberg, D. A., Imbens, G. W., & Wager, S. (2021). "Synthetic difference-in-differences." *American Economic Review*, 111(12), 4088-4118.
+
+---
+
+### `causers.synthetic_control()`
+
+Compute Synthetic Control (SC) estimator for causal inference with a single treated unit. Supports four method variants: traditional, penalized, robust, and augmented.
+
+**Signature:**
+```python
+def synthetic_control(
+    df: polars.DataFrame,
+    unit_col: str,
+    time_col: str,
+    outcome_col: str,
+    treatment_col: str,
+    method: str = "traditional",
+    lambda_param: float | None = None,
+    compute_se: bool = True,
+    n_placebo: int | None = None,
+    max_iter: int = 1000,
+    tol: float = 1e-6,
+    seed: int | None = None,
+) -> SyntheticControlResult
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `df` | `polars.DataFrame` | Panel data in long format with one row per unit-time observation. Must be a balanced panel. |
+| `unit_col` | `str` | Column name identifying unique units (e.g., "state", "firm_id"). Must be integer or string type. |
+| `time_col` | `str` | Column name identifying time periods (e.g., "year", "quarter"). Must be integer or string type. |
+| `outcome_col` | `str` | Column name for the outcome variable. Must be numeric. |
+| `treatment_col` | `str` | Column name for treatment indicator. Must contain only 0 and 1 values. Exactly one unit must be treated. |
+| `method` | `str` | Method to use: `"traditional"` (default), `"penalized"`, `"robust"`, or `"augmented"`. |
+| `lambda_param` | `float \| None` | Regularization parameter for penalized/augmented methods. If None, auto-selected via LOOCV for penalized. |
+| `compute_se` | `bool` | Whether to compute standard errors via in-space placebo. Default: `True`. |
+| `n_placebo` | `int \| None` | Number of placebo iterations for SE. If None, uses all control units. |
+| `max_iter` | `int` | Maximum iterations for Frank-Wolfe optimizer. Default: `1000`. |
+| `tol` | `float` | Convergence tolerance for optimizer. Default: `1e-6`. |
+| `seed` | `int \| None` | Random seed for reproducibility. Default: `None`. |
+
+**Returns:**
+
+`SyntheticControlResult` object with the following attributes:
+- `att` (float): Average Treatment Effect on the Treated
+- `standard_error` (float | None): In-space placebo standard error (None if `compute_se=False`)
+- `unit_weights` (List[float]): Weights assigned to each control unit (sums to 1)
+- `pre_treatment_rmse` (float): Root Mean Squared Error of pre-treatment fit
+- `pre_treatment_mse` (float): Mean Squared Error of pre-treatment fit
+- `method` (str): Method used ("traditional", "penalized", "robust", "augmented")
+- `lambda_used` (float | None): Lambda parameter used (for penalized/augmented)
+- `n_units_control` (int): Number of control units
+- `n_periods_pre` (int): Number of pre-treatment periods
+- `n_periods_post` (int): Number of post-treatment periods
+- `solver_converged` (bool): Whether Frank-Wolfe solver converged
+- `solver_iterations` (int): Number of optimizer iterations
+- `n_placebo_used` (int | None): Number of successful placebo iterations
+
+**Raises:**
+
+| Exception | Condition |
+|-----------|-----------|
+| `ValueError` | DataFrame is empty |
+| `ValueError` | Any specified column doesn't exist |
+| `ValueError` | `unit_col` or `time_col` is float type |
+| `ValueError` | `outcome_col` is not numeric or contains null values |
+| `ValueError` | `treatment_col` contains values other than 0 and 1 |
+| `ValueError` | Not exactly one treated unit found |
+| `ValueError` | Fewer than 1 control unit or pre-treatment period |
+| `ValueError` | Panel is not balanced |
+| `ValueError` | Invalid method name |
+| `ValueError` | `lambda_param < 0` |
+
+**Warns:**
+
+| Warning | Condition |
+|---------|-----------|
+| `UserWarning` | Any unit weight > 0.5 (weight concentration on single unit) |
+| `UserWarning` | Pre-treatment RMSE > 10% of outcome std (poor fit) |
+
+**Examples:**
+
+**Basic Traditional SC:**
+```python
+import polars as pl
+import causers
+
+# Panel data with 1 treated unit (California) and controls
+df = pl.DataFrame({
+    'state': [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
+    'year': [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4],
+    'y': [10.0, 12.0, 14.0, 25.0,   # State 1: treated in year 4
+          9.0, 11.0, 13.0, 15.0,    # State 2: control
+          11.0, 13.0, 15.0, 17.0],  # State 3: control
+    'treated': [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+})
+
+result = causers.synthetic_control(
+    df, 'state', 'year', 'y', 'treated', seed=42
+)
+
+print(f"ATT: {result.att:.4f} ± {result.standard_error:.4f}")
+print(f"Weights: {result.unit_weights}")
+print(f"Pre-treatment RMSE: {result.pre_treatment_rmse:.4f}")
+```
+
+**Penalized SC (more uniform weights):**
+```python
+# Penalized method adds L2 regularization for smoother weights
+result = causers.synthetic_control(
+    df, 'state', 'year', 'y', 'treated',
+    method="penalized",  # Auto-selects lambda via LOOCV
+    seed=42
+)
+
+print(f"Lambda used: {result.lambda_used}")
+print(f"Weights: {result.unit_weights}")
+```
+
+**Robust SC (matching dynamics):**
+```python
+# Robust method de-means data to match dynamics instead of levels
+result = causers.synthetic_control(
+    df, 'state', 'year', 'y', 'treated',
+    method="robust",
+    seed=42
+)
+
+print(f"ATT: {result.att:.4f}")
+```
+
+**Augmented SC (bias correction):**
+```python
+# Augmented method adds ridge regression bias correction
+result = causers.synthetic_control(
+    df, 'state', 'year', 'y', 'treated',
+    method="augmented",
+    lambda_param=0.1,  # Explicit regularization
+    seed=42
+)
+
+print(f"ATT: {result.att:.4f}")
+```
+
+**Without standard errors (faster):**
+```python
+result = causers.synthetic_control(
+    df, 'state', 'year', 'y', 'treated',
+    compute_se=False  # Skip in-space placebo
+)
+
+print(f"ATT: {result.att:.4f} (SE not computed)")
+```
+
+**Mathematical Details:**
+
+**Traditional SC:**
+Finds weights ω that minimize pre-treatment MSE:
+```
+ω̂ = argmin_{ω ≥ 0, Σω = 1} Σ_t∈pre (Y₁ₜ - Σⱼ ωⱼ Yⱼₜ)²
+```
+
+**Penalized SC:**
+Adds L2 regularization:
+```
+ω̂ = argmin_{ω ≥ 0, Σω = 1} Σ_t (Y₁ₜ - Σⱼ ωⱼ Yⱼₜ)² + λ Σⱼ ωⱼ²
+```
+
+**Robust SC:**
+De-means outcomes before optimization to match dynamics.
+
+**Augmented SC:**
+Adds bias correction via ridge regression on pre-treatment fit residuals.
+
+**ATT Computation:**
+```
+τ̂_SC = (1/|post|) Σ_{t∈post} (Y₁ₜ - Σⱼ ω̂ⱼ Yⱼₜ)
+```
+
+**Standard Errors (In-Space Placebo):**
+For each control unit, treat it as placebo, compute SC and ATT. SE = std(placebo ATTs).
+
+> **References:**
+> - Abadie, A., Diamond, A., & Hainmueller, J. (2010). "Synthetic Control Methods for Comparative Case Studies." *JASA*.
+> - Ben-Michael, E., Feller, A., & Rothstein, J. (2021). "The Augmented Synthetic Control Method." *JASA*.
+
+---
+
 ## Result Classes
 
 ### `LinearRegressionResult`
@@ -712,6 +1067,175 @@ result_clustered = causers.logistic_regression(
 print(f"Clustered SE: {result_clustered.standard_errors[0]:.4f}")
 print(f"Number of clusters: {result_clustered.n_clusters}")
 print(f"SE type: {result_clustered.cluster_se_type}")
+```
+
+### `SyntheticDIDResult`
+
+Container for Synthetic Difference-in-Differences results.
+
+**Attributes:**
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `att` | `float` | Average Treatment Effect on the Treated |
+| `standard_error` | `float` | Bootstrap standard error of the ATT |
+| `unit_weights` | `List[float]` | Weights assigned to each control unit (sums to 1) |
+| `time_weights` | `List[float]` | Weights assigned to each pre-treatment period (sums to 1) |
+| `n_units_control` | `int` | Number of control units |
+| `n_units_treated` | `int` | Number of treated units |
+| `n_periods_pre` | `int` | Number of pre-treatment periods |
+| `n_periods_post` | `int` | Number of post-treatment periods |
+| `solver_iterations` | `Tuple[int, int]` | Number of iterations for (unit_weights, time_weights) optimization |
+| `solver_converged` | `bool` | Whether the Frank-Wolfe solver converged |
+| `pre_treatment_fit` | `float` | RMSE of pre-treatment fit (lower is better) |
+| `bootstrap_iterations_used` | `int` | Number of successful bootstrap iterations |
+
+**Methods:**
+
+#### `__repr__()`
+Returns a string representation suitable for debugging.
+
+```python
+>>> result
+SyntheticDIDResult(att=2.5, se=0.3, n_treated=1, n_control=5)
+```
+
+#### `__str__()`
+Returns a human-readable summary.
+
+```python
+>>> print(result)
+Synthetic DID Results:
+  ATT: 2.500 ± 0.300
+  Pre-treatment fit RMSE: 0.123
+  Treated units: 1, Control units: 5
+  Pre-periods: 8, Post-periods: 3
+```
+
+**Example Usage:**
+
+```python
+import polars as pl
+import causers
+
+# Create panel data
+df = pl.DataFrame({
+    'unit': [1, 1, 1, 2, 2, 2, 3, 3, 3],
+    'time': [1, 2, 3, 1, 2, 3, 1, 2, 3],
+    'y': [1.0, 2.0, 5.0, 1.5, 2.5, 3.0, 1.2, 2.2, 2.8],
+    'treated': [0, 0, 1, 0, 0, 0, 0, 0, 0]
+})
+
+result = causers.synthetic_did(df, 'unit', 'time', 'y', 'treated', seed=42)
+
+# Access basic attributes
+print(f"ATT: {result.att:.4f}")
+print(f"SE: {result.standard_error:.4f}")
+
+# Access weights
+print(f"Control unit weights: {result.unit_weights}")
+print(f"Time weights: {result.time_weights}")
+print(f"Unit weights sum to: {sum(result.unit_weights):.6f}")  # Should be 1.0
+print(f"Time weights sum to: {sum(result.time_weights):.6f}")  # Should be 1.0
+
+# Access panel structure
+print(f"Treated units: {result.n_units_treated}")
+print(f"Control units: {result.n_units_control}")
+print(f"Pre-periods: {result.n_periods_pre}")
+print(f"Post-periods: {result.n_periods_post}")
+
+# Access diagnostics
+print(f"Pre-treatment fit RMSE: {result.pre_treatment_fit:.4f}")
+print(f"Converged: {result.solver_converged}")
+print(f"Solver iterations (unit, time): {result.solver_iterations}")
+print(f"Bootstrap iterations used: {result.bootstrap_iterations_used}")
+
+# Construct confidence interval
+ci_lower = result.att - 1.96 * result.standard_error
+ci_upper = result.att + 1.96 * result.standard_error
+print(f"95% CI: [{ci_lower:.4f}, {ci_upper:.4f}]")
+```
+
+### `SyntheticControlResult`
+
+Container for Synthetic Control results.
+
+**Attributes:**
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `att` | `float` | Average Treatment Effect on the Treated |
+| `standard_error` | `float \| None` | In-space placebo standard error. `None` if `compute_se=False` |
+| `unit_weights` | `List[float]` | Weights assigned to each control unit (sums to 1) |
+| `pre_treatment_rmse` | `float` | Root Mean Squared Error of pre-treatment fit |
+| `pre_treatment_mse` | `float` | Mean Squared Error of pre-treatment fit |
+| `method` | `str` | Method used: "traditional", "penalized", "robust", or "augmented" |
+| `lambda_used` | `float \| None` | Regularization parameter (for penalized/augmented methods) |
+| `n_units_control` | `int` | Number of control units |
+| `n_periods_pre` | `int` | Number of pre-treatment periods |
+| `n_periods_post` | `int` | Number of post-treatment periods |
+| `solver_converged` | `bool` | Whether Frank-Wolfe solver converged |
+| `solver_iterations` | `int` | Number of optimizer iterations |
+| `n_placebo_used` | `int \| None` | Number of successful placebo iterations |
+
+**Methods:**
+
+#### `__repr__()`
+Returns a string representation suitable for debugging.
+
+```python
+>>> result
+SyntheticControlResult(att=5.0, se=0.5, method='traditional', n_control=10)
+```
+
+#### `__str__()`
+Returns a human-readable summary.
+
+```python
+>>> print(result)
+Synthetic Control Results:
+  Method: traditional
+  ATT: 5.000 ± 0.500
+  Pre-treatment RMSE: 0.123
+  Control units: 10
+  Pre-periods: 8, Post-periods: 3
+```
+
+**Example Usage:**
+
+```python
+import polars as pl
+import causers
+
+# Create panel data
+df = pl.DataFrame({
+    'unit': [1, 1, 1, 2, 2, 2, 3, 3, 3],
+    'time': [1, 2, 3, 1, 2, 3, 1, 2, 3],
+    'y': [1.0, 2.0, 8.0, 1.5, 2.5, 3.0, 1.2, 2.2, 2.8],
+    'treated': [0, 0, 1, 0, 0, 0, 0, 0, 0]
+})
+
+result = causers.synthetic_control(df, 'unit', 'time', 'y', 'treated', seed=42)
+
+# Access basic attributes
+print(f"ATT: {result.att:.4f}")
+print(f"SE: {result.standard_error:.4f}")
+print(f"Method: {result.method}")
+
+# Access weights
+print(f"Control unit weights: {result.unit_weights}")
+print(f"Weights sum to: {sum(result.unit_weights):.6f}")  # Should be 1.0
+
+# Access diagnostics
+print(f"Pre-treatment RMSE: {result.pre_treatment_rmse:.4f}")
+print(f"Converged: {result.solver_converged}")
+print(f"Iterations: {result.solver_iterations}")
+
+# Construct confidence interval
+if result.standard_error is not None:
+    ci_lower = result.att - 1.96 * result.standard_error
+    ci_upper = result.att + 1.96 * result.standard_error
+    print(f"95% CI: [{ci_lower:.4f}, {ci_upper:.4f}]")
 ```
 
 ## Type Hints
@@ -1022,13 +1546,13 @@ result = causers.linear_regression(df, x_cols=["x1", "x2"], y_col="y")
 
 ## Limitations
 
-### Current Limitations (v0.3.0)
+### Current Limitations (v0.5.0)
 
 1. **Single-way clustering only**: Multi-way clustering (e.g., two-way by firm and time) not yet supported
 2. **No weights**: Weighted least squares not implemented
-3. **No regularization**: Ridge/Lasso regression not available
-4. **No confidence intervals**: P-values and confidence intervals not included (SE available)
-5. **Bootstrap parallelization**: Bootstrap iterations run sequentially (parallelization planned)
+3. **No confidence intervals**: P-values and confidence intervals not included (SE available)
+4. **Bootstrap parallelization**: Bootstrap iterations run sequentially (parallelization planned)
+5. **Synthetic Control**: Single treated unit only (use synthetic_did for multiple treated units)
 
 ### Memory Limitations
 
@@ -1091,4 +1615,4 @@ pl.Config.set_tbl_rows(10)
 
 ---
 
-Last updated: 2025-12-25 | causers v0.3.0
+Last updated: 2025-12-25 | causers v0.5.0

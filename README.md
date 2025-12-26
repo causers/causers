@@ -22,6 +22,7 @@ A high-performance statistical package for Polars DataFrames, powered by Rust.
 - **🏢 Clustered Standard Errors**: Cluster-robust SE for panel/grouped data
 - **🔄 Bootstrap Methods**: Wild cluster bootstrap (linear) and score bootstrap (logistic)
 - **🧪 Synthetic DID**: Synthetic Difference-in-Differences for causal inference with panel data
+- **🎯 Synthetic Control**: Classic SC with 4 method variants (traditional, penalized, robust, augmented)
 - **🔧 Native Polars Integration**: Zero-copy operations on Polars DataFrames
 - **🦀 Rust-Powered**: Core computations in Rust for maximum throughput
 - **🐍 Pythonic API**: Clean, intuitive interface with full type hints
@@ -268,6 +269,42 @@ Pre-treatment fit (RMSE): 0.0000
 ```
 
 > **Note**: The Frank-Wolfe algorithm solves for optimal unit and time weights constrained to the unit simplex. Placebo bootstrap is used by default for standard error estimation.
+
+### Synthetic Control (Single Treated Unit)
+
+Estimate causal effects for a single treated unit using Synthetic Control (Abadie et al., 2010):
+
+```python
+import polars as pl
+import causers
+
+# Panel data: 1 treated unit (unit 1) with controls
+df = pl.DataFrame({
+    "state": [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
+    "year": [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4],
+    "outcome": [10.0, 12.0, 14.0, 25.0,   # State 1: treated in year 4
+                9.0, 11.0, 13.0, 15.0,    # State 2: control
+                11.0, 13.0, 15.0, 17.0],  # State 3: control
+    "treated": [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+})
+
+result = causers.synthetic_control(
+    df,
+    unit_col="state",
+    time_col="year",
+    outcome_col="outcome",
+    treatment_col="treated",
+    method="traditional",  # or "penalized", "robust", "augmented"
+    seed=42
+)
+
+print(f"ATT: {result.att:.4f} ± {result.standard_error:.4f}")
+print(f"Method: {result.method}")
+print(f"Control weights: {result.unit_weights}")
+print(f"Pre-treatment RMSE: {result.pre_treatment_rmse:.4f}")
+```
+
+> **Note**: Synthetic Control requires exactly ONE treated unit. For multiple treated units, use `synthetic_did()` instead. The 4 method variants offer different trade-offs between bias and variance.
 
 ## 📊 Performance Benchmarks
 
@@ -565,12 +602,20 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 - ✅ **Webb weights for bootstrap** (`bootstrap_method="webb"`)
 - ✅ Method-specific `cluster_se_type` values (`"bootstrap_rademacher"`, `"bootstrap_webb"`)
 
-### v0.4.0 (Current)
+### v0.4.0
 - ✅ **Synthetic Difference-in-Differences** (Arkhangelsky et al., 2021)
 - ✅ Frank-Wolfe algorithm for simplex-constrained weight optimization
 - ✅ Placebo bootstrap for standard error estimation
 - ✅ azcausal-validated accuracy (ATT rtol=1e-6, SE rtol=0.5)
 - ✅ Performance: 1000×100 panel < 1 second
+
+### v0.5.0 (Current)
+- ✅ **Synthetic Control** (Abadie et al., 2010, 2015)
+- ✅ Four method variants: traditional, penalized, robust, augmented
+- ✅ In-space placebo standard errors
+- ✅ Auto-lambda selection via LOOCV (penalized method)
+- ✅ Augmented SC with ridge bias correction (Ben-Michael et al., 2021)
+- ✅ pysyncon parity testing
 
 ## 🔒 Security
 

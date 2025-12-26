@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "causers"
-version = "0.4.0"
+version = "0.5.0"
 description = "High-performance statistical operations for Polars DataFrames"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -45,9 +45,12 @@ dev = [
 ]
 test = [
     "pytest>=7.0",
+    "pytest-cov>=4.0",
     "numpy>=1.20",
     "statsmodels>=0.14.0,<0.16.0",
     "azcausal>=0.2",
+    "pysyncon>=1.0",
+    "hypothesis>=6.0",
 ]
 
 [project.urls]
