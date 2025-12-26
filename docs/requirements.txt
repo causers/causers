@@ -1,0 +1,6 @@
+# docs/requirements.txt
+# Sphinx documentation build dependencies
+
+sphinx>=7.0,<8.0
+sphinx-rtd-theme>=2.0,<3.0
+maturin>=1.4,<2.0

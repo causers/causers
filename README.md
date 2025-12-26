@@ -5,6 +5,7 @@
 [![Python Versions](https://img.shields.io/pypi/pyversions/causers)](https://pypi.org/project/causers/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Coverage: 100%](https://img.shields.io/badge/Coverage-100%25-brightgreen.svg)](https://github.com/causers/causers)
+[![Documentation Status](https://readthedocs.org/projects/causers/badge/?version=latest)](https://causers.readthedocs.io/en/latest/?badge=latest)
 
 A high-performance statistical package for Polars DataFrames, powered by Rust.
 
@@ -636,8 +637,8 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## 📚 Resources
 
-- [Documentation](https://causers.readthedocs.io) (Coming soon)
-- [API Reference](https://causers.readthedocs.io/api) (Coming soon)
+- [Documentation](https://causers.readthedocs.io)
+- [API Reference](https://causers.readthedocs.io/en/stable/api/causers.html)
 - [GitHub Issues](https://github.com/causers/causers/issues)
 - [Discussions](https://github.com/causers/causers/discussions)
 

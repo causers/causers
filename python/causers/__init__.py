@@ -9,7 +9,7 @@ from typing import List as _List, Optional as _Optional, Union as _Union
 import warnings as _warnings
 import polars as _polars
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 # Import the Rust extension module
 from causers._causers import (

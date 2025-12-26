@@ -5,6 +5,21 @@ All notable changes to the causers project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2025-12-26
+
+### Documentation
+
+- Added Sphinx documentation infrastructure with autodoc for automatic API reference generation
+- Configured Read The Docs integration with Rust toolchain support for PyO3 extension builds
+- API documentation now auto-generated from Python docstrings
+- Updated README.md with live RTD documentation links and badge
+
+### Removed
+
+- `documentation/api-reference.md` (replaced by Sphinx autodoc on RTD)
+
+---
+
 ## [0.5.0] - 2025-12-25
 
 ### ✨ Features
@@ -516,6 +531,7 @@ MIT License - see LICENSE file for details.
 
 ---
 
+[0.5.1]: https://github.com/causers/causers/releases/tag/v0.5.1
 [0.5.0]: https://github.com/causers/causers/releases/tag/v0.5.0
 [0.4.0]: https://github.com/causers/causers/releases/tag/v0.4.0
 [0.3.0]: https://github.com/causers/causers/releases/tag/v0.3.0
