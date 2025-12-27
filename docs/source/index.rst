@@ -8,6 +8,7 @@ High-performance statistical operations for Polars DataFrames, powered by Rust.
    :caption: Contents:
 
    api/causers
+   benchmarks
 
 Quick Start
 -----------

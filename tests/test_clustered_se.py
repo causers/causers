@@ -1464,3 +1464,208 @@ class TestBootstrapMethodEdgeCases:
         
         assert result.bootstrap_iterations_used == 5000
         assert result.standard_errors[0] > 0
+
+
+# =============================================================================
+# Parallel Bootstrap Tests (Phase 1 - TASK-003)
+# =============================================================================
+
+
+class TestParallelBootstrapDeterminism:
+    """Tests for parallel bootstrap determinism.
+    
+    These tests verify that the parallel implementation of wild cluster bootstrap
+    produces identical results with the same seed across multiple runs.
+    """
+    
+    @pytest.fixture
+    def parallel_test_data(self):
+        """Create test data for parallel bootstrap testing."""
+        np.random.seed(42)
+        n_clusters = 50
+        n_per_cluster = 20
+        n = n_clusters * n_per_cluster
+        
+        cluster_ids = []
+        x = []
+        y = []
+        
+        for g in range(n_clusters):
+            cluster_effect = np.random.randn() * 0.5
+            for _ in range(n_per_cluster):
+                cluster_ids.append(g)
+                xi = np.random.randn()
+                yi = 1.0 + 2.0 * xi + cluster_effect + np.random.randn() * 0.3
+                x.append(xi)
+                y.append(yi)
+        
+        return pl.DataFrame({
+            "x": x,
+            "y": y,
+            "cluster_id": cluster_ids,
+        })
+    
+    def test_parallel_bootstrap_determinism_rademacher(self, parallel_test_data):
+        """Parallel bootstrap with Rademacher weights should be deterministic with same seed."""
+        df = parallel_test_data
+        
+        # Run multiple times with same seed
+        results = []
+        for _ in range(3):
+            result = causers.linear_regression(
+                df, "x", "y",
+                cluster="cluster_id",
+                bootstrap=True,
+                bootstrap_method="rademacher",
+                bootstrap_iterations=500,
+                seed=12345
+            )
+            results.append((result.standard_errors[0], result.intercept_se))
+        
+        # All runs should produce identical results
+        for i in range(1, len(results)):
+            np.testing.assert_array_equal(
+                results[0][0], results[i][0],
+                err_msg=f"Run {i+1} produced different SE than run 1"
+            )
+            np.testing.assert_equal(
+                results[0][1], results[i][1],
+                err_msg=f"Run {i+1} produced different intercept SE than run 1"
+            )
+    
+    def test_parallel_bootstrap_determinism_webb(self, parallel_test_data):
+        """Parallel bootstrap with Webb weights should be deterministic with same seed."""
+        df = parallel_test_data
+        
+        # Run multiple times with same seed
+        results = []
+        for _ in range(3):
+            result = causers.linear_regression(
+                df, "x", "y",
+                cluster="cluster_id",
+                bootstrap=True,
+                bootstrap_method="webb",
+                bootstrap_iterations=500,
+                seed=67890
+            )
+            results.append((result.standard_errors[0], result.intercept_se))
+        
+        # All runs should produce identical results
+        for i in range(1, len(results)):
+            np.testing.assert_array_equal(
+                results[0][0], results[i][0],
+                err_msg=f"Run {i+1} produced different SE than run 1"
+            )
+            np.testing.assert_equal(
+                results[0][1], results[i][1],
+                err_msg=f"Run {i+1} produced different intercept SE than run 1"
+            )
+    
+    def test_parallel_bootstrap_different_seeds_produce_different_results(self, parallel_test_data):
+        """Different seeds should produce different SE values."""
+        df = parallel_test_data
+        
+        result1 = causers.linear_regression(
+            df, "x", "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_iterations=500,
+            seed=111
+        )
+        
+        result2 = causers.linear_regression(
+            df, "x", "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_iterations=500,
+            seed=999
+        )
+        
+        # Results should be different (with high probability)
+        # This could theoretically fail with extremely low probability
+        assert result1.standard_errors[0] != result2.standard_errors[0] or \
+               result1.intercept_se != result2.intercept_se, \
+               "Different seeds produced identical results - extremely unlikely if RNG is working"
+    
+    def test_parallel_bootstrap_produces_valid_se(self, parallel_test_data):
+        """Parallel bootstrap should produce positive, finite SE values."""
+        df = parallel_test_data
+        
+        result = causers.linear_regression(
+            df, "x", "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_iterations=1000,
+            seed=42
+        )
+        
+        # SE should be positive and finite
+        assert result.standard_errors[0] > 0
+        assert np.isfinite(result.standard_errors[0])
+        assert result.intercept_se > 0
+        assert np.isfinite(result.intercept_se)
+    
+    def test_parallel_bootstrap_with_large_iterations(self, parallel_test_data):
+        """Parallel bootstrap should handle large iteration counts efficiently."""
+        df = parallel_test_data
+        
+        # Use a larger iteration count to verify parallelization
+        result = causers.linear_regression(
+            df, "x", "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_iterations=2000,
+            seed=42
+        )
+        
+        assert result.bootstrap_iterations_used == 2000
+        assert result.standard_errors[0] > 0
+        assert result.cluster_se_type == "bootstrap_rademacher"
+    
+    def test_parallel_bootstrap_multiple_covariates_determinism(self):
+        """Parallel bootstrap with multiple covariates should be deterministic."""
+        np.random.seed(42)
+        n_clusters = 30
+        n_per_cluster = 15
+        n = n_clusters * n_per_cluster
+        
+        cluster_ids = np.repeat(np.arange(n_clusters), n_per_cluster)
+        x1 = np.random.randn(n)
+        x2 = np.random.randn(n)
+        y = 0.5 + 1.0 * x1 + 0.5 * x2 + np.random.randn(n) * 0.3
+        
+        df = pl.DataFrame({
+            "x1": x1,
+            "x2": x2,
+            "y": y,
+            "cluster_id": cluster_ids,
+        })
+        
+        # Run twice with same seed
+        result1 = causers.linear_regression(
+            df, ["x1", "x2"], "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_iterations=500,
+            seed=54321
+        )
+        
+        result2 = causers.linear_regression(
+            df, ["x1", "x2"], "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_iterations=500,
+            seed=54321
+        )
+        
+        # All SEs should be identical
+        np.testing.assert_array_equal(
+            result1.standard_errors,
+            result2.standard_errors,
+            err_msg="Multiple covariate bootstrap SEs not deterministic"
+        )
+        np.testing.assert_equal(
+            result1.intercept_se,
+            result2.intercept_se,
+            err_msg="Intercept SE not deterministic with multiple covariates"
+        )

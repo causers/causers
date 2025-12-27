@@ -2215,5 +2215,221 @@ class TestComplexWeightParity:
                     f"{method}: ATT {r['att']:.4f} not close to true effect 5.0"
 
 
+# ============================================================================
+# TASK-010: Parallel Synth Control SE Tests
+# ============================================================================
+
+
+class TestParallelPlaceboSE:
+    """
+    Tests for parallel in-space placebo SE computation (TASK-010).
+    
+    These tests verify:
+    - Determinism: Same seed produces same SE results
+    - Valid SE: Parallel implementation produces valid, non-NaN SE values
+    - Memory efficiency: No allocation explosion from view-based approach
+    """
+
+    def test_parallel_se_determinism(self, basic_sc_panel):
+        """
+        Parallel SE computation should be deterministic with same seed.
+        
+        This tests that the parallel implementation using Rayon and
+        SCPlaceboView produces identical results on repeated runs.
+        """
+        result1 = synthetic_control(
+            basic_sc_panel, 'unit', 'time', 'y', 'treated',
+            method='traditional', compute_se=True, seed=42
+        )
+        result2 = synthetic_control(
+            basic_sc_panel, 'unit', 'time', 'y', 'treated',
+            method='traditional', compute_se=True, seed=42
+        )
+        
+        # ATT should be identical (deterministic)
+        assert abs(result1.att - result2.att) < 1e-10, \
+            f"ATT not deterministic: {result1.att} vs {result2.att}"
+        
+        # SE should be identical (deterministic parallel implementation)
+        assert result1.standard_error is not None
+        assert result2.standard_error is not None
+        assert abs(result1.standard_error - result2.standard_error) < 1e-10, \
+            f"SE not deterministic: {result1.standard_error} vs {result2.standard_error}"
+        
+        # n_placebo_used should be identical
+        assert result1.n_placebo_used == result2.n_placebo_used, \
+            f"n_placebo_used not deterministic: {result1.n_placebo_used} vs {result2.n_placebo_used}"
+
+    def test_parallel_se_different_seeds(self, basic_sc_panel):
+        """
+        Different seeds should produce same ATT but potentially different SE.
+        
+        ATT is deterministic (no randomness), but SE from placebo iterations
+        should still be similar since it's based on control unit permutations.
+        """
+        result1 = synthetic_control(
+            basic_sc_panel, 'unit', 'time', 'y', 'treated',
+            method='traditional', compute_se=True, seed=42
+        )
+        result2 = synthetic_control(
+            basic_sc_panel, 'unit', 'time', 'y', 'treated',
+            method='traditional', compute_se=True, seed=999
+        )
+        
+        # ATT should be identical (deterministic)
+        assert abs(result1.att - result2.att) < 1e-10, \
+            "ATT should be deterministic regardless of seed"
+        
+        # SE should be similar (same data, just different order)
+        # Note: For in-space placebo, results should be deterministic
+        # since we iterate over all control units
+        assert result1.standard_error is not None
+        assert result2.standard_error is not None
+
+    def test_parallel_se_produces_valid_values(self, larger_sc_panel):
+        """
+        Parallel SE computation should produce valid, positive SE values.
+        
+        Uses larger panel with more control units to exercise parallelism.
+        """
+        result = synthetic_control(
+            larger_sc_panel, 'unit', 'time', 'y', 'treated',
+            method='traditional', compute_se=True, seed=42
+        )
+        
+        # SE should be non-negative and finite
+        assert result.standard_error is not None, "SE should be computed"
+        assert result.standard_error >= 0.0, "SE should be non-negative"
+        assert result.standard_error == result.standard_error, "SE should not be NaN"
+        assert result.standard_error < float('inf'), "SE should be finite"
+        
+        # Should have used multiple placebo iterations
+        assert result.n_placebo_used is not None
+        assert result.n_placebo_used >= 2, "Should have at least 2 successful placebos"
+
+    @pytest.mark.parametrize("method", ["traditional", "penalized", "robust", "augmented"])
+    def test_parallel_se_all_methods(self, basic_sc_panel, method):
+        """
+        All SC methods should produce valid parallel SE computation.
+        """
+        result = synthetic_control(
+            basic_sc_panel, 'unit', 'time', 'y', 'treated',
+            method=method, compute_se=True, seed=42
+        )
+        
+        assert result.standard_error is not None, f"[{method}] SE should be computed"
+        assert result.standard_error >= 0.0, f"[{method}] SE should be non-negative"
+        assert result.standard_error == result.standard_error, f"[{method}] SE should not be NaN"
+
+    @pytest.mark.slow
+    def test_parallel_se_memory_efficiency(self):
+        """
+        Memory test to verify no allocation explosion in parallel SE.
+        
+        The view-based implementation should use O(C-1) memory per iteration
+        for index vectors, NOT O(U×T) for outcomes clone.
+        
+        This test uses a moderately large panel and verifies:
+        1. SE computation completes without memory issues
+        2. Result is valid
+        """
+        # Create moderately large panel
+        panel = generate_sc_panel(
+            n_control=50,  # 50 control + 1 treated
+            n_pre=20,
+            n_post=5,
+            effect=5.0,
+            seed=42
+        )
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            
+            # Time and run the SE computation
+            start_time = time.perf_counter()
+            result = synthetic_control(
+                panel, 'unit', 'time', 'y', 'treated',
+                method='traditional', compute_se=True,
+                n_placebo=50,  # Run all 50 placebos
+                seed=42
+            )
+            elapsed_time = time.perf_counter() - start_time
+        
+        print(f"\n[MEMORY EFFICIENCY TEST]")
+        print(f"  Panel: 51 units × 25 periods")
+        print(f"  Placebo iterations: {result.n_placebo_used}")
+        print(f"  Elapsed time: {elapsed_time:.4f} seconds")
+        print(f"  SE: {result.standard_error:.6f}")
+        
+        # Verify result validity
+        assert result.standard_error is not None, "SE should be computed"
+        assert result.standard_error >= 0.0, "SE should be non-negative"
+        assert result.standard_error == result.standard_error, "SE should not be NaN"
+        assert result.n_placebo_used >= 2, "Should have successful placebos"
+        
+        # Should complete in reasonable time (< 60s for 50 placebos)
+        assert elapsed_time < 60.0, \
+            f"SE computation too slow: {elapsed_time:.4f}s (expected < 60s)"
+
+    def test_parallel_se_consistency_with_larger_panel(self):
+        """
+        Verify SE is consistent across multiple runs for larger panel.
+        """
+        panel = generate_sc_panel(
+            n_control=20,
+            n_pre=10,
+            n_post=3,
+            effect=5.0,
+            seed=42
+        )
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            
+            results = []
+            for _ in range(3):
+                result = synthetic_control(
+                    panel, 'unit', 'time', 'y', 'treated',
+                    method='traditional', compute_se=True, seed=42
+                )
+                results.append(result)
+        
+        # All runs should produce identical results
+        for i, r in enumerate(results[1:], 1):
+            assert abs(results[0].att - r.att) < 1e-10, \
+                f"Run {i} ATT differs from run 0"
+            assert abs(results[0].standard_error - r.standard_error) < 1e-10, \
+                f"Run {i} SE differs from run 0"
+
+    def test_parallel_se_n_placebo_parameter(self, larger_sc_panel):
+        """
+        Verify n_placebo parameter correctly limits placebo iterations.
+        """
+        # Run with limited placebo count
+        result_limited = synthetic_control(
+            larger_sc_panel, 'unit', 'time', 'y', 'treated',
+            method='traditional', compute_se=True,
+            n_placebo=5, seed=42
+        )
+        
+        # Run with full placebo count
+        result_full = synthetic_control(
+            larger_sc_panel, 'unit', 'time', 'y', 'treated',
+            method='traditional', compute_se=True,
+            n_placebo=100, seed=42  # More than n_control
+        )
+        
+        # Limited run should use at most 5 placebos
+        assert result_limited.n_placebo_used is not None
+        assert result_limited.n_placebo_used <= 5, \
+            f"n_placebo_used should be <= 5, got {result_limited.n_placebo_used}"
+        
+        # Both should produce valid SE
+        assert result_limited.standard_error is not None
+        assert result_full.standard_error is not None
+        assert result_limited.standard_error >= 0.0
+        assert result_full.standard_error >= 0.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

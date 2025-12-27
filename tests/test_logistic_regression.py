@@ -24,7 +24,7 @@ class TestLogisticRegressionBasic:
         """Test basic logistic regression on simple data."""
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-            "y": [0, 0, 1, 0, 1, 1, 1, 1]
+            "y": [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0]
         })
         
         from causers import logistic_regression
@@ -61,7 +61,7 @@ class TestLogisticRegressionBasic:
         """Test logistic regression without intercept."""
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-            "y": [0, 0, 1, 0, 1, 1, 1, 1]
+            "y": [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0]
         })
         
         from causers import logistic_regression
@@ -76,7 +76,7 @@ class TestLogisticRegressionBasic:
         """Test __repr__ and __str__ methods of LogisticRegressionResult."""
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-            "y": [0, 0, 1, 0, 1, 1, 1, 1]
+            "y": [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0]
         })
         
         from causers import logistic_regression
@@ -100,7 +100,7 @@ class TestLogisticRegressionDiagnostics:
         """Test that log-likelihood is always negative."""
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-            "y": [0, 0, 1, 0, 1, 1, 1, 1]
+            "y": [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0]
         })
         
         from causers import logistic_regression
@@ -112,7 +112,7 @@ class TestLogisticRegressionDiagnostics:
         """Test that pseudo R² is between 0 and 1."""
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-            "y": [0, 0, 1, 0, 1, 1, 1, 1]
+            "y": [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0]
         })
         
         from causers import logistic_regression
@@ -124,7 +124,7 @@ class TestLogisticRegressionDiagnostics:
         """Test that converged and iterations fields are populated."""
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-            "y": [0, 0, 1, 0, 1, 1, 1, 1]
+            "y": [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0]
         })
         
         from causers import logistic_regression
@@ -138,7 +138,7 @@ class TestLogisticRegressionDiagnostics:
         """Test that all standard errors are positive."""
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-            "y": [0, 0, 1, 0, 1, 1, 1, 1]
+            "y": [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0]
         })
         
         from causers import logistic_regression
@@ -155,7 +155,7 @@ class TestLogisticRegressionClusteredSE:
         """Test analytical clustered standard errors."""
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0],
-            "y": [0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1],
+            "y": [0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
             "cluster": [1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6]
         })
         
@@ -179,7 +179,7 @@ class TestLogisticRegressionClusteredSE:
         """
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0],
-            "y": [0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1],
+            "y": [0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
             "cluster": [1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6]
         })
         
@@ -200,7 +200,7 @@ class TestLogisticRegressionClusteredSE:
         """Test that same seed produces same results."""
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0],
-            "y": [0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1],
+            "y": [0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
             "cluster": [1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6]
         })
         
@@ -389,7 +389,7 @@ class TestLogisticRegressionImmutability:
         """Test that input DataFrame is not mutated."""
         df = pl.DataFrame({
             "x": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-            "y": [0, 0, 1, 0, 1, 1, 1, 1]
+            "y": [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0]
         })
         
         df_original = df.clone()
@@ -593,3 +593,163 @@ class TestLogisticWebbBootstrap:
         )
         
         assert result.cluster_se_type == "bootstrap_rademacher"
+
+
+# =============================================================================
+# TASK-006: Parallel Score Bootstrap Tests (Phase 2)
+# =============================================================================
+
+
+class TestParallelScoreBootstrap:
+    """Tests for parallel score bootstrap implementation in logistic regression.
+    
+    These tests verify the Rayon-parallelized bootstrap loop produces:
+    1. Deterministic results with the same seed
+    2. Valid (finite, positive) standard errors
+    """
+    
+    @pytest.fixture
+    def parallel_bootstrap_data(self):
+        """Create test data for parallel bootstrap tests.
+        
+        Uses larger dataset with more clusters to exercise parallel execution.
+        """
+        np.random.seed(42)
+        n_clusters = 20
+        n_per_cluster = 30
+        n = n_clusters * n_per_cluster
+        
+        cluster_ids = []
+        x1 = []
+        x2 = []
+        y = []
+        
+        for g in range(n_clusters):
+            cluster_effect = np.random.randn() * 0.3
+            for _ in range(n_per_cluster):
+                cluster_ids.append(g)
+                x1i = np.random.randn()
+                x2i = np.random.randn() * 0.5
+                prob = 1 / (1 + np.exp(-(0.3 + 0.5 * x1i - 0.3 * x2i + cluster_effect)))
+                yi = float(np.random.rand() < prob)
+                x1.append(x1i)
+                x2.append(x2i)
+                y.append(yi)
+        
+        return pl.DataFrame({
+            "x1": x1,
+            "x2": x2,
+            "y": y,
+            "cluster_id": cluster_ids,
+        })
+    
+    def test_parallel_bootstrap_determinism_multiple_runs(self, parallel_bootstrap_data):
+        """Verify parallel bootstrap produces identical results across multiple runs.
+        
+        The iteration-indexed RNG seeding (seed.wrapping_add(iter_idx)) ensures
+        deterministic parallel execution regardless of thread scheduling.
+        """
+        from causers import logistic_regression
+        
+        # Run the same bootstrap 3 times with same seed
+        results = []
+        for _ in range(3):
+            result = logistic_regression(
+                parallel_bootstrap_data, ["x1", "x2"], "y",
+                cluster="cluster_id",
+                bootstrap=True,
+                bootstrap_iterations=500,
+                seed=54321
+            )
+            results.append(result)
+        
+        # All runs should produce identical SEs
+        for i in range(1, len(results)):
+            np.testing.assert_array_equal(
+                results[0].standard_errors,
+                results[i].standard_errors,
+                err_msg=f"Run 0 and run {i} produced different SEs"
+            )
+            assert results[0].intercept_se == results[i].intercept_se, \
+                f"Run 0 and run {i} produced different intercept SEs"
+    
+    def test_parallel_bootstrap_valid_se_values(self, parallel_bootstrap_data):
+        """Verify parallel bootstrap produces finite, positive standard errors."""
+        from causers import logistic_regression
+        
+        result = logistic_regression(
+            parallel_bootstrap_data, ["x1", "x2"], "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_iterations=1000,
+            seed=12345
+        )
+        
+        # All SEs should be finite and positive
+        assert all(np.isfinite(se) for se in result.standard_errors), \
+            "Bootstrap produced non-finite standard errors"
+        assert all(se > 0 for se in result.standard_errors), \
+            "Bootstrap produced non-positive standard errors"
+        assert np.isfinite(result.intercept_se), \
+            "Bootstrap produced non-finite intercept SE"
+        assert result.intercept_se > 0, \
+            "Bootstrap produced non-positive intercept SE"
+        
+        # Verify bootstrap_iterations_used is correct
+        assert result.bootstrap_iterations_used == 1000
+    
+    def test_parallel_bootstrap_different_seeds_different_results(self, parallel_bootstrap_data):
+        """Verify different seeds produce different bootstrap results."""
+        from causers import logistic_regression
+        
+        result1 = logistic_regression(
+            parallel_bootstrap_data, ["x1", "x2"], "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_iterations=500,
+            seed=11111
+        )
+        
+        result2 = logistic_regression(
+            parallel_bootstrap_data, ["x1", "x2"], "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_iterations=500,
+            seed=22222
+        )
+        
+        # Results should differ (at least one SE should be different)
+        ses_differ = any(
+            se1 != se2
+            for se1, se2 in zip(result1.standard_errors, result2.standard_errors)
+        )
+        assert ses_differ, "Different seeds produced identical SEs (very unlikely)"
+    
+    def test_parallel_bootstrap_reasonable_se_magnitude(self, parallel_bootstrap_data):
+        """Verify bootstrap SEs are reasonable compared to analytical SEs."""
+        from causers import logistic_regression
+        
+        # Get analytical clustered SE
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result_analytical = logistic_regression(
+                parallel_bootstrap_data, ["x1", "x2"], "y",
+                cluster="cluster_id",
+                bootstrap=False
+            )
+        
+        # Get bootstrap SE
+        result_bootstrap = logistic_regression(
+            parallel_bootstrap_data, ["x1", "x2"], "y",
+            cluster="cluster_id",
+            bootstrap=True,
+            bootstrap_iterations=1000,
+            seed=42
+        )
+        
+        # Bootstrap SEs should be in same order of magnitude as analytical
+        # (within factor of 5, very loose to avoid flaky tests)
+        for se_b, se_a in zip(result_bootstrap.standard_errors, result_analytical.standard_errors):
+            ratio = se_b / se_a if se_a > 0 else float('inf')
+            assert 0.2 < ratio < 5.0, \
+                f"Bootstrap SE {se_b} differs too much from analytical SE {se_a} (ratio: {ratio})"

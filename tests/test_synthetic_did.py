@@ -601,13 +601,27 @@ class TestErrorHandling:
         with pytest.raises(ValueError, match="balanced"):
             synthetic_did(df, 'unit', 'time', 'y', 'treated')
 
-    def test_bootstrap_iterations_less_than_one(self, basic_panel):
-        """Verify error when bootstrap_iterations < 1."""
-        with pytest.raises(ValueError, match="at least 1"):
+    def test_bootstrap_iterations_negative(self, basic_panel):
+        """Verify error when bootstrap_iterations < 0."""
+        with pytest.raises(ValueError, match="at least 0"):
             synthetic_did(
                 basic_panel, 'unit', 'time', 'y', 'treated',
-                bootstrap_iterations=0
+                bootstrap_iterations=-1
             )
+
+    def test_bootstrap_iterations_zero_allowed(self, basic_panel):
+        """Verify bootstrap_iterations=0 is allowed for ATT-only mode."""
+        # Should not raise - 0 means ATT-only, no SE computation
+        result = synthetic_did(
+            basic_panel, 'unit', 'time', 'y', 'treated',
+            bootstrap_iterations=0
+        )
+        # ATT should be computed
+        assert result.att == result.att  # Not NaN
+        # SE should be 0 (no bootstrap)
+        assert result.standard_error == 0.0
+        # bootstrap_iterations_used should be 0
+        assert result.bootstrap_iterations_used == 0
 
     def test_float_unit_column(self, basic_panel):
         """Verify error when unit_col is float type."""

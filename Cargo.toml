@@ -1,6 +1,6 @@
 [package]
 name = "causers"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 authors = ["James Nordlund"]
 license = "MIT"
@@ -17,14 +17,20 @@ default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.21", features = ["abi3-py38"] }
-polars = { version = "0.44", default-features = false }
-numpy = "0.21"
-ndarray = "0.16"
+pyo3 = { version = "0.26", features = ["abi3-py38"] }
+numpy = "0.26"
+# pyo3-polars for native Arrow-based DataFrame extraction
+pyo3-polars = "0.25"
+# polars with categorical support for cluster column handling
+polars = { version = "0.52", default-features = false, features = ["dtype-categorical"] }
+# faer for optimized linear algebra (pure Rust, no external BLAS dependency)
+faer = "0.20"
+# rayon for parallel placebo bootstrap iterations
+rayon = "1.10"
 
 [dev-dependencies]
 approx = "0.5"
-pyo3 = { version = "0.21", features = ["auto-initialize"] }
+pyo3 = { version = "0.26", features = ["auto-initialize"] }
 
 [profile.release]
 lto = true

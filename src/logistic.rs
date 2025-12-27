@@ -9,12 +9,28 @@
 //! - Perfect separation detection
 //! - McFadden's pseudo R² and log-likelihood computation
 //!
+//! # Performance Optimizations
+//! - Uses faer for efficient X'WX and X'r computation (BLAS-like performance)
+//! - Uses Cholesky solve instead of explicit matrix inversion (O(p²) vs O(p³))
+//! - Caches likelihood before step halving to avoid redundant computation
+//! - Batch leverage computation using faer matrix operations
+//!
 //! # References
 //! - Kline, P., & Santos, A. (2012). "A Score Based Approach to Wild Bootstrap Inference."
 //! - MacKinnon, J. G., & White, H. (1985). "Some heteroskedasticity-consistent
 //!   covariance matrix estimators with improved finite sample properties."
 
+use crate::linalg::{
+    cholesky_solve, compute_hc3_logistic_vcov, compute_residuals_inplace,
+    compute_weighted_leverages_batch, compute_weights_inplace, compute_xtr_inplace,
+    compute_xtwx_inplace, invert_xtx, mat_to_vec, mat_vec_mul, mat_vec_mul_inplace, vec_to_mat,
+    LinalgError,
+};
+use faer::{Col, Mat};
 use pyo3::prelude::*;
+
+// Re-export vec_to_mat for external use (tests, lib.rs)
+pub use crate::linalg::vec_to_mat as linalg_vec_to_mat;
 
 /// Result of a logistic regression computation.
 ///
@@ -420,6 +436,30 @@ pub fn compute_log_likelihood(x: &[Vec<f64>], y: &[f64], beta: &[f64]) -> f64 {
     ll
 }
 
+/// Compute log-likelihood using faer matrix for batch linear predictions.
+///
+/// This is an optimized version that uses faer's mat_vec_mul for computing
+/// all linear predictions X×β at once, avoiding O(n) individual dot products.
+///
+/// L(β) = Σᵢ [yᵢ log(πᵢ) + (1-yᵢ) log(1-πᵢ)]
+#[inline]
+pub fn compute_log_likelihood_faer(x_mat: &Mat<f64>, y: &[f64], beta: &[f64]) -> f64 {
+    let epsilon = 1e-15;
+    
+    // Compute all linear predictions at once: Xβ
+    let linear_preds = mat_vec_mul(x_mat, beta);
+    
+    // Compute log-likelihood
+    let mut ll = 0.0;
+    for (&lp, &yi) in linear_preds.iter().zip(y.iter()) {
+        let pi = sigmoid(lp);
+        let pi_clipped = pi.max(epsilon).min(1.0 - epsilon);
+        ll += yi * pi_clipped.ln() + (1.0 - yi) * (1.0 - pi_clipped).ln();
+    }
+    
+    ll
+}
+
 /// Compute null model log-likelihood (intercept-only model).
 ///
 /// For the null model, π = mean(y) for all observations.
@@ -527,54 +567,84 @@ fn newton_step_with_halving(beta: &mut [f64], delta: &[f64], x: &[Vec<f64>], y: 
 
 /// Compute logistic regression MLE using Newton-Raphson algorithm.
 ///
+/// # Performance Optimizations
+/// - Uses faer for X'WX computation (BLAS-like performance)
+/// - Uses Cholesky solve instead of explicit matrix inversion
+/// - Caches likelihood before step halving
+/// - Accepts faer::Mat directly to avoid Vec<Vec<f64>> conversion overhead
+///
 /// # Arguments
-/// * `x` - Design matrix (n × p), including intercept column if applicable
+/// * `x_mat` - Design matrix as faer::Mat (n × p), including intercept column if applicable
 /// * `y` - Binary outcome vector (n,), values must be 0 or 1
 ///
 /// # Returns
 /// * `Result<MleResult, LogisticError>` - MLE result or error
-pub fn compute_logistic_mle(x: &[Vec<f64>], y: &[f64]) -> Result<MleResult, LogisticError> {
-    let n = x.len();
+pub fn compute_logistic_mle(x_mat: &Mat<f64>, y: &[f64]) -> Result<MleResult, LogisticError> {
+    let n = x_mat.nrows();
     if n == 0 {
         return Err(LogisticError::NumericalInstability {
             message: "Cannot perform regression on empty data".to_string(),
         });
     }
 
-    let p = x[0].len();
+    let p = x_mat.ncols();
     if p == 0 {
         return Err(LogisticError::NumericalInstability {
             message: "Design matrix must have at least one column".to_string(),
         });
     }
 
+    // x_mat is already a faer matrix - no conversion needed
+
     // Initialize β = 0
     let mut beta = vec![0.0; p];
     let mut converged = false;
     let mut iterations = 0;
-    let mut info_inv = vec![vec![0.0; p]; p];
+    let mut info_inv_mat: Mat<f64> = Mat::zeros(p, p);
+    
+    // Pre-allocate all buffers ONCE (reuse across iterations)
+    // This eliminates ~n×6 allocations per iteration
+    let mut linear_pred = vec![0.0; n];
     let mut pi = vec![0.0; n];
+    let mut weights = vec![0.0; n];
+    let mut residuals = vec![0.0; n];
+    let mut gradient = vec![0.0; p];
+    let mut x_weighted = Mat::<f64>::zeros(n, p);
+    let mut hessian_mat = Mat::<f64>::zeros(p, p);
+    
+    // Pre-allocate faer::Col buffers for SIMD matmul operations
+    let mut linear_pred_col = Col::<f64>::zeros(n);
+    let mut gradient_col = Col::<f64>::zeros(p);
+    
+    // Cache log-likelihood for step halving optimization
+    // Use faer for initial LL computation
+    let mut current_ll = compute_log_likelihood_faer(x_mat, y, &beta);
 
     for iter in 0..MAX_ITERATIONS {
         iterations = iter + 1;
 
-        // Compute π = sigmoid(Xβ)
-        pi = x.iter().map(|xi| sigmoid(dot(xi, &beta))).collect();
+        // Compute π = sigmoid(Xβ) using pre-allocated buffers and faer SIMD
+        // Step 1: Compute linear predictions Xβ in-place with reusable Col buffer
+        mat_vec_mul_inplace(x_mat, &beta, &mut linear_pred, &mut linear_pred_col);
+        
+        // Step 2: Apply sigmoid in-place, storing results in pi
+        for (p_i, &lp) in pi.iter_mut().zip(linear_pred.iter()) {
+            *p_i = sigmoid(lp);
+        }
 
         // Check for perfect separation
         if detect_separation(&beta, &pi) {
             return Err(LogisticError::PerfectSeparation);
         }
 
-        // Compute weights W = diag(π(1-π)) with floor for stability
-        let weights: Vec<f64> = pi
-            .iter()
-            .map(|&p| (p * (1.0 - p)).max(WEIGHT_FLOOR))
-            .collect();
+        // Compute weights W = diag(π(1-π)) with floor for stability (in-place)
+        compute_weights_inplace(&pi, &mut weights, WEIGHT_FLOOR);
 
-        // Compute gradient: X'(y - π)
-        let residuals: Vec<f64> = y.iter().zip(&pi).map(|(&yi, &pi)| yi - pi).collect();
-        let gradient = xt_vector_multiply(x, &residuals);
+        // Compute residuals (y - π) in-place
+        compute_residuals_inplace(y, &pi, &mut residuals);
+
+        // Compute gradient: X'(y - π) in-place with reusable Col buffer
+        compute_xtr_inplace(x_mat, &residuals, &mut gradient, &mut gradient_col);
 
         // Check for NaN in gradient
         if has_invalid_values(&gradient) {
@@ -583,21 +653,30 @@ pub fn compute_logistic_mle(x: &[Vec<f64>], y: &[f64]) -> Result<MleResult, Logi
             });
         }
 
+        // Compute Hessian X'WX in-place (reuses x_weighted and hessian_mat buffers)
+        compute_xtwx_inplace(x_mat, &weights, &mut x_weighted, &mut hessian_mat);
+
         // Check convergence: ||∇L|| < tol
         let grad_norm = gradient.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
         if grad_norm < CONVERGENCE_TOL {
             converged = true;
-            // Compute final info_inv before breaking
-            let hessian = xt_w_x(x, &weights);
-            info_inv = invert_matrix(&hessian)?;
+            // Compute final info_inv using faer Cholesky (reuse hessian_mat computed above)
+            info_inv_mat = invert_xtx(&hessian_mat).map_err(|e| match e {
+                LinalgError::SingularMatrix => LogisticError::SingularHessian,
+                LinalgError::NumericalInstability => LogisticError::NumericalInstability {
+                    message: "Numerical instability in final Hessian inversion".to_string(),
+                },
+                LinalgError::DimensionMismatch { expected, got } => {
+                    LogisticError::NumericalInstability {
+                        message: format!("Dimension mismatch: expected {}, got {}", expected, got),
+                    }
+                }
+            })?;
             break;
         }
 
-        // Compute Hessian: X'WX
-        let hessian = xt_w_x(x, &weights);
-
         // Check condition number (simple estimate using diagonal ratio)
-        let diag: Vec<f64> = (0..p).map(|i| hessian[i][i]).collect();
+        let diag: Vec<f64> = (0..p).map(|i| hessian_mat.read(i, i)).collect();
         let max_diag = diag.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let min_diag = diag.iter().cloned().fold(f64::INFINITY, f64::min);
         if min_diag <= 0.0 || max_diag / min_diag > 1e10 {
@@ -607,20 +686,49 @@ pub fn compute_logistic_mle(x: &[Vec<f64>], y: &[f64]) -> Result<MleResult, Logi
             });
         }
 
-        // Invert Hessian
-        info_inv = invert_matrix(&hessian)?;
+        // Compute Newton direction: δ = H⁻¹ × g using Cholesky solve
+        // This avoids explicit O(p³) matrix inversion
+        let delta = cholesky_solve(&hessian_mat, &gradient).map_err(|e| match e {
+            LinalgError::SingularMatrix => LogisticError::SingularHessian,
+            LinalgError::NumericalInstability => LogisticError::NumericalInstability {
+                message: "Numerical instability in Cholesky solve".to_string(),
+            },
+            LinalgError::DimensionMismatch { expected, got } => {
+                LogisticError::NumericalInstability {
+                    message: format!("Dimension mismatch: expected {}, got {}", expected, got),
+                }
+            }
+        })?;
 
-        // Compute Newton direction: δ = H⁻¹ × g
-        let delta = matrix_vector_multiply(&info_inv, &gradient);
+        // Apply Newton step with step halving using faer SIMD
+        // Returns (success, new_ll) to avoid redundant LL recomputation
+        let (step_success, new_ll) = newton_step_with_halving_faer(&mut beta, &delta, x_mat, y, current_ll);
 
-        // Apply Newton step with step halving
-        if !newton_step_with_halving(&mut beta, &delta, x, y) {
+        if !step_success {
             // Could not improve - check if we're close to optimum
             if grad_norm < CONVERGENCE_TOL * 100.0 {
                 converged = true;
+                // Need to compute info_inv for final result
+                info_inv_mat = invert_xtx(&hessian_mat).map_err(|e| match e {
+                    LinalgError::SingularMatrix => LogisticError::SingularHessian,
+                    LinalgError::NumericalInstability => LogisticError::NumericalInstability {
+                        message: "Numerical instability in Hessian inversion".to_string(),
+                    },
+                    LinalgError::DimensionMismatch { expected, got } => {
+                        LogisticError::NumericalInstability {
+                            message: format!(
+                                "Dimension mismatch: expected {}, got {}",
+                                expected, got
+                            ),
+                        }
+                    }
+                })?;
             }
             break;
         }
+
+        // Use LL from step halving (no redundant recomputation)
+        current_ll = new_ll;
 
         // Check for NaN/Inf in beta
         if has_invalid_values(&beta) {
@@ -634,8 +742,8 @@ pub fn compute_logistic_mle(x: &[Vec<f64>], y: &[f64]) -> Result<MleResult, Logi
         return Err(LogisticError::ConvergenceFailure { iterations });
     }
 
-    // Compute final log-likelihood
-    let log_likelihood = compute_log_likelihood(x, y, &beta);
+    // Compute final log-likelihood using faer SIMD
+    let log_likelihood = compute_log_likelihood_faer(x_mat, y, &beta);
 
     // Verify no NaN/Inf in final values
     if log_likelihood.is_nan() || log_likelihood.is_infinite() {
@@ -643,6 +751,9 @@ pub fn compute_logistic_mle(x: &[Vec<f64>], y: &[f64]) -> Result<MleResult, Logi
             message: "Invalid log-likelihood at convergence".to_string(),
         });
     }
+
+    // Convert faer matrix back to Vec<Vec<f64>> for API compatibility
+    let info_inv = mat_to_vec(&info_inv_mat);
 
     Ok(MleResult {
         beta,
@@ -654,13 +765,159 @@ pub fn compute_logistic_mle(x: &[Vec<f64>], y: &[f64]) -> Result<MleResult, Logi
     })
 }
 
+/// Compute Newton step with step halving, using cached likelihood.
+///
+/// This is an optimized version that avoids recomputing the old likelihood.
+///
+/// Returns true if a valid step was found, false otherwise.
+#[allow(dead_code)]
+fn newton_step_with_halving_cached(
+    beta: &mut [f64],
+    delta: &[f64],
+    x: &[Vec<f64>],
+    y: &[f64],
+    old_ll: f64,
+) -> bool {
+    let p = beta.len();
+
+    for halving in 0..MAX_STEP_HALVINGS {
+        let step_size = 0.5_f64.powi(halving);
+
+        // Compute new beta
+        let beta_new: Vec<f64> = beta
+            .iter()
+            .zip(delta.iter())
+            .map(|(&b, &d)| b + step_size * d)
+            .collect();
+
+        // Check for invalid values
+        if has_invalid_values(&beta_new) {
+            continue;
+        }
+
+        let new_ll = compute_log_likelihood(x, y, &beta_new);
+
+        // Accept step if log-likelihood improves (or is close enough)
+        if new_ll >= old_ll - 1e-8 || (halving == MAX_STEP_HALVINGS - 1 && !new_ll.is_nan()) {
+            beta[..p].copy_from_slice(&beta_new[..p]);
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Compute Newton step with step halving using faer matrix for batch predictions.
+///
+/// This is the optimized version that uses faer's mat_vec_mul for computing
+/// likelihood during step halving, avoiding conversion overhead.
+///
+/// Returns (success, new_ll) - the new log-likelihood is returned to avoid recomputation.
+fn newton_step_with_halving_faer(
+    beta: &mut [f64],
+    delta: &[f64],
+    x_mat: &Mat<f64>,
+    y: &[f64],
+    old_ll: f64,
+) -> (bool, f64) {
+    let p = beta.len();
+
+    for halving in 0..MAX_STEP_HALVINGS {
+        let step_size = 0.5_f64.powi(halving);
+
+        // Compute new beta
+        let beta_new: Vec<f64> = beta
+            .iter()
+            .zip(delta.iter())
+            .map(|(&b, &d)| b + step_size * d)
+            .collect();
+
+        // Check for invalid values
+        if has_invalid_values(&beta_new) {
+            continue;
+        }
+
+        // Use faer-based likelihood for batch linear predictions
+        let new_ll = compute_log_likelihood_faer(x_mat, y, &beta_new);
+
+        // Accept step if log-likelihood improves (or is close enough)
+        if new_ll >= old_ll - 1e-8 || (halving == MAX_STEP_HALVINGS - 1 && !new_ll.is_nan()) {
+            beta[..p].copy_from_slice(&beta_new[..p]);
+            return (true, new_ll);
+        }
+    }
+
+    (false, old_ll)
+}
+
+/// Compute Newton step with step halving using pre-allocated buffers.
+///
+/// This version eliminates allocations during step halving by reusing
+/// pre-allocated beta_new and linear_pred buffers.
+///
+/// Returns true if a valid step was found, false otherwise.
+fn newton_step_with_halving_inplace(
+    beta: &mut [f64],
+    delta: &[f64],
+    x_mat: &Mat<f64>,
+    y: &[f64],
+    old_ll: f64,
+    beta_new: &mut [f64],
+    linear_pred: &mut [f64],
+) -> bool {
+    let n = x_mat.nrows();
+    let p = beta.len();
+    let epsilon = 1e-15;
+
+    for halving in 0..MAX_STEP_HALVINGS {
+        let step_size = 0.5_f64.powi(halving);
+
+        // Compute new beta in-place
+        for j in 0..p {
+            beta_new[j] = beta[j] + step_size * delta[j];
+        }
+
+        // Check for invalid values
+        if has_invalid_values(beta_new) {
+            continue;
+        }
+
+        // Compute log-likelihood without allocation
+        // Step 1: Compute linear predictions Xβ directly into linear_pred
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..p {
+                sum += x_mat.read(i, j) * beta_new[j];
+            }
+            linear_pred[i] = sum;
+        }
+
+        // Step 2: Compute log-likelihood from linear predictions
+        let mut new_ll = 0.0;
+        for i in 0..n {
+            let pi = sigmoid(linear_pred[i]);
+            let pi_clipped = pi.max(epsilon).min(1.0 - epsilon);
+            new_ll += y[i] * pi_clipped.ln() + (1.0 - y[i]) * (1.0 - pi_clipped).ln();
+        }
+
+        // Accept step if log-likelihood improves (or is close enough)
+        if new_ll >= old_ll - 1e-8 || (halving == MAX_STEP_HALVINGS - 1 && !new_ll.is_nan()) {
+            beta[..p].copy_from_slice(&beta_new[..p]);
+            return true;
+        }
+    }
+
+    false
+}
+
 // ============================================================================
 // HC3 Standard Errors for Logistic Regression
 // ============================================================================
 
-/// Compute weighted leverages for logistic regression.
+/// Compute weighted leverages for logistic regression (legacy, kept for compatibility).
 ///
 /// h_ii = w_i × x_i' (X'WX)⁻¹ x_i
+#[allow(dead_code)]
 fn compute_weighted_leverages(
     x: &[Vec<f64>],
     weights: &[f64],
@@ -693,6 +950,10 @@ fn compute_weighted_leverages(
 
 /// Compute HC3 standard errors for logistic regression.
 ///
+/// # Performance Optimizations
+/// - Uses faer for batch weighted leverage computation
+/// - Uses faer for meat matrix and sandwich formula computation
+///
 /// Uses the sandwich formula with weighted leverages:
 /// V = I⁻¹ M I⁻¹ where M = Σᵢ xᵢ xᵢ' × (yᵢ - πᵢ)² / (1 - hᵢᵢ)²
 ///
@@ -710,35 +971,94 @@ pub fn compute_hc3_logistic(
     pi: &[f64],
     info_inv: &[Vec<f64>],
 ) -> Result<Vec<f64>, LogisticError> {
-    let _n = x.len();
     let p = info_inv.len();
+
+    // Convert to faer matrices for efficient operations
+    let x_mat = vec_to_mat(x);
+    let info_inv_mat = vec_to_mat(info_inv);
 
     // Compute weights: W = diag(π(1-π))
     let weights: Vec<f64> = pi.iter().map(|&p| p * (1.0 - p)).collect();
 
-    // Compute weighted leverages
-    let leverages = compute_weighted_leverages(x, &weights, info_inv)?;
+    // Compute residuals (y - π)
+    let residuals: Vec<f64> = y.iter().zip(pi).map(|(&yi, &pi)| yi - pi).collect();
 
-    // Compute HC3 meat matrix
-    let mut meat = vec![vec![0.0; p]; p];
-    for (i, x_row) in x.iter().enumerate() {
-        let resid = y[i] - pi[i];
-        let one_minus_h = 1.0 - leverages[i];
-        let omega = resid.powi(2) / one_minus_h.powi(2);
+    // Compute weighted leverages using faer batch operation
+    let leverages = compute_weighted_leverages_batch(&x_mat, &weights, &info_inv_mat).map_err(
+        |e| match e {
+            LinalgError::NumericalInstability => LogisticError::NumericalInstability {
+                message:
+                    "Extreme leverage detected; HC3 standard errors may be unreliable".to_string(),
+            },
+            _ => LogisticError::NumericalInstability {
+                message: "Error in leverage computation".to_string(),
+            },
+        },
+    )?;
 
-        for (j, meat_row) in meat.iter_mut().enumerate() {
-            for k in 0..p {
-                meat_row[k] += x_row[j] * omega * x_row[k];
-            }
-        }
-    }
-
-    // Sandwich: V = I⁻¹ M I⁻¹
-    let temp = matrix_multiply(info_inv, &meat);
-    let vcov = matrix_multiply(&temp, info_inv);
+    // Compute HC3 variance-covariance using faer
+    let vcov_mat = compute_hc3_logistic_vcov(&x_mat, &residuals, &leverages, &info_inv_mat);
 
     // Extract diagonal and compute SE
-    let se: Vec<f64> = (0..p).map(|i| vcov[i][i].sqrt()).collect();
+    let se: Vec<f64> = (0..p).map(|i| vcov_mat.read(i, i).sqrt()).collect();
+
+    // Check for invalid values
+    if se.iter().any(|&s| s.is_nan() || s.is_infinite() || s < 0.0) {
+        return Err(LogisticError::NumericalInstability {
+            message: "HC3 standard error computation produced invalid values".to_string(),
+        });
+    }
+
+    Ok(se)
+}
+
+/// Compute HC3 standard errors for logistic regression using faer matrices directly.
+///
+/// This is the optimized version that avoids Vec<Vec<f64>> conversions.
+///
+/// Uses the sandwich formula with weighted leverages:
+/// V = I⁻¹ M I⁻¹ where M = Σᵢ xᵢ xᵢ' × (yᵢ - πᵢ)² / (1 - hᵢᵢ)²
+///
+/// # Arguments
+/// * `x_mat` - Design matrix as faer::Mat (n × p)
+/// * `y` - Binary outcome (n,)
+/// * `pi` - Predicted probabilities (n,)
+/// * `info_inv_mat` - Inverse information matrix (X'WX)⁻¹ as faer::Mat (p × p)
+///
+/// # Returns
+/// * `Result<Vec<f64>, LogisticError>` - Standard errors (p,)
+pub fn compute_hc3_logistic_faer(
+    x_mat: &Mat<f64>,
+    y: &[f64],
+    pi: &[f64],
+    info_inv_mat: &Mat<f64>,
+) -> Result<Vec<f64>, LogisticError> {
+    let p = info_inv_mat.ncols();
+
+    // Compute weights: W = diag(π(1-π))
+    let weights: Vec<f64> = pi.iter().map(|&p| p * (1.0 - p)).collect();
+
+    // Compute residuals (y - π)
+    let residuals: Vec<f64> = y.iter().zip(pi).map(|(&yi, &pi)| yi - pi).collect();
+
+    // Compute weighted leverages using faer batch operation
+    let leverages = compute_weighted_leverages_batch(x_mat, &weights, info_inv_mat).map_err(
+        |e| match e {
+            LinalgError::NumericalInstability => LogisticError::NumericalInstability {
+                message:
+                    "Extreme leverage detected; HC3 standard errors may be unreliable".to_string(),
+            },
+            _ => LogisticError::NumericalInstability {
+                message: "Error in leverage computation".to_string(),
+            },
+        },
+    )?;
+
+    // Compute HC3 variance-covariance using faer
+    let vcov_mat = compute_hc3_logistic_vcov(x_mat, &residuals, &leverages, info_inv_mat);
+
+    // Extract diagonal and compute SE
+    let se: Vec<f64> = (0..p).map(|i| vcov_mat.read(i, i).sqrt()).collect();
 
     // Check for invalid values
     if se.iter().any(|&s| s.is_nan() || s.is_infinite() || s < 0.0) {
@@ -817,7 +1137,9 @@ mod tests {
         ];
         let y = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 
-        let result = compute_logistic_mle(&x, &y);
+        // Convert to faer::Mat
+        let x_mat = vec_to_mat(&x);
+        let result = compute_logistic_mle(&x_mat, &y);
         assert!(result.is_ok());
         let mle = result.unwrap();
         assert!(mle.converged);
@@ -836,7 +1158,9 @@ mod tests {
         ];
         let y = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 
-        let mle = compute_logistic_mle(&x, &y).unwrap();
+        // Convert to faer::Mat
+        let x_mat = vec_to_mat(&x);
+        let mle = compute_logistic_mle(&x_mat, &y).unwrap();
         let se = compute_hc3_logistic(&x, &y, &mle.pi, &mle.info_inv).unwrap();
 
         assert_eq!(se.len(), 2);

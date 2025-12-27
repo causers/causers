@@ -10,6 +10,9 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use faer::linalg::matmul::matmul;
+use faer::{Col, Mat, Parallelism};
+
 /// Error type for cluster operations
 #[derive(Debug, Clone)]
 pub enum ClusterError {
@@ -335,6 +338,11 @@ fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
 ///
 /// # Returns
 /// * `Result<(Vec<f64>, Option<f64>), ClusterError>` - (coefficient_se, intercept_se)
+///
+/// # Note
+/// This is the legacy Vec<Vec<f64>> implementation kept for rollback capability.
+/// See `compute_cluster_se_analytical_faer` for the optimized version.
+#[allow(dead_code)]
 pub fn compute_cluster_se_analytical(
     design_matrix: &[Vec<f64>],
     residuals: &[f64],
@@ -415,6 +423,152 @@ pub fn compute_cluster_se_analytical(
     }
 }
 
+/// Compute analytical clustered SE using faer matrices for O(p²) speedup.
+///
+/// Formula: SE = sqrt(diag((X'X)^-1 × meat × (X'X)^-1))
+/// where meat = Σ_g (X_g'û_g)(X_g'û_g)' with small-sample adjustment
+///
+/// Uses batched score matrix computation followed by faer matmul for the
+/// meat matrix: meat = S' × S where S is the (G × p) cluster score matrix.
+///
+/// # Arguments
+/// * `design_matrix` - Design matrix X (n × p) as faer::Mat
+/// * `residuals` - OLS residuals (n,)
+/// * `xtx_inv` - (X'X)^-1 (p × p) as faer::Mat
+/// * `cluster_info` - Cluster membership information
+/// * `include_intercept` - Whether intercept is included
+///
+/// # Returns
+/// * `Result<(Vec<f64>, Option<f64>), ClusterError>` - (coefficient_se, intercept_se)
+pub fn compute_cluster_se_analytical_faer(
+    design_matrix: &Mat<f64>,
+    residuals: &[f64],
+    xtx_inv: &Mat<f64>,
+    cluster_info: &ClusterInfo,
+    include_intercept: bool,
+) -> Result<(Vec<f64>, Option<f64>), ClusterError> {
+    let n = residuals.len();
+    let p = xtx_inv.nrows();
+    let g = cluster_info.n_clusters;
+
+    // Check for single-observation clusters in analytical mode
+    for (cluster_idx, size) in cluster_info.sizes.iter().enumerate() {
+        if *size == 1 {
+            return Err(ClusterError::SingleObservationCluster { cluster_idx });
+        }
+    }
+
+    // Build observation → cluster mapping for cache-friendly sequential access.
+    // This enables single-pass iteration through observations in order 0, 1, 2, ..., n-1
+    // which provides optimal cache locality for residuals[] access.
+    let mut obs_to_cluster: Vec<usize> = vec![0; n];
+    for (cluster_idx, cluster_indices) in cluster_info.indices.iter().enumerate() {
+        for &i in cluster_indices {
+            obs_to_cluster[i] = cluster_idx;
+        }
+    }
+
+    // Pre-allocate score vectors for all clusters
+    let mut cluster_scores: Vec<Vec<f64>> = vec![vec![0.0; p]; g];
+
+    // Column-major iteration using faer's .col() method for optimal cache access.
+    // Each col() returns a view with efficient sequential access, eliminating
+    // the overhead of .read(i, j) method calls (which was the bottleneck).
+    for j in 0..p {
+        let col = design_matrix.col(j);
+        for i in 0..n {
+            let cluster_idx = obs_to_cluster[i];
+            cluster_scores[cluster_idx][j] += col.read(i) * residuals[i];
+        }
+    }
+
+    // Write to faer Mat only once per element (G×p writes instead of n×p)
+    let mut scores: Mat<f64> = Mat::zeros(g, p);
+    for cluster_idx in 0..g {
+        for j in 0..p {
+            scores.write(cluster_idx, j, cluster_scores[cluster_idx][j]);
+        }
+    }
+
+    // Use Rayon only for large matrices; sequential for small problems
+    let parallelism = if p < 50 && g < 200 {
+        Parallelism::None // Sequential for small problems
+    } else {
+        Parallelism::Rayon(0) // Parallel for large problems
+    };
+
+    // Compute meat = S' × S using faer matmul (O(p²G) with BLAS)
+    let mut meat: Mat<f64> = Mat::zeros(p, p);
+    matmul(
+        meat.as_mut(),
+        scores.transpose(),
+        scores.as_ref(),
+        None,
+        1.0,
+        parallelism,
+    );
+
+    // Small-sample adjustment: G/(G-1) × (n-1)/(n-k)
+    let adjustment = (g as f64 / (g - 1) as f64) * ((n - 1) as f64 / (n - p) as f64);
+    for i in 0..p {
+        for j in 0..p {
+            let val = meat.read(i, j) * adjustment;
+            meat.write(i, j, val);
+        }
+    }
+
+    // Sandwich: V = (X'X)^-1 × meat × (X'X)^-1 using faer matmul
+    // temp = (X'X)^-1 × meat
+    let mut temp: Mat<f64> = Mat::zeros(p, p);
+    matmul(
+        temp.as_mut(),
+        xtx_inv.as_ref(),
+        meat.as_ref(),
+        None,
+        1.0,
+        parallelism,
+    );
+
+    // v = temp × (X'X)^-1
+    let mut v: Mat<f64> = Mat::zeros(p, p);
+    matmul(
+        v.as_mut(),
+        temp.as_ref(),
+        xtx_inv.as_ref(),
+        None,
+        1.0,
+        parallelism,
+    );
+
+    // Check condition number for numerical stability
+    let diag: Vec<f64> = (0..p).map(|i| v.read(i, i)).collect();
+    let max_diag = diag.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let min_diag = diag.iter().cloned().fold(f64::INFINITY, f64::min);
+
+    if min_diag <= 0.0 || max_diag / min_diag > 1e10 {
+        return Err(ClusterError::NumericalInstability {
+            message: "Cluster covariance matrix is nearly singular (condition number > 1e10); standard errors may be unreliable".to_string()
+        });
+    }
+
+    // Extract standard errors from diagonal
+    let se: Vec<f64> = diag.iter().map(|&d| d.sqrt()).collect();
+
+    // Check for NaN/Inf values
+    if se.iter().any(|&s| s.is_nan() || s.is_infinite()) {
+        return Err(ClusterError::InvalidStandardErrors);
+    }
+
+    // Split into intercept_se and coefficient_se
+    if include_intercept {
+        let intercept_se = Some(se[0]);
+        let coefficient_se = se[1..].to_vec();
+        Ok((coefficient_se, intercept_se))
+    } else {
+        Ok((se, None))
+    }
+}
+
 /// Compute wild cluster bootstrap standard errors.
 ///
 /// Uses the "type 11" bootstrap: y* = ŷ + w_g × e where w_g is drawn from
@@ -433,8 +587,13 @@ pub fn compute_cluster_se_analytical(
 ///
 /// # Returns
 /// * `Result<(Vec<f64>, Option<f64>), ClusterError>` - (coefficient_se, intercept_se)
+///
+/// # Note
+/// This is the legacy Vec<Vec<f64>> implementation kept for rollback capability.
+/// See `compute_cluster_se_bootstrap_faer` for the optimized version.
 // Wild cluster bootstrap requires all statistical context parameters. Struct would reduce clarity.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn compute_cluster_se_bootstrap(
     design_matrix: &[Vec<f64>],
     fitted_values: &[f64],
@@ -493,6 +652,141 @@ pub fn compute_cluster_se_bootstrap(
 
         // Compute bootstrap coefficients β* = (X'X)^-1 X'y*
         let beta_star = matrix_vector_multiply(xtx_inv, &xty_star);
+
+        // Update Welford's algorithm
+        welford.update(&beta_star);
+    }
+
+    // Compute standard errors from Welford state
+    let se = welford.standard_errors();
+
+    // Check for NaN/Inf values
+    if se.iter().any(|&s| s.is_nan() || s.is_infinite()) {
+        return Err(ClusterError::InvalidStandardErrors);
+    }
+
+    // Split into intercept_se and coefficient_se
+    if include_intercept {
+        let intercept_se = Some(se[0]);
+        let coefficient_se = se[1..].to_vec();
+        Ok((coefficient_se, intercept_se))
+    } else {
+        Ok((se, None))
+    }
+}
+
+/// Compute wild cluster bootstrap SE using faer matrices.
+///
+/// Uses the "type 11" bootstrap: y* = ŷ + w_g × e where w_g is drawn from
+/// the specified weight distribution (Rademacher or Webb).
+///
+/// Uses faer matmul for the X'y* computation which dominates runtime
+/// in the bootstrap loop.
+///
+/// # Arguments
+/// * `design_matrix` - Design matrix X (n × p) as faer::Mat
+/// * `fitted_values` - Fitted values ŷ = Xβ (n,)
+/// * `residuals` - OLS residuals e = y - ŷ (n,)
+/// * `xtx_inv` - (X'X)^-1 (p × p) as faer::Mat
+/// * `cluster_info` - Cluster membership information
+/// * `bootstrap_iterations` - Number of bootstrap replications (B)
+/// * `seed` - Random seed for reproducibility (None for random)
+/// * `include_intercept` - Whether intercept is included
+/// * `weight_type` - Bootstrap weight distribution (Rademacher or Webb)
+///
+/// # Returns
+/// * `Result<(Vec<f64>, Option<f64>), ClusterError>` - (coefficient_se, intercept_se)
+#[allow(clippy::too_many_arguments)]
+pub fn compute_cluster_se_bootstrap_faer(
+    design_matrix: &Mat<f64>,
+    fitted_values: &[f64],
+    residuals: &[f64],
+    xtx_inv: &Mat<f64>,
+    cluster_info: &ClusterInfo,
+    bootstrap_iterations: usize,
+    seed: Option<u64>,
+    include_intercept: bool,
+    weight_type: BootstrapWeightType,
+) -> Result<(Vec<f64>, Option<f64>), ClusterError> {
+    let n = residuals.len();
+    let p = xtx_inv.nrows();
+    let g = cluster_info.n_clusters;
+
+    // Initialize RNG
+    let actual_seed = seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(42)
+    });
+    let mut rng = SplitMix64::new(actual_seed);
+
+    // Initialize Welford's online algorithm state
+    let mut welford = WelfordState::new(p);
+
+    // Pre-allocate buffers
+    let mut y_star = vec![0.0; n];
+    let mut weights = vec![0.0; g];
+    let mut beta_star = vec![0.0; p];
+
+    // Pre-allocate faer column vectors for X'y* computation
+    let mut y_star_col: Col<f64> = Col::zeros(n);
+    let mut xty_star_col: Col<f64> = Col::zeros(p);
+
+    // Use Rayon only for large matrices; sequential for small problems
+    // For bootstrap, n (observations) and p (parameters) determine overhead
+    let parallelism = if p < 50 && n < 1000 {
+        Parallelism::None // Sequential for small problems
+    } else {
+        Parallelism::Rayon(0) // Parallel for large problems
+    };
+
+    for _ in 0..bootstrap_iterations {
+        // Generate weights for each cluster using specified distribution
+        for w in weights.iter_mut() {
+            *w = rng.weight(weight_type);
+        }
+
+        // Create bootstrap response y*
+        // y*_i = ŷ_i + w_{g(i)} × e_i
+        for (cluster_idx, cluster_indices) in cluster_info.indices.iter().enumerate() {
+            let w_g = weights[cluster_idx];
+            for &i in cluster_indices {
+                y_star[i] = fitted_values[i] + w_g * residuals[i];
+            }
+        }
+
+        // Copy y_star to faer Col
+        for i in 0..n {
+            y_star_col.write(i, y_star[i]);
+        }
+
+        // Compute X'y* using faer matmul
+        matmul(
+            xty_star_col.as_mut().as_2d_mut(),
+            design_matrix.transpose(),
+            y_star_col.as_ref().as_2d(),
+            None,
+            1.0,
+            parallelism,
+        );
+
+        // Compute bootstrap coefficients β* = (X'X)^-1 X'y* using faer matmul
+        // Convert xty_star_col to a column matrix view for the matmul
+        let mut beta_star_col: Col<f64> = Col::zeros(p);
+        matmul(
+            beta_star_col.as_mut().as_2d_mut(),
+            xtx_inv.as_ref(),
+            xty_star_col.as_ref().as_2d(),
+            None,
+            1.0,
+            parallelism,
+        );
+
+        // Copy to beta_star for Welford update
+        for i in 0..p {
+            beta_star[i] = beta_star_col.read(i);
+        }
 
         // Update Welford's algorithm
         welford.update(&beta_star);
@@ -823,6 +1117,284 @@ mod tests {
             &fitted_values,
             &residuals,
             &xtx_inv,
+            &cluster_info,
+            100,
+            Some(42),
+            true,
+            BootstrapWeightType::Rademacher,
+        );
+
+        // Should succeed
+        assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // Tests for faer-optimized functions
+    // ========================================================================
+
+    /// Helper function to convert Vec<Vec<f64>> to faer::Mat
+    fn vec_to_mat(v: &[Vec<f64>]) -> Mat<f64> {
+        let nrows = v.len();
+        let ncols = if nrows > 0 { v[0].len() } else { 0 };
+        let mut mat: Mat<f64> = Mat::zeros(nrows, ncols);
+        for (i, row) in v.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                mat.write(i, j, val);
+            }
+        }
+        mat
+    }
+
+    #[test]
+    fn test_analytical_se_faer_matches_legacy() {
+        // Test that faer implementation produces same results as legacy Vec<Vec<f64>> version
+        let design_matrix_vec = vec![
+            vec![1.0, 1.0], // cluster 0
+            vec![1.0, 2.0], // cluster 0
+            vec![1.0, 3.0], // cluster 1
+            vec![1.0, 4.0], // cluster 1
+        ];
+        let residuals = vec![0.1, -0.1, 0.2, -0.2];
+        let xtx_inv_vec = vec![vec![1.5, -0.5], vec![-0.5, 0.2]];
+
+        let cluster_ids = vec![0, 0, 1, 1];
+        let cluster_info = build_cluster_indices(&cluster_ids).unwrap();
+
+        // Convert to faer matrices
+        let design_matrix_faer = vec_to_mat(&design_matrix_vec);
+        let xtx_inv_faer = vec_to_mat(&xtx_inv_vec);
+
+        // Compute using legacy implementation
+        let legacy_result = compute_cluster_se_analytical(
+            &design_matrix_vec,
+            &residuals,
+            &xtx_inv_vec,
+            &cluster_info,
+            true,
+        )
+        .unwrap();
+
+        // Compute using faer implementation
+        let faer_result = compute_cluster_se_analytical_faer(
+            &design_matrix_faer,
+            &residuals,
+            &xtx_inv_faer,
+            &cluster_info,
+            true,
+        )
+        .unwrap();
+
+        // Results should match within floating-point tolerance
+        assert_relative_eq!(legacy_result.0[0], faer_result.0[0], epsilon = 1e-10);
+        assert_relative_eq!(
+            legacy_result.1.unwrap(),
+            faer_result.1.unwrap(),
+            epsilon = 1e-10
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_se_faer_matches_legacy() {
+        // Test that faer bootstrap produces same results as legacy Vec<Vec<f64>> version
+        let design_matrix_vec = vec![
+            vec![1.0, 1.0],
+            vec![1.0, 2.0],
+            vec![1.0, 3.0],
+            vec![1.0, 4.0],
+        ];
+        let fitted_values = vec![1.0, 2.0, 3.0, 4.0];
+        let residuals = vec![0.1, -0.1, 0.2, -0.2];
+        let xtx_inv_vec = vec![vec![1.5, -0.5], vec![-0.5, 0.2]];
+
+        let cluster_ids = vec![0, 0, 1, 1];
+        let cluster_info = build_cluster_indices(&cluster_ids).unwrap();
+
+        // Convert to faer matrices
+        let design_matrix_faer = vec_to_mat(&design_matrix_vec);
+        let xtx_inv_faer = vec_to_mat(&xtx_inv_vec);
+
+        // Compute using legacy implementation
+        let legacy_result = compute_cluster_se_bootstrap(
+            &design_matrix_vec,
+            &fitted_values,
+            &residuals,
+            &xtx_inv_vec,
+            &cluster_info,
+            100,
+            Some(42),
+            true,
+            BootstrapWeightType::Rademacher,
+        )
+        .unwrap();
+
+        // Compute using faer implementation
+        let faer_result = compute_cluster_se_bootstrap_faer(
+            &design_matrix_faer,
+            &fitted_values,
+            &residuals,
+            &xtx_inv_faer,
+            &cluster_info,
+            100,
+            Some(42),
+            true,
+            BootstrapWeightType::Rademacher,
+        )
+        .unwrap();
+
+        // Results should match within floating-point tolerance
+        // Using 1e-9 as faer may have slightly different numerical precision
+        assert_relative_eq!(legacy_result.0[0], faer_result.0[0], epsilon = 1e-9);
+        assert_relative_eq!(
+            legacy_result.1.unwrap(),
+            faer_result.1.unwrap(),
+            epsilon = 1e-9
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_se_faer_reproducibility() {
+        // Test that same seed produces same results for faer implementation
+        let design_matrix_vec = vec![
+            vec![1.0, 1.0],
+            vec![1.0, 2.0],
+            vec![1.0, 3.0],
+            vec![1.0, 4.0],
+        ];
+        let fitted_values = vec![1.0, 2.0, 3.0, 4.0];
+        let residuals = vec![0.1, -0.1, 0.2, -0.2];
+        let xtx_inv_vec = vec![vec![1.5, -0.5], vec![-0.5, 0.2]];
+
+        let cluster_ids = vec![0, 0, 1, 1];
+        let cluster_info = build_cluster_indices(&cluster_ids).unwrap();
+
+        // Convert to faer matrices
+        let design_matrix_faer = vec_to_mat(&design_matrix_vec);
+        let xtx_inv_faer = vec_to_mat(&xtx_inv_vec);
+
+        let result1 = compute_cluster_se_bootstrap_faer(
+            &design_matrix_faer,
+            &fitted_values,
+            &residuals,
+            &xtx_inv_faer,
+            &cluster_info,
+            100,
+            Some(42),
+            true,
+            BootstrapWeightType::Rademacher,
+        )
+        .unwrap();
+
+        let result2 = compute_cluster_se_bootstrap_faer(
+            &design_matrix_faer,
+            &fitted_values,
+            &residuals,
+            &xtx_inv_faer,
+            &cluster_info,
+            100,
+            Some(42),
+            true,
+            BootstrapWeightType::Rademacher,
+        )
+        .unwrap();
+
+        // Same seed should produce same results
+        assert_relative_eq!(result1.0[0], result2.0[0], epsilon = 1e-10);
+        assert_relative_eq!(result1.1.unwrap(), result2.1.unwrap(), epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_analytical_se_faer_2x2() {
+        // Test faer analytical SE with a simple 2x2 case
+        let design_matrix_vec = vec![
+            vec![1.0, 1.0], // cluster 0
+            vec![1.0, 2.0], // cluster 0
+            vec![1.0, 3.0], // cluster 1
+            vec![1.0, 4.0], // cluster 1
+        ];
+        let residuals = vec![0.1, -0.1, 0.2, -0.2];
+        let xtx_inv_vec = vec![vec![1.5, -0.5], vec![-0.5, 0.2]];
+
+        let cluster_ids = vec![0, 0, 1, 1];
+        let cluster_info = build_cluster_indices(&cluster_ids).unwrap();
+
+        // Convert to faer matrices
+        let design_matrix_faer = vec_to_mat(&design_matrix_vec);
+        let xtx_inv_faer = vec_to_mat(&xtx_inv_vec);
+
+        let result = compute_cluster_se_analytical_faer(
+            &design_matrix_faer,
+            &residuals,
+            &xtx_inv_faer,
+            &cluster_info,
+            true,
+        );
+
+        // Should succeed without error
+        assert!(result.is_ok());
+        let (coef_se, intercept_se) = result.unwrap();
+
+        // Coefficient SE should have 1 element (for β1)
+        assert_eq!(coef_se.len(), 1);
+        assert!(intercept_se.is_some());
+
+        // Values should be positive and finite
+        assert!(coef_se[0] > 0.0);
+        assert!(intercept_se.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_single_observation_cluster_faer_analytical_error() {
+        // Test that faer analytical SE errors on single-observation clusters
+        let design_matrix_vec = vec![vec![1.0, 1.0], vec![1.0, 2.0], vec![1.0, 3.0]];
+        let residuals = vec![0.1, -0.1, 0.2];
+        let xtx_inv_vec = vec![vec![1.5, -0.5], vec![-0.5, 0.2]];
+
+        // Cluster with only 1 observation (cluster 1)
+        let cluster_ids = vec![0, 0, 1];
+        let cluster_info = build_cluster_indices(&cluster_ids).unwrap();
+
+        // Convert to faer matrices
+        let design_matrix_faer = vec_to_mat(&design_matrix_vec);
+        let xtx_inv_faer = vec_to_mat(&xtx_inv_vec);
+
+        let result = compute_cluster_se_analytical_faer(
+            &design_matrix_faer,
+            &residuals,
+            &xtx_inv_faer,
+            &cluster_info,
+            true,
+        );
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ClusterError::SingleObservationCluster { cluster_idx } => {
+                assert_eq!(cluster_idx, 1);
+            }
+            _ => panic!("Expected SingleObservationCluster error"),
+        }
+    }
+
+    #[test]
+    fn test_single_observation_cluster_faer_bootstrap_ok() {
+        // Test that faer bootstrap allows single-observation clusters
+        let design_matrix_vec = vec![vec![1.0, 1.0], vec![1.0, 2.0], vec![1.0, 3.0]];
+        let fitted_values = vec![1.0, 2.0, 3.0];
+        let residuals = vec![0.1, -0.1, 0.2];
+        let xtx_inv_vec = vec![vec![1.5, -0.5], vec![-0.5, 0.2]];
+
+        // Cluster with only 1 observation (cluster 1)
+        let cluster_ids = vec![0, 0, 1];
+        let cluster_info = build_cluster_indices(&cluster_ids).unwrap();
+
+        // Convert to faer matrices
+        let design_matrix_faer = vec_to_mat(&design_matrix_vec);
+        let xtx_inv_faer = vec_to_mat(&xtx_inv_vec);
+
+        let result = compute_cluster_se_bootstrap_faer(
+            &design_matrix_faer,
+            &fitted_values,
+            &residuals,
+            &xtx_inv_faer,
             &cluster_info,
             100,
             Some(42),

@@ -14,10 +14,11 @@ extensions = [
     'sphinx.ext.napoleon',     # Parse NumPy/Google-style docstrings
     'sphinx.ext.viewcode',     # Link to source code
     'sphinx.ext.intersphinx',  # Cross-reference external docs (Polars, NumPy)
+    'nbsphinx',                # Jupyter notebook rendering for benchmarks
 ]
 
 templates_path = ['_templates']
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
+exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store', '**/.ipynb_checkpoints']
 
 # -- Autodoc configuration ---------------------------------------------------
 autodoc_member_order = 'bysource'        # Preserve source file order
@@ -45,3 +46,8 @@ html_favicon = None                      # Optional: add favicon later
 # -- Extension options -------------------------------------------------------
 # Do NOT enable doctest auto-execution (REQ-031)
 # doctest is NOT in extensions list
+
+# -- nbsphinx configuration ---------------------------------------------------
+nbsphinx_execute = 'never'    # Use pre-executed notebooks (REQ-044)
+nbsphinx_allow_errors = False  # Fail build on notebook errors
+nbsphinx_timeout = 300         # 5 minute timeout per notebook

@@ -26,8 +26,10 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pyo3::prelude::*;
+use rayon::prelude::*;
 
 use crate::cluster::{SplitMix64, WelfordState};
 use crate::sdid::{FrankWolfeConfig, FrankWolfeSolver, StepSizeMethod};
@@ -473,6 +475,427 @@ impl SCPanelData {
 }
 
 // ============================================================================
+// Placebo View for Parallel SE Computation (TASK-007)
+// ============================================================================
+
+/// A lightweight view into panel data for placebo iteration.
+///
+/// This struct avoids cloning the outcomes matrix by holding a reference
+/// to the original data and using index vectors to define the placebo
+/// configuration. Memory cost per iteration is O(C-1) for indices,
+/// NOT O(U×T) for outcomes clone.
+///
+/// # Usage
+///
+/// Used in parallel placebo bootstrap for SE computation. Each parallel
+/// iteration creates its own view with different control/treated indices.
+pub struct SCPlaceboView<'a> {
+    /// Reference to original outcomes (row-major: unit × period)
+    pub outcomes: &'a [f64],
+    
+    /// Total number of units in the original panel
+    pub n_units: usize,
+    
+    /// Total number of periods in the original panel
+    pub n_periods: usize,
+    
+    /// Indices of control units for this placebo iteration
+    pub control_indices: Vec<usize>,
+    
+    /// Index of the placebo-treated unit
+    pub treated_index: usize,
+    
+    /// Indices of pre-treatment periods (borrowed from original)
+    pub pre_period_indices: &'a [usize],
+    
+    /// Indices of post-treatment periods (borrowed from original)
+    pub post_period_indices: &'a [usize],
+}
+
+impl<'a> SCPlaceboView<'a> {
+    /// Get outcome value for a specific unit and period.
+    #[inline]
+    pub fn outcome(&self, unit: usize, period: usize) -> f64 {
+        debug_assert!(unit < self.n_units, "Unit index out of bounds");
+        debug_assert!(period < self.n_periods, "Period index out of bounds");
+        self.outcomes[unit * self.n_periods + period]
+    }
+    
+    /// Get number of control units.
+    #[inline]
+    pub fn n_control(&self) -> usize {
+        self.control_indices.len()
+    }
+    
+    /// Get number of pre-treatment periods.
+    #[inline]
+    pub fn n_pre(&self) -> usize {
+        self.pre_period_indices.len()
+    }
+    
+    /// Get number of post-treatment periods.
+    #[inline]
+    pub fn n_post(&self) -> usize {
+        self.post_period_indices.len()
+    }
+}
+
+// ============================================================================
+// View-based Helper Functions (TASK-008)
+// ============================================================================
+
+/// Compute traditional SC weights using a placebo view.
+///
+/// This is the view-based version of `compute_traditional_weights` that
+/// avoids cloning the outcomes matrix. It directly accesses outcomes
+/// through the view's indices.
+///
+/// # Arguments
+///
+/// * `view` - Placebo view with control/treated indices
+/// * `config` - Configuration for the optimizer
+///
+/// # Returns
+///
+/// * `Ok(WeightResult)` - Computed weights and diagnostics
+/// * `Err(SynthControlError)` - If optimization fails
+fn compute_traditional_weights_from_view(
+    view: &SCPlaceboView,
+    config: &SynthControlConfig,
+) -> Result<WeightResult, SynthControlError> {
+    let n_control = view.n_control();
+    let n_pre = view.n_pre();
+    
+    // Validate minimum requirements
+    if n_control < 1 {
+        return Err(SynthControlError::InvalidData {
+            message: "At least 1 control unit required".to_string(),
+        });
+    }
+    if n_pre < 1 {
+        return Err(SynthControlError::InvalidData {
+            message: "At least 1 pre-treatment period required".to_string(),
+        });
+    }
+    
+    // Extract pre-treatment data using view's indices
+    let mut y_control_pre = Vec::with_capacity(n_control * n_pre);
+    for &ctrl_idx in &view.control_indices {
+        for &t in view.pre_period_indices {
+            y_control_pre.push(view.outcome(ctrl_idx, t));
+        }
+    }
+    
+    let mut y_treated_pre = Vec::with_capacity(n_pre);
+    for &t in view.pre_period_indices {
+        y_treated_pre.push(view.outcome(view.treated_index, t));
+    }
+    
+    // Precompute Y @ Y' and Y @ y
+    let yyt = compute_yyt(&y_control_pre, n_control, n_pre);
+    let yy = compute_yy(&y_control_pre, &y_treated_pre, n_control, n_pre);
+    
+    // Create copies for closures
+    let yyt_obj = yyt.clone();
+    let yy_obj = yy.clone();
+    
+    // Objective function: f(w) = w' @ YYt @ w - 2 × w' @ Yy + const
+    let objective = move |w: &[f64]| -> f64 {
+        let mut w_yyt_w = 0.0;
+        for i in 0..n_control {
+            for j in 0..n_control {
+                w_yyt_w += w[i] * yyt_obj[i][j] * w[j];
+            }
+        }
+        let mut w_yy = 0.0;
+        for (i, &wi) in w.iter().enumerate() {
+            w_yy += wi * yy_obj[i];
+        }
+        w_yyt_w - 2.0 * w_yy
+    };
+    
+    // Gradient function: ∇f(w) = 2 × YYt @ w - 2 × Yy
+    let gradient_fn = move |w: &[f64]| -> Vec<f64> {
+        let mut grad = vec![0.0; n_control];
+        for i in 0..n_control {
+            let yyt_w_i: f64 = yyt[i].iter().zip(w.iter()).map(|(&a, &b)| a * b).sum();
+            grad[i] = 2.0 * yyt_w_i - 2.0 * yy[i];
+        }
+        grad
+    };
+    
+    // Configure Frank-Wolfe solver
+    let fw_config = FrankWolfeConfig {
+        max_iterations: config.max_iter,
+        tolerance: config.tol,
+        step_size_method: StepSizeMethod::Classic,
+        armijo_beta: 0.5,
+        armijo_sigma: 1e-4,
+        use_relative_gap: true,
+    };
+    
+    // Create and run Frank-Wolfe solver
+    let mut solver = FrankWolfeSolver::new(n_control, fw_config);
+    let weights = solver.solve(&objective, gradient_fn).map_err(|e| {
+        SynthControlError::NumericalInstability {
+            message: format!("Frank-Wolfe solver error: {}", e),
+        }
+    })?;
+    
+    // Compute final objective value
+    let final_obj = objective(&weights);
+    
+    Ok(WeightResult {
+        weights,
+        converged: true,
+        iterations: config.max_iter,
+        objective: final_obj,
+    })
+}
+
+/// Compute penalized SC weights using a placebo view.
+fn compute_penalized_weights_from_view(
+    view: &SCPlaceboView,
+    config: &SynthControlConfig,
+) -> Result<WeightResult, SynthControlError> {
+    let n_control = view.n_control();
+    let n_pre = view.n_pre();
+    
+    if n_control < 1 {
+        return Err(SynthControlError::InvalidData {
+            message: "At least 1 control unit required".to_string(),
+        });
+    }
+    if n_pre < 1 {
+        return Err(SynthControlError::InvalidData {
+            message: "At least 1 pre-treatment period required".to_string(),
+        });
+    }
+    
+    // Get lambda (use default if not specified - can't do LOOCV in view context)
+    let lambda = config.lambda.unwrap_or(1.0);
+    if lambda < 0.0 {
+        return Err(SynthControlError::InvalidParameter {
+            name: "lambda".to_string(),
+            message: format!("lambda must be non-negative, got {}", lambda),
+        });
+    }
+    
+    // Extract pre-treatment data using view's indices
+    let mut y_control_pre = Vec::with_capacity(n_control * n_pre);
+    for &ctrl_idx in &view.control_indices {
+        for &t in view.pre_period_indices {
+            y_control_pre.push(view.outcome(ctrl_idx, t));
+        }
+    }
+    
+    let mut y_treated_pre = Vec::with_capacity(n_pre);
+    for &t in view.pre_period_indices {
+        y_treated_pre.push(view.outcome(view.treated_index, t));
+    }
+    
+    // Compute Y @ Y' (n_control × n_control)
+    let yyt = compute_yyt(&y_control_pre, n_control, n_pre);
+    
+    // Add regularization: (Y @ Y' + λI)
+    let mut yyt_regularized = yyt;
+    for i in 0..n_control {
+        yyt_regularized[i][i] += lambda;
+    }
+    
+    // Compute Y @ y (n_control × 1)
+    let yy = compute_yy(&y_control_pre, &y_treated_pre, n_control, n_pre);
+    
+    // Solve for unconstrained solution
+    let yyt_inv = invert_matrix(&yyt_regularized)?;
+    let w_unconstrained = matrix_vector_mult(&yyt_inv, &yy);
+    
+    // Project onto simplex
+    let weights = project_onto_simplex(&w_unconstrained);
+    
+    // Compute objective value
+    let objective = compute_penalized_objective(&y_control_pre, &y_treated_pre, &weights, lambda, n_control, n_pre);
+    
+    Ok(WeightResult {
+        weights,
+        converged: true,
+        iterations: 1,
+        objective,
+    })
+}
+
+/// Compute robust SC weights using a placebo view.
+fn compute_robust_weights_from_view(
+    view: &SCPlaceboView,
+    config: &SynthControlConfig,
+) -> Result<WeightResult, SynthControlError> {
+    let n_control = view.n_control();
+    let n_pre = view.n_pre();
+    
+    if n_control < 1 {
+        return Err(SynthControlError::InvalidData {
+            message: "At least 1 control unit required".to_string(),
+        });
+    }
+    if n_pre < 1 {
+        return Err(SynthControlError::InvalidData {
+            message: "At least 1 pre-treatment period required".to_string(),
+        });
+    }
+    
+    // Extract pre-treatment data using view's indices
+    let mut y_control_pre = Vec::with_capacity(n_control * n_pre);
+    for &ctrl_idx in &view.control_indices {
+        for &t in view.pre_period_indices {
+            y_control_pre.push(view.outcome(ctrl_idx, t));
+        }
+    }
+    
+    let mut y_treated_pre = Vec::with_capacity(n_pre);
+    for &t in view.pre_period_indices {
+        y_treated_pre.push(view.outcome(view.treated_index, t));
+    }
+    
+    // De-mean control unit outcomes
+    let mut y_control_demeaned = Vec::with_capacity(n_control * n_pre);
+    for i in 0..n_control {
+        let row_start = i * n_pre;
+        let row_mean: f64 = (0..n_pre)
+            .map(|t| y_control_pre[row_start + t])
+            .sum::<f64>() / n_pre as f64;
+        for t in 0..n_pre {
+            y_control_demeaned.push(y_control_pre[row_start + t] - row_mean);
+        }
+    }
+    
+    // De-mean treated outcomes
+    let treated_mean: f64 = y_treated_pre.iter().sum::<f64>() / n_pre as f64;
+    let y_treated_demeaned: Vec<f64> = y_treated_pre
+        .iter()
+        .map(|&y| y - treated_mean)
+        .collect();
+    
+    // Compute Y @ Y' and Y @ y on de-meaned data
+    let yyt = compute_yyt(&y_control_demeaned, n_control, n_pre);
+    let yy = compute_yy(&y_control_demeaned, &y_treated_demeaned, n_control, n_pre);
+    
+    let yyt_obj = yyt.clone();
+    let yy_obj = yy.clone();
+    let yyt_final = yyt.clone();
+    let yy_final = yy.clone();
+    
+    let objective = move |w: &[f64]| -> f64 {
+        let mut w_yyt_w = 0.0;
+        for i in 0..n_control {
+            for j in 0..n_control {
+                w_yyt_w += w[i] * yyt_obj[i][j] * w[j];
+            }
+        }
+        let mut w_yy = 0.0;
+        for (i, &wi) in w.iter().enumerate() {
+            w_yy += wi * yy_obj[i];
+        }
+        w_yyt_w - 2.0 * w_yy
+    };
+    
+    let gradient_fn = move |w: &[f64]| -> Vec<f64> {
+        let mut grad = vec![0.0; n_control];
+        for i in 0..n_control {
+            let yyt_w_i: f64 = yyt[i].iter().zip(w.iter()).map(|(&a, &b)| a * b).sum();
+            grad[i] = 2.0 * yyt_w_i - 2.0 * yy[i];
+        }
+        grad
+    };
+    
+    let fw_config = FrankWolfeConfig {
+        max_iterations: config.max_iter,
+        tolerance: config.tol,
+        step_size_method: StepSizeMethod::Classic,
+        armijo_beta: 0.5,
+        armijo_sigma: 1e-4,
+        use_relative_gap: true,
+    };
+    
+    let mut solver = FrankWolfeSolver::new(n_control, fw_config);
+    let weights = solver.solve(&objective, gradient_fn).map_err(|e| {
+        SynthControlError::NumericalInstability {
+            message: format!("Frank-Wolfe solver error: {}", e),
+        }
+    })?;
+    
+    let final_obj = {
+        let mut w_yyt_w = 0.0;
+        for i in 0..n_control {
+            for j in 0..n_control {
+                w_yyt_w += weights[i] * yyt_final[i][j] * weights[j];
+            }
+        }
+        let mut w_yy = 0.0;
+        for (i, &wi) in weights.iter().enumerate() {
+            w_yy += wi * yy_final[i];
+        }
+        w_yyt_w - 2.0 * w_yy
+    };
+    
+    Ok(WeightResult {
+        weights,
+        converged: true,
+        iterations: config.max_iter,
+        objective: final_obj,
+    })
+}
+
+/// Compute SC weights using a placebo view (method dispatch).
+fn compute_weights_from_view(
+    view: &SCPlaceboView,
+    config: &SynthControlConfig,
+) -> Result<WeightResult, SynthControlError> {
+    match config.method {
+        SynthControlMethod::Traditional => compute_traditional_weights_from_view(view, config),
+        SynthControlMethod::Penalized => compute_penalized_weights_from_view(view, config),
+        SynthControlMethod::Robust => compute_robust_weights_from_view(view, config),
+        SynthControlMethod::Augmented => {
+            // For placebo, fall back to traditional (augmented has complex bias correction)
+            compute_traditional_weights_from_view(view, config)
+        }
+    }
+}
+
+/// Compute ATT using a placebo view.
+///
+/// This is the view-based version of `compute_att` that directly
+/// accesses outcomes through the view's indices.
+fn compute_att_from_view(view: &SCPlaceboView, weights: &[f64]) -> f64 {
+    let n_post = view.n_post();
+    
+    if n_post == 0 {
+        return 0.0;
+    }
+    
+    let mut att_sum = 0.0;
+    
+    for (t_idx, &post_period) in view.post_period_indices.iter().enumerate() {
+        // Treated unit outcome
+        let y_treated_t = view.outcome(view.treated_index, post_period);
+        
+        // Compute synthetic control for this period
+        let mut y_synth_t = 0.0;
+        for (i, &ctrl_idx) in view.control_indices.iter().enumerate() {
+            let y_control_it = view.outcome(ctrl_idx, post_period);
+            y_synth_t += weights[i] * y_control_it;
+        }
+        
+        // Treatment effect at this period
+        att_sum += y_treated_t - y_synth_t;
+        
+        // Suppress unused variable warning
+        let _ = t_idx;
+    }
+    
+    att_sum / n_post as f64
+}
+
+// ============================================================================
 // Weight Computation Result
 // ============================================================================
 
@@ -515,7 +938,7 @@ fn compute_yyt(y_control_pre: &[f64], n_control: usize, n_pre: usize) -> Vec<Vec
     let mut yyt = vec![vec![0.0; n_control]; n_control];
 
     for i in 0..n_control {
-        for j in 0..n_control {
+        for j in i..n_control {
             let mut sum = 0.0;
             for t in 0..n_pre {
                 let y_it = y_control_pre[i * n_pre + t];
@@ -523,6 +946,9 @@ fn compute_yyt(y_control_pre: &[f64], n_control: usize, n_pre: usize) -> Vec<Vec
                 sum += y_it * y_jt;
             }
             yyt[i][j] = sum;
+            if j > i {
+                yyt[j][i] = sum;
+            }
         }
     }
 
@@ -1356,16 +1782,19 @@ pub fn compute_augmented_sc(
     // Where X is (n_control × n_pre) and y is (n_control,)
     // X'X is (n_pre × n_pre), X'y is (n_pre,)
 
-    // Compute X'X (n_pre × n_pre)
+    // Compute X'X (n_pre × n_pre) using triangular loop optimization
     let mut xtx = vec![vec![0.0; n_pre]; n_pre];
     for i in 0..n_pre {
-        for j in 0..n_pre {
+        for j in i..n_pre {
             let mut sum = 0.0;
             for k in 0..n_control {
                 // X[k, i] = y_control_pre[k * n_pre + i]
                 sum += y_control_pre[k * n_pre + i] * y_control_pre[k * n_pre + j];
             }
             xtx[i][j] = sum;
+            if j > i {
+                xtx[j][i] = sum;
+            }
         }
     }
 
@@ -1543,6 +1972,10 @@ pub struct SyntheticControlResult {
     /// Number of successful placebo iterations (None if SE not computed)
     #[pyo3(get)]
     pub n_placebo_used: Option<usize>,
+
+    /// Number of failed placebo iterations (None if SE not computed)
+    #[pyo3(get)]
+    pub n_failed_iterations: Option<usize>,
 }
 
 #[pymethods]
@@ -1557,9 +1990,13 @@ impl SyntheticControlResult {
             Some(l) => format!("{:.4}", l),
             None => "None".to_string(),
         };
+        let n_failed_str = match self.n_failed_iterations {
+            Some(n) => n.to_string(),
+            None => "None".to_string(),
+        };
         format!(
             "SyntheticControlResult(att={:.6}, se={}, method='{}', lambda={}, \
-             pre_rmse={:.6}, n_control={}, n_pre={}, n_post={}, converged={})",
+             pre_rmse={:.6}, n_control={}, n_pre={}, n_post={}, converged={}, n_failed_iterations={})",
             self.att,
             se_str,
             self.method,
@@ -1568,7 +2005,8 @@ impl SyntheticControlResult {
             self.n_units_control,
             self.n_periods_pre,
             self.n_periods_post,
-            self.solver_converged
+            self.solver_converged,
+            n_failed_str
         )
     }
 
@@ -1588,7 +2026,7 @@ impl SyntheticControlResult {
 }
 
 // ============================================================================
-// In-Space Placebo SE Computation (TASK-014)
+// In-Space Placebo SE Computation (TASK-014 + TASK-009 Parallel)
 // ============================================================================
 
 /// Compute standard error via in-space placebo bootstrap.
@@ -1597,18 +2035,21 @@ impl SyntheticControlResult {
 /// is iteratively treated as the "placebo treated" unit, and the
 /// standard deviation of the resulting placebo ATTs is used as the SE.
 ///
+/// **Parallelized** using Rayon for performance. Each iteration creates
+/// a lightweight `SCPlaceboView` that references the original outcomes
+/// without cloning, achieving O(C-1) memory per iteration instead of O(U×T).
+///
 /// # Algorithm
-/// 1. For each control unit i:
-///    a. Create modified panel with unit i as treated
+/// 1. For each control unit i (in parallel):
+///    a. Create SCPlaceboView with unit i as treated
 ///    b. Remaining control units form the donor pool
-///    c. Compute SC weights and placebo ATT
+///    c. Compute SC weights and placebo ATT using view-based helpers
 /// 2. SE = std(placebo_ATTs)
 ///
 /// # Arguments
 ///
 /// * `panel` - Original panel data
 /// * `config` - Configuration (uses config.n_placebo to limit iterations)
-/// * `method` - Which SC method to use for placebo estimation
 ///
 /// # Returns
 ///
@@ -1632,63 +2073,79 @@ pub fn compute_placebo_se(
         });
     }
 
-    // Initialize PRNG for reproducible placebo selection
-    let seed = config.seed.unwrap_or_else(|| {
+    // Initialize seed for reproducibility
+    let initial_seed = config.seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(42)
     });
-    let mut _rng = SplitMix64::new(seed);
 
-    // Use Welford's algorithm for online variance computation
-    let mut welford = WelfordState::new(1);
-    let mut n_successful = 0;
+    // Track failed iterations
+    let failed_count = AtomicUsize::new(0);
 
-    // Iterate over control units as placebo treated
-    for placebo_ctrl_idx in 0..n_placebo {
-        // Get the actual unit index for this control
-        let placebo_treated_unit = panel.control_indices[placebo_ctrl_idx];
+    // Parallel iteration over control units as placebo treated
+    // Each iteration creates a lightweight SCPlaceboView (O(C-1) memory)
+    // instead of cloning the entire outcomes matrix (O(U×T) memory)
+    let placebo_atts: Vec<f64> = (0..n_placebo)
+        .into_par_iter()
+        .filter_map(|placebo_ctrl_idx| {
+            // Use iteration-indexed seed for determinism
+            // (not used for selection here, but maintains pattern from SDID)
+            let _iter_seed = initial_seed.wrapping_add(placebo_ctrl_idx as u64);
+            
+            // Get the actual unit index for this control
+            let placebo_treated_unit = panel.control_indices[placebo_ctrl_idx];
 
-        // Create new control indices excluding the placebo treated unit
-        let new_control_indices: Vec<usize> = panel
-            .control_indices
-            .iter()
-            .filter(|&&idx| idx != placebo_treated_unit)
-            .copied()
-            .collect();
+            // Create new control indices excluding the placebo treated unit
+            // This is O(C-1) allocation, not O(U×T)
+            let new_control_indices: Vec<usize> = panel
+                .control_indices
+                .iter()
+                .filter(|&&idx| idx != placebo_treated_unit)
+                .copied()
+                .collect();
 
-        // Need at least 1 control unit for the placebo
-        if new_control_indices.is_empty() {
-            continue;
-        }
+            // Need at least 1 control unit for the placebo
+            if new_control_indices.is_empty() {
+                failed_count.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
 
-        // Create placebo panel
-        let placebo_panel = SCPanelData {
-            outcomes: panel.outcomes.clone(),
-            n_units: panel.n_units,
-            n_periods: panel.n_periods,
-            control_indices: new_control_indices,
-            treated_index: placebo_treated_unit,
-            pre_period_indices: panel.pre_period_indices.clone(),
-            post_period_indices: panel.post_period_indices.clone(),
-        };
+            // Create lightweight placebo view (references original outcomes)
+            let placebo_view = SCPlaceboView {
+                outcomes: &panel.outcomes,
+                n_units: panel.n_units,
+                n_periods: panel.n_periods,
+                control_indices: new_control_indices,
+                treated_index: placebo_treated_unit,
+                pre_period_indices: &panel.pre_period_indices,
+                post_period_indices: &panel.post_period_indices,
+            };
 
-        // Compute weights for placebo using same method
-        let weight_result = match compute_weights(&placebo_panel, config) {
-            Ok(r) => r,
-            Err(_) => continue, // Skip failed placebos
-        };
+            // Compute weights for placebo using view-based helper
+            let weight_result = match compute_weights_from_view(&placebo_view, config) {
+                Ok(r) => r,
+                Err(_) => {
+                    failed_count.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            };
 
-        // Compute placebo ATT
-        let placebo_att = compute_att(&placebo_panel, &weight_result.weights);
+            // Compute placebo ATT using view-based helper
+            let placebo_att = compute_att_from_view(&placebo_view, &weight_result.weights);
 
-        // Check for valid ATT
-        if placebo_att.is_finite() {
-            welford.update(&[placebo_att]);
-            n_successful += 1;
-        }
-    }
+            // Check for valid ATT
+            if placebo_att.is_finite() {
+                Some(placebo_att)
+            } else {
+                failed_count.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        })
+        .collect();
+
+    let n_successful = placebo_atts.len();
 
     // Need at least 2 successful placebos to compute SE
     if n_successful < 2 {
@@ -1700,6 +2157,12 @@ pub fn compute_placebo_se(
         });
     }
 
+    // Compute variance from collected ATTs
+    let mut welford = WelfordState::new(1);
+    for &att in &placebo_atts {
+        welford.update(&[att]);
+    }
+    
     // Compute SE as std of placebo ATTs
     let se = welford.standard_errors()[0];
 
@@ -1751,13 +2214,18 @@ pub fn estimate(
     let pre_rmse = pre_mse.sqrt();
 
     // Compute standard error if requested
-    let (standard_error, n_placebo_used) = if config.compute_se {
+    let (standard_error, n_placebo_used, n_failed_iterations) = if config.compute_se {
         match compute_placebo_se(panel, config) {
-            Ok((se, n)) => (Some(se), Some(n)),
-            Err(_) => (None, None), // SE computation failed, but we still return the ATT
+            Ok((se, n_successful)) => {
+                // n_failed = requested - successful
+                let n_requested = config.n_placebo.min(panel.n_control());
+                let n_failed = n_requested.saturating_sub(n_successful);
+                (Some(se), Some(n_successful), Some(n_failed))
+            }
+            Err(_) => (None, None, None), // SE computation failed, but we still return the ATT
         }
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     // Determine lambda used (for penalized method)
@@ -1783,6 +2251,7 @@ pub fn estimate(
         solver_converged: weight_result.converged,
         solver_iterations: weight_result.iterations,
         n_placebo_used,
+        n_failed_iterations,
     })
 }
 

@@ -1,17 +1,20 @@
 use pyo3::prelude::*;
+use pyo3_polars::PyDataFrame;
+use polars::prelude::*;
 
 mod cluster;
+mod linalg;
 mod logistic;
 mod sdid;
 mod stats;
 mod synth_control;
 
 use cluster::{
-    build_cluster_indices, compute_cluster_se_analytical, compute_cluster_se_bootstrap,
+    build_cluster_indices, compute_cluster_se_analytical_faer, compute_cluster_se_bootstrap_faer,
     BootstrapWeightType, ClusterError, ClusterInfo,
 };
 use logistic::{
-    compute_hc3_logistic, compute_logistic_mle, compute_null_log_likelihood,
+    compute_hc3_logistic_faer, compute_logistic_mle, compute_null_log_likelihood,
     compute_pseudo_r_squared, LogisticError, LogisticRegressionResult,
 };
 use sdid::{synthetic_did_impl, SyntheticDIDResult};
@@ -44,6 +47,123 @@ fn validate_column_name(name: &str) -> PyResult<()> {
         )));
     }
     Ok(())
+}
+
+// ============================================================================
+// Arrow-based Data Extraction Helpers (Phase 3)
+// ============================================================================
+
+/// Extract a single f64 column from a Polars DataFrame
+fn extract_f64_column(df: &PyDataFrame, col_name: &str) -> PyResult<Vec<f64>> {
+    let series = df.as_ref().column(col_name)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+    let ca = series.f64()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+    let vec: Vec<f64> = ca.into_iter()
+        .map(|opt| opt.unwrap_or(f64::NAN))
+        .collect();
+    Ok(vec)
+}
+
+/// Extract multiple columns as flat row-major Vec<f64>
+fn extract_f64_columns_flat(df: &PyDataFrame, col_names: &[String]) -> PyResult<(Vec<f64>, usize, usize)> {
+    let n_rows = df.as_ref().height();
+    let n_cols = col_names.len();
+    let mut flat = Vec::with_capacity(n_rows * n_cols);
+    
+    // Pre-extract all columns ONCE (not n_rows times!)
+    let columns: Vec<_> = col_names.iter()
+        .map(|name| {
+            let series = df.as_ref().column(name)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+            series.f64()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    
+    // Interleave into row-major order
+    for i in 0..n_rows {
+        for col_ca in &columns {
+            flat.push(col_ca.get(i).unwrap_or(f64::NAN));
+        }
+    }
+    
+    Ok((flat, n_rows, n_cols))
+}
+
+/// Extract cluster column as Vec<i64> from a Polars DataFrame
+/// Handles integer, float, string, and categorical columns with automatic encoding
+fn extract_cluster_column(df: &PyDataFrame, col_name: &str, expected_len: usize) -> PyResult<Vec<i64>> {
+    let series = df.as_ref().column(col_name)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+    
+    // Check for nulls
+    if series.null_count() > 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Cluster column '{}' contains null values",
+            col_name
+        )));
+    }
+    
+    // Check if it's a categorical type and handle by casting to string
+    let is_categorical = matches!(series.dtype(), DataType::Categorical(_, _));
+    
+    // Try to extract as i64, handling various types including categorical
+    let cluster_vec: Vec<i64> = if let Ok(ca) = series.i64() {
+        ca.into_iter().map(|opt| opt.unwrap_or(0)).collect()
+    } else if let Ok(ca) = series.i32() {
+        ca.into_iter().map(|opt| opt.unwrap_or(0) as i64).collect()
+    } else if let Ok(ca) = series.f64() {
+        ca.into_iter().map(|opt| opt.unwrap_or(0.0) as i64).collect()
+    } else if let Ok(ca) = series.str() {
+        // For string columns, create unique integer encoding
+        let mut mapping = std::collections::HashMap::new();
+        let mut next_id = 0i64;
+        ca.into_iter()
+            .map(|opt| {
+                let s = opt.unwrap_or("");
+                *mapping.entry(s.to_string()).or_insert_with(|| {
+                    let id = next_id;
+                    next_id += 1;
+                    id
+                })
+            })
+            .collect()
+    } else if is_categorical {
+        // For categorical columns, cast to string first then encode
+        let str_series = series.cast(&DataType::String)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+        let ca = str_series.str()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+        let mut mapping = std::collections::HashMap::new();
+        let mut next_id = 0i64;
+        ca.into_iter()
+            .map(|opt| {
+                let s = opt.unwrap_or("");
+                *mapping.entry(s.to_string()).or_insert_with(|| {
+                    let id = next_id;
+                    next_id += 1;
+                    id
+                })
+            })
+            .collect()
+    } else {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Cluster column '{}' has unsupported dtype; expected integer, float, string, or categorical",
+            col_name
+        )));
+    };
+    
+    if cluster_vec.len() != expected_len {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Cluster column must have same length as data: {} has {}, expected {}",
+            col_name,
+            cluster_vec.len(),
+            expected_len
+        )));
+    }
+    
+    Ok(cluster_vec)
 }
 
 /// Parse bootstrap_method string to BootstrapWeightType enum.
@@ -89,8 +209,7 @@ fn get_cluster_se_type(weight_type: BootstrapWeightType) -> String {
 // Refactoring into a config struct would reduce API clarity for Python users.
 #[allow(clippy::too_many_arguments)]
 fn linear_regression(
-    py: Python,
-    df: PyObject,
+    df: PyDataFrame,
     x_cols: Vec<String>,
     y_col: &str,
     include_intercept: bool,
@@ -147,112 +266,36 @@ fn linear_regression(
         validate_column_name(cluster_col)?;
     }
 
-    // Extract y column from Polars DataFrame
-    let y_series = df.getattr(py, "get_column")?.call1(py, (y_col,))?;
-    let y_array = y_series.call_method0(py, "to_numpy")?;
-    let y_vec: Vec<f64> = y_array.extract(py)?;
-
-    // Extract x columns from Polars DataFrame
-    let mut x_matrix: Vec<Vec<f64>> = Vec::new();
+    // OPTIMIZED: Extract y column using native Arrow path (Phase 3)
+    let y_vec = extract_f64_column(&df, y_col)?;
     let n_rows = y_vec.len();
 
-    // Initialize x_matrix with n_rows empty vectors
-    for _ in 0..n_rows {
-        x_matrix.push(Vec::new());
+    // OPTIMIZED: Extract all x columns using native Arrow path (Phase 3)
+    let (x_flat, _, n_x_cols) = extract_f64_columns_flat(&df, &x_cols)?;
+
+    // Validate dimensions
+    if x_flat.len() != n_rows * n_x_cols {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "X matrix dimension mismatch: expected {} elements ({}×{}), got {}",
+            n_rows * n_x_cols,
+            n_rows,
+            n_x_cols,
+            x_flat.len()
+        )));
     }
 
-    // Extract each x column and add to the matrix
-    for col_name in &x_cols {
-        let x_series = df
-            .getattr(py, "get_column")?
-            .call1(py, (col_name.as_str(),))?;
-        let x_array = x_series.call_method0(py, "to_numpy")?;
-        let x_vec: Vec<f64> = x_array.extract(py)?;
-
-        if x_vec.len() != n_rows {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "All columns must have the same length: {} has {}, expected {}",
-                col_name,
-                x_vec.len(),
-                n_rows
-            )));
-        }
-
-        // Add this column's values to each row
-        for (i, val) in x_vec.iter().enumerate() {
-            x_matrix[i].push(*val);
-        }
-    }
-
-    // Extract cluster column if specified
+    // Extract cluster column if specified using native Arrow path
     let cluster_ids: Option<Vec<i64>> = if let Some(cluster_col) = cluster {
-        let cluster_series = df.getattr(py, "get_column")?.call1(py, (cluster_col,))?;
-
-        // Check for nulls
-        let null_count: usize = cluster_series.call_method0(py, "null_count")?.extract(py)?;
-        if null_count > 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Cluster column '{}' contains null values",
-                cluster_col
-            )));
-        }
-
-        // Try to extract as i64 directly, or convert via unique_id mapping
-        // First, try direct i64 extraction
-        let cluster_array = cluster_series.call_method0(py, "to_numpy")?;
-
-        // Try extracting as i64
-        let cluster_vec_result: Result<Vec<i64>, _> = cluster_array.extract(py);
-
-        let cluster_vec = match cluster_vec_result {
-            Ok(v) => v,
-            Err(_) => {
-                // Try f64 and cast
-                let f64_result: Result<Vec<f64>, _> = cluster_array.extract(py);
-                match f64_result {
-                    Ok(v) => v.iter().map(|&x| x as i64).collect(),
-                    Err(_) => {
-                        // For string columns, use unique encoding
-                        // Cast to string and get unique integer codes
-                        let unique = cluster_series.call_method0(py, "unique")?;
-                        let unique_list: Vec<String> =
-                            unique.call_method0(py, "to_list")?.extract(py)?;
-
-                        let string_list: Vec<String> =
-                            cluster_series.call_method0(py, "to_list")?.extract(py)?;
-
-                        // Create mapping from string to integer ID
-                        let mut mapping = std::collections::HashMap::new();
-                        for (i, s) in unique_list.iter().enumerate() {
-                            mapping.insert(s.clone(), i as i64);
-                        }
-
-                        string_list
-                            .iter()
-                            .map(|s| *mapping.get(s).unwrap())
-                            .collect()
-                    }
-                }
-            }
-        };
-
-        if cluster_vec.len() != n_rows {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Cluster column must have same length as data: {} has {}, expected {}",
-                cluster_col,
-                cluster_vec.len(),
-                n_rows
-            )));
-        }
-
-        Some(cluster_vec)
+        Some(extract_cluster_column(&df, cluster_col, n_rows)?)
     } else {
         None
     };
 
-    // Compute regression with optional clustering
-    compute_linear_regression_with_cluster(
-        &x_matrix,
+    // Compute regression with optional clustering using optimized flat data path
+    compute_linear_regression_flat(
+        &x_flat,
+        n_rows,
+        n_x_cols,
         &y_vec,
         include_intercept,
         cluster_ids.as_deref(),
@@ -263,9 +306,15 @@ fn linear_regression(
     )
 }
 
-/// Compute linear regression with optional clustered standard errors
-fn compute_linear_regression_with_cluster(
-    x: &[Vec<f64>],
+/// Optimized linear regression computation using flat data directly.
+///
+/// This function builds the faer::Mat directly from flat array data,
+/// eliminating intermediate Vec<Vec<f64>> allocations for the common non-clustered case.
+#[allow(clippy::too_many_arguments)]
+fn compute_linear_regression_flat(
+    x_flat: &[f64],
+    n_rows: usize,
+    n_x_cols: usize,
     y: &[f64],
     include_intercept: bool,
     cluster_ids: Option<&[i64]>,
@@ -274,58 +323,29 @@ fn compute_linear_regression_with_cluster(
     seed: Option<u64>,
     weight_type: BootstrapWeightType,
 ) -> PyResult<LinearRegressionResult> {
-    if x.is_empty() {
+    if n_rows == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "Cannot perform regression on empty data",
         ));
     }
 
-    let n = x.len();
-    if n != y.len() {
+    if n_rows != y.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "x and y must have the same number of rows: x has {}, y has {}",
-            n,
+            n_rows,
             y.len()
         )));
     }
 
-    if n == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Cannot perform regression on empty data",
-        ));
-    }
-
-    let n_vars = x[0].len();
-    if n_vars == 0 {
+    if n_x_cols == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "x must have at least one variable",
         ));
     }
 
-    // Check all rows have same number of variables
-    for (i, row) in x.iter().enumerate() {
-        if row.len() != n_vars {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "All rows in x must have the same number of variables: row {} has {}, expected {}",
-                i,
-                row.len(),
-                n_vars
-            )));
-        }
-    }
-
-    // Build design matrix X
-    let mut design_matrix = Vec::new();
-    for x_row in x.iter() {
-        let mut row = Vec::new();
-        if include_intercept {
-            row.push(1.0); // Add intercept column
-        }
-        row.extend_from_slice(x_row);
-        design_matrix.push(row);
-    }
-
-    let n_params = design_matrix[0].len();
+    let n = n_rows;
+    let n_vars = n_x_cols;
+    let n_params = if include_intercept { n_x_cols + 1 } else { n_x_cols };
 
     // Check if we have enough samples
     if n < n_params {
@@ -335,45 +355,24 @@ fn compute_linear_regression_with_cluster(
         )));
     }
 
-    // Compute X'X
-    let mut xtx = vec![vec![0.0; n_params]; n_params];
-    for (i, xtx_row) in xtx.iter_mut().enumerate() {
-        for j in 0..n_params {
-            let mut sum = 0.0;
-            for dm_row in design_matrix.iter() {
-                sum += dm_row[i] * dm_row[j];
-            }
-            xtx_row[j] = sum;
-        }
-    }
+    // OPTIMIZED: Build design matrix directly from flat data using faer::Mat
+    // This skips the Vec<Vec<f64>> intermediate format entirely
+    let x_faer = linalg::flat_to_mat_with_intercept(x_flat, n_rows, n_x_cols, include_intercept);
 
-    // Compute X'y
-    let mut xty = vec![0.0; n_params];
-    for (i, xty_val) in xty.iter_mut().enumerate() {
-        let mut sum = 0.0;
-        for (dm_row, &y_val) in design_matrix.iter().zip(y.iter()) {
-            sum += dm_row[i] * y_val;
-        }
-        *xty_val = sum;
-    }
+    // Compute X'X using faer (BLAS gemm)
+    let xtx_faer = linalg::xtx(&x_faer);
 
-    // Compute (X'X)^-1
-    let xtx_inv = invert_matrix(&xtx)?;
+    // Compute X'y using faer
+    let xty_vec = linalg::xty(&x_faer, y);
 
-    // Compute coefficients: β = (X'X)^-1 X'y
-    let coefficients_full = matrix_vector_multiply(&xtx_inv, &xty);
+    // Compute (X'X)^-1 using Cholesky decomposition
+    let xtx_inv_faer = linalg::invert_xtx(&xtx_faer)?;
 
-    // Compute fitted values: ŷ = Xβ
-    let fitted_values: Vec<f64> = design_matrix
-        .iter()
-        .map(|dm_row| {
-            coefficients_full
-                .iter()
-                .zip(dm_row.iter())
-                .map(|(&coef, &dm_val)| coef * dm_val)
-                .sum()
-        })
-        .collect();
+    // Compute coefficients: β = (X'X)^-1 X'y via Cholesky solve
+    let coefficients_full = linalg::solve_normal_equations(&xtx_faer, &xty_vec)?;
+
+    // Compute fitted values: ŷ = Xβ using faer
+    let fitted_values = linalg::mat_vec_mul(&x_faer, &coefficients_full);
 
     // Compute residuals: e = y - ŷ
     let residuals: Vec<f64> = (0..n).map(|i| y[i] - fitted_values[i]).collect();
@@ -423,13 +422,14 @@ fn compute_linear_regression_with_cluster(
 
         let n_clusters = cluster_info.n_clusters;
 
+        // OPTIMIZED: Use faer matrices directly (no Vec<Vec<f64>> design_matrix overhead)
         if bootstrap {
-            // Wild cluster bootstrap
-            let (coef_se, int_se) = compute_cluster_se_bootstrap(
-                    &design_matrix,
+            // Wild cluster bootstrap with faer matrices
+            let (coef_se, int_se) = compute_cluster_se_bootstrap_faer(
+                    &x_faer,
                     &fitted_values,
                     &residuals,
-                    &xtx_inv,
+                    &xtx_inv_faer,
                     &cluster_info,
                     bootstrap_iterations,
                     seed,
@@ -454,11 +454,11 @@ fn compute_linear_regression_with_cluster(
                 Some(bootstrap_iterations),
             )
         } else {
-            // Analytical clustered SE
-            let (coef_se, int_se) = compute_cluster_se_analytical(
-                    &design_matrix,
+            // Analytical clustered SE with faer matrices
+            let (coef_se, int_se) = compute_cluster_se_analytical_faer(
+                    &x_faer,
                     &residuals,
-                    &xtx_inv,
+                    &xtx_inv_faer,
                     &cluster_info,
                     include_intercept,
                 ).map_err(|e| {
@@ -498,16 +498,23 @@ fn compute_linear_regression_with_cluster(
                 (None, vec![0.0; n_vars], None, None, None)
             }
         } else {
-            // Compute HC3 leverages
-            let leverages = compute_leverages(&design_matrix, &xtx_inv)?;
-            let hc3_vcov = compute_hc3_vcov(&design_matrix, &residuals, &leverages, &xtx_inv);
+            // Compute HC3 leverages using optimized faer batch computation
+            let leverages = linalg::compute_leverages_batch(&x_faer, &xtx_inv_faer)?;
+
+            // Compute HC3 variance-covariance matrix using faer
+            let hc3_vcov_faer =
+                linalg::compute_hc3_vcov_faer(&x_faer, &residuals, &leverages, &xtx_inv_faer);
 
             if include_intercept {
-                let intercept_se_val = hc3_vcov[0][0].sqrt();
-                let se_vec: Vec<f64> = (1..n_params).map(|i| hc3_vcov[i][i].sqrt()).collect();
+                let intercept_se_val = hc3_vcov_faer.read(0, 0).sqrt();
+                let se_vec: Vec<f64> = (1..n_params)
+                    .map(|i| hc3_vcov_faer.read(i, i).sqrt())
+                    .collect();
                 (Some(intercept_se_val), se_vec, None, None, None)
             } else {
-                let se_vec: Vec<f64> = (0..n_params).map(|i| hc3_vcov[i][i].sqrt()).collect();
+                let se_vec: Vec<f64> = (0..n_params)
+                    .map(|i| hc3_vcov_faer.read(i, i).sqrt())
+                    .collect();
                 (None, se_vec, None, None, None)
             }
         }
@@ -541,182 +548,6 @@ fn compute_linear_regression_with_cluster(
     })
 }
 
-/// Invert a square matrix using Gauss-Jordan elimination with partial pivoting
-fn invert_matrix(a: &[Vec<f64>]) -> PyResult<Vec<Vec<f64>>> {
-    let n = a.len();
-    if n == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Cannot invert empty matrix",
-        ));
-    }
-
-    // Verify square matrix
-    for row in a.iter() {
-        if row.len() != n {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "Cannot invert non-square matrix",
-            ));
-        }
-    }
-
-    // Create augmented matrix [A|I]
-    let mut aug: Vec<Vec<f64>> = Vec::with_capacity(n);
-    for (i, a_row) in a.iter().enumerate() {
-        let mut row = Vec::with_capacity(2 * n);
-        row.extend_from_slice(a_row);
-        for j in 0..n {
-            row.push(if i == j { 1.0 } else { 0.0 });
-        }
-        aug.push(row);
-    }
-
-    // Gauss-Jordan elimination with partial pivoting
-    for col in 0..n {
-        // Find pivot
-        let mut max_row = col;
-        let mut max_val = aug[col][col].abs();
-        #[allow(clippy::needless_range_loop)]
-        for row in (col + 1)..n {
-            // Index needed for row swapping and in-place modification
-            let val = aug[row][col].abs();
-            if val > max_val {
-                max_val = val;
-                max_row = row;
-            }
-        }
-
-        if max_val < 1e-10 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "Singular matrix: cannot solve linear regression (X'X is not invertible, check for collinearity)"
-            ));
-        }
-
-        if max_row != col {
-            aug.swap(col, max_row);
-        }
-
-        let pivot = aug[col][col];
-        for j in 0..(2 * n) {
-            aug[col][j] /= pivot;
-        }
-
-        for row in 0..n {
-            if row != col {
-                let factor = aug[row][col];
-                for j in 0..(2 * n) {
-                    aug[row][j] -= factor * aug[col][j];
-                }
-            }
-        }
-    }
-
-    // Extract inverse
-    let mut inverse: Vec<Vec<f64>> = Vec::with_capacity(n);
-    for aug_row in aug.iter() {
-        inverse.push(aug_row[n..(2 * n)].to_vec());
-    }
-
-    Ok(inverse)
-}
-
-/// Multiply a matrix by a vector
-fn matrix_vector_multiply(a: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
-    let m = a.len();
-    let mut result = Vec::with_capacity(m);
-
-    for row in a.iter() {
-        let mut sum = 0.0;
-        for (j, &val) in row.iter().enumerate() {
-            sum += val * v[j];
-        }
-        result.push(sum);
-    }
-
-    result
-}
-
-/// Multiply two matrices
-fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let m = a.len();
-    if m == 0 {
-        return vec![];
-    }
-    let k = a[0].len();
-    if k == 0 || b.is_empty() {
-        return vec![vec![]; m];
-    }
-    let n = b[0].len();
-
-    let mut result = vec![vec![0.0; n]; m];
-
-    for (i, a_row) in a.iter().enumerate() {
-        for j in 0..n {
-            let mut sum = 0.0;
-            for (l, &a_val) in a_row.iter().enumerate() {
-                sum += a_val * b[l][j];
-            }
-            result[i][j] = sum;
-        }
-    }
-
-    result
-}
-
-/// Compute leverage values h_ii = x_i' (X'X)^-1 x_i
-fn compute_leverages(design_matrix: &[Vec<f64>], xtx_inv: &[Vec<f64>]) -> PyResult<Vec<f64>> {
-    let n = design_matrix.len();
-    let mut leverages = Vec::with_capacity(n);
-
-    for (i, x_i) in design_matrix.iter().enumerate() {
-        let temp = matrix_vector_multiply(xtx_inv, x_i);
-
-        let mut h_ii = 0.0;
-        for (j, &x_ij) in x_i.iter().enumerate() {
-            h_ii += x_ij * temp[j];
-        }
-
-        if h_ii >= 0.99 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!(
-                    "Observation {} has leverage ≥ 0.99; HC3 standard errors may be unreliable due to extreme leverage.",
-                    i
-                )
-            ));
-        }
-
-        leverages.push(h_ii);
-    }
-
-    Ok(leverages)
-}
-
-/// Compute HC3 variance-covariance matrix using the sandwich formula
-fn compute_hc3_vcov(
-    design_matrix: &[Vec<f64>],
-    residuals: &[f64],
-    leverages: &[f64],
-    xtx_inv: &[Vec<f64>],
-) -> Vec<Vec<f64>> {
-    let _n = design_matrix.len();
-    let p = xtx_inv.len();
-
-    let mut meat = vec![vec![0.0; p]; p];
-
-    for (i, dm_row) in design_matrix.iter().enumerate() {
-        let one_minus_h = 1.0 - leverages[i];
-        let omega_ii = residuals[i].powi(2) / one_minus_h.powi(2);
-
-        for (j, meat_row) in meat.iter_mut().enumerate() {
-            for k in 0..p {
-                meat_row[k] += dm_row[j] * omega_ii * dm_row[k];
-            }
-        }
-    }
-
-    let temp = matrix_multiply(xtx_inv, &meat);
-    matrix_multiply(&temp, xtx_inv)
-}
-
 // ============================================================================
 // Logistic Regression
 // ============================================================================
@@ -745,8 +576,7 @@ fn compute_hc3_vcov(
 // Refactoring into a config struct would reduce API clarity for Python users.
 #[allow(clippy::too_many_arguments)]
 fn logistic_regression(
-    py: Python,
-    df: PyObject,
+    df: PyDataFrame,
     x_cols: Vec<String>,
     y_col: &str,
     include_intercept: bool,
@@ -803,11 +633,8 @@ fn logistic_regression(
         validate_column_name(cluster_col)?;
     }
 
-    // Extract y column from Polars DataFrame
-    let y_series = df.getattr(py, "get_column")?.call1(py, (y_col,))?;
-    let y_array = y_series.call_method0(py, "to_numpy")?;
-    let y_vec: Vec<f64> = y_array.extract(py)?;
-
+    // OPTIMIZED: Extract y column using native Arrow path (Phase 3)
+    let y_vec = extract_f64_column(&df, y_col)?;
     let n_rows = y_vec.len();
 
     // Validate empty DataFrame (REQ-102)
@@ -835,102 +662,32 @@ fn logistic_regression(
         ));
     }
 
-    // Extract x columns from Polars DataFrame
-    let mut x_matrix: Vec<Vec<f64>> = Vec::new();
+    // OPTIMIZED: Extract all x columns using native Arrow path (Phase 3)
+    let (x_flat, _, n_x_cols) = extract_f64_columns_flat(&df, &x_cols)?;
 
-    // Initialize x_matrix with n_rows empty vectors
-    for _ in 0..n_rows {
-        x_matrix.push(Vec::new());
+    // Validate dimensions
+    if x_flat.len() != n_rows * n_x_cols {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "X matrix dimension mismatch: expected {} elements ({}×{}), got {}",
+            n_rows * n_x_cols,
+            n_rows,
+            n_x_cols,
+            x_flat.len()
+        )));
     }
 
-    // Extract each x column and add to the matrix
-    for col_name in &x_cols {
-        let x_series = df
-            .getattr(py, "get_column")?
-            .call1(py, (col_name.as_str(),))?;
-        let x_array = x_series.call_method0(py, "to_numpy")?;
-        let x_vec: Vec<f64> = x_array.extract(py)?;
-
-        if x_vec.len() != n_rows {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "All columns must have the same length: {} has {}, expected {}",
-                col_name,
-                x_vec.len(),
-                n_rows
-            )));
-        }
-
-        // Add this column's values to each row
-        for (i, val) in x_vec.iter().enumerate() {
-            x_matrix[i].push(*val);
-        }
-    }
-
-    // Extract cluster column if specified
+    // Extract cluster column if specified using native Arrow path
     let cluster_ids: Option<Vec<i64>> = if let Some(cluster_col) = cluster {
-        let cluster_series = df.getattr(py, "get_column")?.call1(py, (cluster_col,))?;
-
-        // Check for nulls (REQ-107)
-        let null_count: usize = cluster_series.call_method0(py, "null_count")?.extract(py)?;
-        if null_count > 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Cluster column '{}' contains null values",
-                cluster_col
-            )));
-        }
-
-        // Try to extract as i64 directly, or convert via unique_id mapping
-        let cluster_array = cluster_series.call_method0(py, "to_numpy")?;
-        let cluster_vec_result: Result<Vec<i64>, _> = cluster_array.extract(py);
-
-        let cluster_vec = match cluster_vec_result {
-            Ok(v) => v,
-            Err(_) => {
-                // Try f64 and cast
-                let f64_result: Result<Vec<f64>, _> = cluster_array.extract(py);
-                match f64_result {
-                    Ok(v) => v.iter().map(|&x| x as i64).collect(),
-                    Err(_) => {
-                        // For string columns, use unique encoding
-                        let unique = cluster_series.call_method0(py, "unique")?;
-                        let unique_list: Vec<String> =
-                            unique.call_method0(py, "to_list")?.extract(py)?;
-
-                        let string_list: Vec<String> =
-                            cluster_series.call_method0(py, "to_list")?.extract(py)?;
-
-                        // Create mapping from string to integer ID
-                        let mut mapping = std::collections::HashMap::new();
-                        for (i, s) in unique_list.iter().enumerate() {
-                            mapping.insert(s.clone(), i as i64);
-                        }
-
-                        string_list
-                            .iter()
-                            .map(|s| *mapping.get(s).unwrap())
-                            .collect()
-                    }
-                }
-            }
-        };
-
-        if cluster_vec.len() != n_rows {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Cluster column must have same length as data: {} has {}, expected {}",
-                cluster_col,
-                cluster_vec.len(),
-                n_rows
-            )));
-        }
-
-        Some(cluster_vec)
+        Some(extract_cluster_column(&df, cluster_col, n_rows)?)
     } else {
         None
     };
 
-    // Compute logistic regression with optional clustering
-    compute_logistic_regression_with_cluster(
-        &x_matrix,
+    // Compute logistic regression with optional clustering using optimized flat data path
+    compute_logistic_regression_flat(
+        &x_flat,
+        n_rows,
+        n_x_cols,
         &y_vec,
         include_intercept,
         cluster_ids.as_deref(),
@@ -941,9 +698,15 @@ fn logistic_regression(
     )
 }
 
-/// Compute logistic regression with optional clustered standard errors
-fn compute_logistic_regression_with_cluster(
-    x: &[Vec<f64>],
+/// Optimized logistic regression computation using flat data directly.
+///
+/// This function builds the faer::Mat directly from flat array data,
+/// eliminating intermediate Vec<Vec<f64>> allocations for the common non-clustered case.
+#[allow(clippy::too_many_arguments)]
+fn compute_logistic_regression_flat(
+    x_flat: &[f64],
+    n_rows: usize,
+    n_x_cols: usize,
     y: &[f64],
     include_intercept: bool,
     cluster_ids: Option<&[i64]>,
@@ -952,21 +715,14 @@ fn compute_logistic_regression_with_cluster(
     seed: Option<u64>,
     weight_type: BootstrapWeightType,
 ) -> PyResult<LogisticRegressionResult> {
-    let n = x.len();
+    let n = n_rows;
 
-    // Build design matrix X
-    let mut design_matrix: Vec<Vec<f64>> = Vec::new();
-    for x_row in x.iter() {
-        let mut row = Vec::new();
-        if include_intercept {
-            row.push(1.0); // Add intercept column
-        }
-        row.extend_from_slice(x_row);
-        design_matrix.push(row);
-    }
+    // OPTIMIZED: Build design matrix directly from flat data using faer::Mat
+    // This skips the Vec<Vec<f64>> intermediate format entirely
+    let design_mat_faer = linalg::flat_to_mat_with_intercept(x_flat, n_rows, n_x_cols, include_intercept);
 
-    // Run MLE optimization
-    let mle_result = compute_logistic_mle(&design_matrix, y).map_err(|e| match e {
+    // Run MLE optimization with faer::Mat directly
+    let mle_result = compute_logistic_mle(&design_mat_faer, y).map_err(|e| match e {
         LogisticError::PerfectSeparation => pyo3::exceptions::PyValueError::new_err(
             "Perfect separation detected; logistic regression cannot converge",
         ),
@@ -1019,6 +775,21 @@ fn compute_logistic_regression_with_cluster(
         })?;
 
         let n_clusters = cluster_info.n_clusters;
+
+        // Build design matrix Vec<Vec<f64>> for cluster SE functions (only when clustering)
+        let design_matrix: Vec<Vec<f64>> = (0..n_rows)
+            .map(|i| {
+                let row_start = i * n_x_cols;
+                if include_intercept {
+                    let mut row = Vec::with_capacity(n_x_cols + 1);
+                    row.push(1.0);
+                    row.extend_from_slice(&x_flat[row_start..row_start + n_x_cols]);
+                    row
+                } else {
+                    x_flat[row_start..row_start + n_x_cols].to_vec()
+                }
+            })
+            .collect();
 
         if bootstrap {
             // Score bootstrap for logistic regression
@@ -1082,8 +853,11 @@ fn compute_logistic_regression_with_cluster(
             )
         }
     } else {
-        // Non-clustered: use HC3
-        let se = compute_hc3_logistic(&design_matrix, y, &mle_result.pi, &mle_result.info_inv)
+        // Non-clustered: use HC3 with faer matrices directly (no Vec<Vec<f64>> overhead)
+        // Convert info_inv from Vec<Vec<f64>> to faer::Mat for HC3 computation
+        let info_inv_mat = linalg::vec_to_mat(&mle_result.info_inv);
+
+        let se = compute_hc3_logistic_faer(&design_mat_faer, y, &mle_result.pi, &info_inv_mat)
             .map_err(|e| match e {
                 LogisticError::NumericalInstability { message } => {
                     pyo3::exceptions::PyValueError::new_err(message)

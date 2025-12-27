@@ -5,6 +5,111 @@ All notable changes to the causers project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2025-12-27
+
+### 🎯 Overview: Performance Diagnostics and Improvements
+
+Version 0.6.0 is a performance-focused release that introduces optimized matrix operations, comprehensive benchmark infrastructure, and measurable speedups across all statistical methods. This release consolidates the 0.5.x feature set while delivering faster computation and diagnostic tooling.
+
+### ⚡ Performance Improvements
+
+#### Triangular Matrix Multiplication
+
+The X'WX computation in logistic regression now uses [`faer::linalg::matmul::triangular`](src/linalg.rs:7) to exploit matrix symmetry:
+- Only computes lower triangle of symmetric result (~50% fewer FLOPs)
+- Automatic symmetry fill for Cholesky compatibility
+- Applied to all weighted Gram matrix calculations
+
+#### Flat Data Path Optimization
+
+New [`compute_linear_regression_flat()`](src/lib.rs:314) and [`compute_logistic_regression_flat()`](src/lib.rs:706) functions eliminate intermediate allocations:
+- Build faer::Mat directly from flat array data via [`flat_to_mat_with_intercept()`](src/linalg.rs:83)
+- Skip Vec<Vec<f64>> intermediate format entirely
+- Reduces memory allocation overhead for large datasets
+
+#### In-Place Newton-Raphson Operations
+
+Dedicated in-place functions in [`src/linalg.rs`](src/linalg.rs:692) optimize the logistic regression inner loop:
+- [`mat_vec_mul_inplace_direct()`](src/linalg.rs:706): Direct loops for small p, avoiding SIMD overhead
+- [`compute_xtr_inplace_direct()`](src/linalg.rs:769): Zero-allocation gradient computation
+- [`compute_xtwx_inplace()`](src/linalg.rs:836): Reuses pre-allocated buffers across iterations
+- [`sigmoid_inplace()`](src/linalg.rs:878): In-place sigmoid with numerical stability
+
+#### Rayon Parallelization
+
+All matrix operations use automatic thread pool parallelization:
+```rust
+Parallelism::Rayon(0)  // 0 = auto-detect thread count
+```
+
+### 📊 Benchmark Infrastructure
+
+#### Comparative Performance Suite
+
+New [`tests/benchmark_performance.py`](tests/benchmark_performance.py) and [`tests/test_benchmark_performance.py`](tests/test_benchmark_performance.py) provide:
+- Head-to-head timing vs reference packages (statsmodels, azcausal, pysyncon)
+- Warmup runs and median timing for stable measurements
+- Automated pass/fail based on speedup ratios
+- Coverage across dataset sizes (1K–100K rows), variable counts (2–50), and SE types
+
+```bash
+python tests/benchmark_performance.py
+```
+
+#### Performance Validation Tests
+
+[`tests/test_performance.py`](tests/test_performance.py) validates:
+- **Scaling behavior**: 1K → 100K → 1M → 5M rows
+- **Consistency**: CV < 20% across 10 runs
+- **Webb parity**: Webb bootstrap ≤ 1.10× Rademacher time (REQ-PERF-001)
+- **Worst-case data**: Large scale differences handled efficiently
+
+#### Benchmark Configurations
+
+Comprehensive test matrix in [`tests/test_benchmark_performance.py`](tests/test_benchmark_performance.py:144):
+- Observations: 1,000 | 10,000 | 100,000
+- Variables: 2 | 10 | 50
+- SE types: HC3 | Clustered (balanced) | Clustered (imbalanced)
+- Methods: Linear, Logistic, SDID, SC (all 4 variants)
+
+### 📈 Performance Results
+
+Typical speedups vs reference implementations (Apple M1 Pro):
+
+| Method | vs Reference | Speedup |
+|--------|--------------|---------|
+| Linear regression (HC3) | statsmodels | 2–6× (median 4×) |
+| Logistic regression (HC3) | statsmodels | 1–4× (median 1.4×) |
+| Synthetic DID | azcausal | 14–28× |
+| Synthetic Control | pysyncon | 137–368× |
+
+Absolute timings (1M rows, single covariate):
+- Linear regression + HC3: ~250ms
+- Logistic regression + HC3: ~400ms
+
+### ✅ Validation
+
+All methods validated against reference implementations:
+- Linear/Logistic regression: statsmodels (rtol=1e-6)
+- Wild cluster bootstrap: wildboottest (rtol=1e-2)
+- Synthetic DID: azcausal (ATT rtol=1e-6, SE rtol=0.5)
+- Synthetic Control: pysyncon (traditional method parity)
+
+**Test Coverage:**
+- 193+ tests passing
+- 100% Python API coverage
+- Property-based testing with Hypothesis
+
+### ⚠️ Breaking Changes
+
+None. All existing code continues to work unchanged.
+
+### 📦 Dependencies
+
+No new runtime dependencies. Uses existing `faer::linalg::matmul::triangular` module (faer v0.20).
+
+---
+
 ## [0.5.1] - 2025-12-26
 
 ### Documentation
@@ -531,6 +636,8 @@ MIT License - see LICENSE file for details.
 
 ---
 
+[0.6.0]: https://github.com/causers/causers/releases/tag/v0.6.0
+[0.5.2]: https://github.com/causers/causers/releases/tag/v0.5.2
 [0.5.1]: https://github.com/causers/causers/releases/tag/v0.5.1
 [0.5.0]: https://github.com/causers/causers/releases/tag/v0.5.0
 [0.4.0]: https://github.com/causers/causers/releases/tag/v0.4.0

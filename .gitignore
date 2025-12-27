@@ -1,5 +1,6 @@
 # Build artifacts
 spec*/
+plans/
 AGENTS.md
 constitution.md
 target/

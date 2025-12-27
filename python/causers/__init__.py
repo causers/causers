@@ -9,7 +9,7 @@ from typing import List as _List, Optional as _Optional, Union as _Union
 import warnings as _warnings
 import polars as _polars
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 # Import the Rust extension module
 from causers._causers import (
@@ -748,9 +748,9 @@ def synthetic_did(
         if val not in valid_treatment_values:
             raise ValueError("treatment_col must contain only 0 and 1 values")
     
-    # Check bootstrap_iterations >= 1
-    if bootstrap_iterations < 1:
-        raise ValueError("bootstrap_iterations must be at least 1")
+    # Check bootstrap_iterations >= 0 (0 = no bootstrap, ATT only)
+    if bootstrap_iterations < 0:
+        raise ValueError("bootstrap_iterations must be at least 0")
     
     # ========================================================================
     # Panel Structure Detection
@@ -843,14 +843,11 @@ def synthetic_did(
     # Sort DataFrame by unit, then time for consistent ordering
     df_sorted = df.sort([unit_col, time_col])
     
-    # Create outcome array in row-major order: outcomes[unit_idx * n_periods + period_idx]
-    outcomes = []
-    for unit in unique_units:
-        unit_df = df_sorted.filter(_polars.col(unit_col) == unit).sort(time_col)
-        outcomes.extend(unit_df[outcome_col].to_list())
-    
-    # Convert to flat list of floats
-    outcomes = [float(v) for v in outcomes]
+    # OPTIMIZED: Use vectorized extraction instead of per-unit filter loop
+    # Since df is sorted by (unit, time), outcomes are already in row-major order:
+    # [unit_0_period_0, unit_0_period_1, ..., unit_N-1_period_T-1]
+    # This is O(1) extraction vs O(n_units × n_periods) for the filter loop
+    outcomes = df_sorted[outcome_col].cast(_polars.Float64).to_list()
     
     # Create index arrays
     control_indices = [unit_to_idx[u] for u in control_units]
@@ -1299,14 +1296,11 @@ def synthetic_control(
     # Sort DataFrame by unit, then time for consistent ordering
     df_sorted = df.sort([unit_col, time_col])
     
-    # Create outcome array in row-major order: outcomes[unit_idx * n_periods + period_idx]
-    outcomes = []
-    for unit in unique_units:
-        unit_df = df_sorted.filter(_polars.col(unit_col) == unit).sort(time_col)
-        outcomes.extend(unit_df[outcome_col].to_list())
-    
-    # Convert to flat list of floats
-    outcomes = [float(v) for v in outcomes]
+    # OPTIMIZED: Use vectorized extraction instead of per-unit filter loop
+    # Since df is sorted by (unit, time), outcomes are already in row-major order:
+    # [unit_0_period_0, unit_0_period_1, ..., unit_N-1_period_T-1]
+    # This is O(1) extraction vs O(n_units × n_periods) for the filter loop
+    outcomes = df_sorted[outcome_col].cast(_polars.Float64).to_list()
     
     # Create index arrays
     control_indices = [unit_to_idx[u] for u in control_units]

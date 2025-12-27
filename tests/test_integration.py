@@ -63,12 +63,12 @@ class TestIntegration:
         Tests that the package works correctly when data
         undergoes typical preprocessing steps.
         """
-        # Original data
+        # Original data - cast to Float64 for Rust compatibility
         df = pl.DataFrame({
             "feature1": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             "feature2": [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
             "target": [15, 28, 42, 55, 69, 82, 96, 109, 123, 136]
-        })
+        }).cast({"feature1": pl.Float64, "feature2": pl.Float64, "target": pl.Float64})
         
         # Transform: normalize feature1
         df = df.with_columns([
@@ -293,17 +293,11 @@ class TestIntegration:
     
     def test_workflow_with_string_to_numeric_conversion(self):
         """Test workflow when numeric data needs type conversion."""
-        # Create DataFrame with integer columns
+        # Create DataFrame with integer columns and convert to Float64
         df = pl.DataFrame({
             "x": pl.Series([1, 2, 3, 4, 5], dtype=pl.Int32),
             "y": pl.Series([2, 4, 6, 8, 10], dtype=pl.Int32)
-        })
-        
-        # Convert to float64 (as required by the function)
-        df = df.with_columns([
-            pl.col("x").cast(pl.Float64),
-            pl.col("y").cast(pl.Float64)
-        ])
+        }).cast({"x": pl.Float64, "y": pl.Float64})
         
         result = linear_regression(df, "x", "y")
         
