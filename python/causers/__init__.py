@@ -5,11 +5,32 @@ A Python package with Rust backend for fast statistical computations
 on Polars DataFrames.
 """
 
+# ============================================================
+# IMPORTS
+# ============================================================
+
 from typing import List as _List, Optional as _Optional, Union as _Union
 import warnings as _warnings
-import polars as _polars
+import polars as _pl
+from polars.exceptions import ColumnNotFoundError as _ColumnNotFoundError
 
-__version__ = "0.6.0"
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+_CLUSTER_BALANCE_THRESHOLD = 0.5  # Warn if single cluster has >50% of observations
+_SMALL_CLUSTER_THRESHOLD = 42     # Recommend bootstrap when clusters < 42
+_WEIGHT_CONCENTRATION_THRESHOLD = 0.5  # Warn if single unit/period weight > 50%
+_MIN_RELIABLE_BOOTSTRAP_ITERATIONS = 100  # Minimum for reliable SE estimates
+_POOR_FIT_RMSE_RATIO = 0.1  # Warn if RMSE > 10% of outcome std
+
+
+# ============================================================
+# EXPORTS
+# ============================================================
+
+__version__ = "0.7.0"
 
 # Import the Rust extension module
 from causers._causers import (
@@ -17,27 +38,96 @@ from causers._causers import (
     LogisticRegressionResult,
     SyntheticDIDResult,
     SyntheticControlResult,
+    DMLResult,
+    TwoStageLSResult,
     linear_regression as _linear_regression_rust,
     logistic_regression as _logistic_regression_rust,
     synthetic_did_impl as _synthetic_did_impl,
     synthetic_control_impl as _synthetic_control_impl,
+    dml_impl as _dml_impl,
+    two_stage_least_squares as _two_stage_least_squares_rust,
 )
 
 # Re-export main functions
 __all__ = [
+    # Version
+    "__version__",
+    # Result classes
     "LinearRegressionResult",
     "LogisticRegressionResult",
     "SyntheticDIDResult",
     "SyntheticControlResult",
+    "DMLResult",
+    "TwoStageLSResult",
+    # Estimators
     "linear_regression",
     "logistic_regression",
     "synthetic_did",
     "synthetic_control",
+    "dml",
+    "two_stage_least_squares",
+    # Utilities
+    "about",
 ]
 
 
+# ============================================================
+# PRIVATE HELPER FUNCTIONS
+# ============================================================
+
+
+def _convert_dataframe_if_pandas(
+    df: _Union[_pl.DataFrame, "pd.DataFrame"],
+    required_cols: _List[str],
+    int_columns: _Optional[_List[str]] = None,
+) -> _pl.DataFrame:
+    """Convert pandas DataFrame to Polars if needed.
+    
+    Parameters
+    ----------
+    df : Union[pl.DataFrame, pd.DataFrame]
+        Input DataFrame.
+    required_cols : List[str]
+        Columns that must be present.
+    int_columns : Optional[List[str]]
+        Columns to treat as integer type during conversion.
+    
+    Returns
+    -------
+    pl.DataFrame
+        Polars DataFrame (converted if input was pandas).
+    """
+    from causers._pandas_compat import (
+        detect_dataframe_type,
+        validate_pandas_dataframe,
+        convert_pandas_to_polars,
+    )
+    
+    df_type = detect_dataframe_type(df)
+    if df_type == "pandas":
+        validate_pandas_dataframe(df, required_cols)
+        return convert_pandas_to_polars(df, required_cols, int_columns=int_columns)
+    return df
+
+
+def _warn_if_float_cluster(df: _pl.DataFrame, cluster: _Optional[str]) -> None:
+    """Emit warning if cluster column is float type."""
+    if cluster is None:
+        return
+    try:
+        cluster_dtype = df[cluster].dtype
+        if cluster_dtype in (_pl.Float32, _pl.Float64):
+            _warnings.warn(
+                f"Cluster column '{cluster}' is float; will be cast to string for grouping.",
+                UserWarning,
+                stacklevel=3,
+            )
+    except (KeyError, AttributeError, _ColumnNotFoundError):
+        pass  # Let Rust layer handle column not found errors
+
+
 def _check_cluster_balance(
-    df: _polars.DataFrame, cluster_col: str
+    df: _pl.DataFrame, cluster_col: str
 ) -> _Optional[str]:
     """
     Check cluster balance and return warning message if any cluster has >50% observations.
@@ -47,7 +137,7 @@ def _check_cluster_balance(
     try:
         value_counts = df[cluster_col].value_counts()
         total = len(df)
-        threshold = total // 2  # 50%
+        threshold = int(total * _CLUSTER_BALANCE_THRESHOLD)
         
         for row in value_counts.iter_rows():
             cluster_val, count = row[0], row[1]
@@ -58,13 +148,41 @@ def _check_cluster_balance(
                     f"Clustered standard errors may be unreliable with such imbalanced clusters."
                 )
         return None
-    except Exception:
+    except (KeyError, AttributeError, _ColumnNotFoundError):
         # If we can't check balance, don't warn
         return None
 
 
+# ============================================================
+# UTILITIES & METADATA
+# ============================================================
+
+
+def about() -> None:
+    """Print information about the causers package."""
+    print(f"causers version {__version__}")
+    print("High-performance statistical operations for Polars DataFrames")
+    print("Powered by Rust via PyO3/maturin")
+    print("")
+    print("Features:")
+    print("  - Linear regression with HC3 robust standard errors")
+    print("  - Fixed effects estimation (one-way and two-way)")
+    print("  - Logistic regression with Newton-Raphson MLE")
+    print("  - Cluster-robust standard errors (analytical and bootstrap)")
+    print("  - Wild cluster bootstrap for small cluster counts (linear)")
+    print("  - Score bootstrap for small cluster counts (logistic)")
+    print("  - Synthetic Difference-in-Differences (SDID)")
+    print("  - Synthetic Control (SC) with multiple method variants")
+    print("  - Double Machine Learning (DML) for causal inference")
+
+
+# ============================================================
+# CORE ESTIMATORS
+# ============================================================
+
+
 def linear_regression(
-    df: _polars.DataFrame,
+    df: _Union[_pl.DataFrame, "pd.DataFrame"],
     x_cols: _Union[str, _List[str]],
     y_col: str,
     include_intercept: bool = True,
@@ -73,18 +191,25 @@ def linear_regression(
     bootstrap_iterations: int = 1000,
     seed: _Optional[int] = None,
     bootstrap_method: str = "rademacher",
+    fixed_effects: _Optional[_Union[str, _List[str]]] = None,
 ) -> LinearRegressionResult:
     """
-    Perform linear regression on Polars DataFrame columns.
+    Perform linear regression on Polars or pandas DataFrame columns.
     
     Supports both single and multiple covariate regression using ordinary
     least squares (OLS). For multiple covariates, uses matrix operations:
     β = (X'X)^-1 X'y
     
+    Optionally absorbs fixed effects (entity/time) via within-transformation
+    (demeaning) before regression. When fixed effects are absorbed, the intercept
+    is implicitly absorbed and not returned.
+    
     Parameters
     ----------
-    df : pl.DataFrame
-        The Polars DataFrame containing the data
+    df : pl.DataFrame or pd.DataFrame
+        The DataFrame containing the data. Accepts both Polars and pandas.
+        For pandas DataFrames with Arrow-backed columns (pd.ArrowDtype),
+        data is extracted via zero-copy where possible.
     x_cols : str or List[str]
         Name(s) of the independent variable column(s). Can be:
         - A single column name as a string
@@ -94,6 +219,8 @@ def linear_regression(
     include_intercept : bool, default=True
         Whether to include an intercept term in the regression.
         If False, forces the regression line through the origin.
+        Note: When fixed_effects are specified, intercept is implicitly
+        absorbed regardless of this setting.
     cluster : str, optional
         Column name for cluster identifiers. When specified, computes
         cluster-robust standard errors instead of HC3. Supports integer,
@@ -112,6 +239,13 @@ def linear_regression(
         - "rademacher": Standard Rademacher weights (±1 with equal probability)
         - "webb": Webb's 6-point distribution for improved small-sample performance
         Only used when bootstrap=True and cluster is specified.
+    fixed_effects : str or List[str], optional
+        Column name(s) for fixed effects to absorb. Supports 1 or 2 columns.
+        When specified:
+        - One column: One-way fixed effects (e.g., entity or time)
+        - Two columns: Two-way fixed effects (e.g., entity + time)
+        Fixed effect columns must not overlap with x_cols or y_col.
+        Columns can be integer, string, or categorical type.
     
     Returns
     -------
@@ -120,9 +254,9 @@ def linear_regression(
         - coefficients : List[float]
             Regression coefficients for each x variable
         - intercept : float or None
-            Intercept term (None if include_intercept=False)
+            Intercept term (None if include_intercept=False or fixed_effects used)
         - r_squared : float
-            Coefficient of determination (R²)
+            Coefficient of determination (R²) using original y
         - n_samples : int
             Number of samples used in the regression
         - slope : float or None
@@ -131,7 +265,8 @@ def linear_regression(
             Robust standard errors for each coefficient. Uses HC3 by
             default, or cluster-robust SE if cluster is specified.
         - intercept_se : float or None
-            Robust standard error for intercept (None if include_intercept=False)
+            Robust standard error for intercept (None if include_intercept=False
+            or fixed_effects used)
         - n_clusters : int or None
             Number of unique clusters (None if cluster not specified)
         - cluster_se_type : str or None
@@ -139,6 +274,12 @@ def linear_regression(
             "bootstrap_webb" (None if not clustered)
         - bootstrap_iterations_used : int or None
             Number of bootstrap iterations (None if not bootstrap)
+        - fixed_effects_absorbed : List[int] or None
+            Number of groups absorbed for each fixed effect (None if no FE)
+        - fixed_effects_names : List[str] or None
+            Names of the fixed effect columns absorbed (None if no FE)
+        - within_r_squared : float or None
+            Within R² computed on demeaned data (None if no FE)
     
     Raises
     ------
@@ -150,6 +291,11 @@ def linear_regression(
         - If single-observation clusters exist (analytical mode only)
         - If numerical instability detected (condition number > 1e10)
         - If bootstrap_iterations < 1
+        - If fixed_effects has more than 2 columns
+        - If fixed_effects column overlaps with x_cols or y_col
+        - If fixed_effects column contains null values
+        - If fixed_effects column has only one unique value
+        - If covariate becomes collinear after FE demeaning
     
     Warns
     -----
@@ -157,6 +303,7 @@ def linear_regression(
         - When fewer than 42 clusters with bootstrap=False: recommends using
           wild cluster bootstrap for more accurate inference.
         - When cluster column has float dtype: implicit cast to string.
+        - When fixed_effects column has float dtype: implicit cast warning.
     
     Examples
     --------
@@ -246,18 +393,38 @@ def linear_regression(
     else:
         x_cols_list = list(x_cols)
     
-    # Check for float cluster column and emit warning (REQ-031)
-    if cluster is not None:
-        try:
-            cluster_dtype = df[cluster].dtype
-            if cluster_dtype in (_polars.Float32, _polars.Float64):
-                _warnings.warn(
-                    f"Cluster column '{cluster}' is float; will be cast to string for grouping.",
-                    UserWarning,
-                    stacklevel=2
-                )
-        except Exception:
-            pass  # Let the Rust layer handle column not found errors
+    # Normalize fixed_effects to a list or None
+    fe_cols_list: _Optional[_List[str]] = None
+    if fixed_effects is not None:
+        if isinstance(fixed_effects, str):
+            fe_cols_list = [fixed_effects]
+        else:
+            fe_cols_list = list(fixed_effects)
+    
+    # Detect and convert pandas DataFrames if needed
+    all_cols = x_cols_list + [y_col]
+    if cluster:
+        all_cols.append(cluster)
+    if fe_cols_list:
+        all_cols.extend(fe_cols_list)
+    df = _convert_dataframe_if_pandas(df, all_cols)
+    
+    # Check for float cluster column and emit warning
+    _warn_if_float_cluster(df, cluster)
+    
+    # Check for float fixed_effects columns and emit warning
+    if fe_cols_list is not None:
+        for fe_col in fe_cols_list:
+            try:
+                fe_dtype = df[fe_col].dtype
+                if fe_dtype in (_pl.Float32, _pl.Float64):
+                    _warnings.warn(
+                        f"Fixed effect column '{fe_col}' is float; will be cast to integer for grouping.",
+                        UserWarning,
+                        stacklevel=2
+                    )
+            except (KeyError, AttributeError, _ColumnNotFoundError):
+                pass  # Let the Rust layer handle column not found errors
     
     # Normalize bootstrap_method to lowercase for case-insensitive matching
     bootstrap_method_normalized = bootstrap_method.lower()
@@ -273,19 +440,20 @@ def linear_regression(
         bootstrap_iterations,
         seed,
         bootstrap_method_normalized,
+        fe_cols_list,
     )
     
-    # Check for small cluster count and emit warning (REQ-030)
+    # Check for small cluster count and emit warning
     if result.n_clusters is not None and not bootstrap:
-        if result.n_clusters < 42:
+        if result.n_clusters < _SMALL_CLUSTER_THRESHOLD:
             _warnings.warn(
                 f"Only {result.n_clusters} clusters detected. Wild cluster bootstrap "
-                f"(bootstrap=True) is recommended when clusters < 42.",
+                f"(bootstrap=True) is recommended when clusters < {_SMALL_CLUSTER_THRESHOLD}.",
                 UserWarning,
                 stacklevel=2
             )
     
-    # Check for cluster imbalance and emit warning (REQ-032)
+    # Check for cluster imbalance and emit warning
     if cluster is not None:
         balance_warning = _check_cluster_balance(df, cluster)
         if balance_warning is not None:
@@ -295,7 +463,7 @@ def linear_regression(
 
 
 def logistic_regression(
-    df: _polars.DataFrame,
+    df: _Union[_pl.DataFrame, "pd.DataFrame"],
     x_cols: _Union[str, _List[str]],
     y_col: str,
     include_intercept: bool = True,
@@ -304,6 +472,7 @@ def logistic_regression(
     bootstrap_iterations: int = 1000,
     seed: _Optional[int] = None,
     bootstrap_method: str = "rademacher",
+    fixed_effects: _Optional[_Union[str, _List[str]]] = None,
 ) -> LogisticRegressionResult:
     """
     Perform logistic regression on binary outcome with robust standard errors.
@@ -312,10 +481,16 @@ def logistic_regression(
     with Newton-Raphson optimization. Returns coefficient estimates (log-odds),
     robust standard errors, and diagnostic information.
     
+    Optionally absorbs fixed effects using the Mundlak (1978) approach: adds
+    group means of covariates as additional regressors. This is suitable for
+    nonlinear models where standard within-transformation is not valid.
+    
     Parameters
     ----------
-    df : pl.DataFrame
-        The Polars DataFrame containing the data
+    df : pl.DataFrame or pd.DataFrame
+        The DataFrame containing the data. Accepts both Polars and pandas.
+        For pandas DataFrames with Arrow-backed columns (pd.ArrowDtype),
+        data is extracted via zero-copy where possible.
     x_cols : str or List[str]
         Name(s) of the independent variable column(s). Can be:
         - A single column name as a string
@@ -342,13 +517,24 @@ def logistic_regression(
         - "rademacher": Standard Rademacher weights (±1 with equal probability)
         - "webb": Webb's 6-point distribution for improved small-sample performance
         Only used when bootstrap=True and cluster is specified.
+    fixed_effects : str or List[str], optional
+        Column name(s) for fixed effects to absorb using the Mundlak approach.
+        Supports 1 or 2 columns. When specified:
+        - One column: One-way fixed effects (e.g., entity or time)
+        - Two columns: Two-way fixed effects (e.g., entity + time)
+        The Mundlak approach adds group means of covariates as additional regressors,
+        which is appropriate for nonlinear models like logistic regression.
+        Fixed effect columns must not overlap with x_cols or y_col.
+        Columns can be integer, string, or categorical type.
     
     Returns
     -------
     LogisticRegressionResult
         Result object with the following attributes:
         - coefficients : List[float]
-            Coefficient estimates for x variables (log-odds scale)
+            Coefficient estimates for x variables (log-odds scale).
+            When fixed_effects is used, only returns coefficients for
+            the original K covariates (Mundlak terms are filtered out).
         - intercept : float or None
             Intercept term (None if include_intercept=False)
         - standard_errors : List[float]
@@ -373,6 +559,12 @@ def logistic_regression(
             Log-likelihood at the MLE solution
         - pseudo_r_squared : float
             McFadden's pseudo R² = 1 - (LL_model / LL_null)
+        - fixed_effects_absorbed : List[int] or None
+            Number of groups absorbed for each fixed effect (None if no FE)
+        - fixed_effects_names : List[str] or None
+            Names of the fixed effect columns absorbed (None if no FE)
+        - within_pseudo_r_squared : float or None
+            Within pseudo R² for FE model (None if no FE)
     
     Raises
     ------
@@ -388,6 +580,11 @@ def logistic_regression(
         - If convergence fails after max iterations
         - If numerical instability detected (condition number > 1e10)
         - If bootstrap_iterations < 1
+        - If fixed_effects has more than 2 columns
+        - If fixed_effects column overlaps with x_cols or y_col
+        - If fixed_effects column contains null values
+        - If fixed_effects column has only one unique value
+        - If augmented design matrix is collinear after adding Mundlak terms
     
     Warns
     -----
@@ -395,6 +592,7 @@ def logistic_regression(
         - When fewer than 42 clusters with bootstrap=False: recommends using
           score bootstrap for more accurate inference.
         - When cluster column has float dtype: implicit cast to string.
+        - When fixed_effects column has float dtype: implicit cast warning.
     
     Examples
     --------
@@ -451,6 +649,19 @@ def logistic_regression(
     >>> print(f"Bootstrap SE: {result.standard_errors[0]:.4f}")
     Bootstrap SE: ...
     
+    Fixed effects (entity FE using Mundlak approach):
+    
+    >>> df = pl.DataFrame({
+    ...     "x": [1.0, 2.0, 3.0, 4.0, 1.5, 2.5, 3.5, 4.5],
+    ...     "y": [0, 0, 1, 1, 0, 1, 0, 1],
+    ...     "entity_id": [1, 1, 1, 1, 2, 2, 2, 2]
+    ... })
+    >>> result = causers.logistic_regression(df, "x", "y", fixed_effects="entity_id")
+    >>> print(f"Coefficient (FE): {result.coefficients[0]:.4f}")
+    Coefficient (FE): ...
+    >>> print(f"FE absorbed: {result.fixed_effects_absorbed}")
+    FE absorbed: [2]
+    
     Notes
     -----
     The logistic regression model is:
@@ -475,6 +686,19 @@ def logistic_regression(
     The optimizer uses Newton-Raphson with step halving for stability,
     converging when gradient norm < 1e-8 or after 35 iterations.
     
+    **Fixed Effects (Mundlak Approach)**
+    
+    For nonlinear models like logistic regression, standard within-transformation
+    (demeaning) is not valid. The Mundlak (1978) approach provides an alternative:
+    
+    1. Compute group means of all covariates: X̄_g for each FE group g
+    2. Augment the design matrix: [X | X̄_g1 | X̄_g2 | ...]
+    3. Run standard logistic regression on the augmented model
+    4. Return only the coefficients for the original X variables
+    
+    This approach is equivalent to correlated random effects (CRE) and produces
+    consistent estimates under the same assumptions as fixed effects.
+    
     References
     ----------
     Kline, P., & Santos, A. (2012). "A Score Based Approach to Wild Bootstrap
@@ -485,10 +709,13 @@ def logistic_regression(
     covariance matrix estimators with improved finite sample properties."
     Journal of Econometrics, 29(3), 305-325.
     
+    Mundlak, Y. (1978). "On the Pooling of Time Series and Cross Section Data."
+    Econometrica, 46(1), 69-85.
+    
     See Also
     --------
     LogisticRegressionResult : Result class with coefficient estimates and diagnostics.
-    linear_regression : For continuous outcome regression.
+    linear_regression : For continuous outcome regression with FE support.
     """
     # Normalize x_cols to always be a list
     if isinstance(x_cols, str):
@@ -496,18 +723,38 @@ def logistic_regression(
     else:
         x_cols_list = list(x_cols)
     
-    # Check for float cluster column and emit warning (REQ-031 equivalent)
-    if cluster is not None:
-        try:
-            cluster_dtype = df[cluster].dtype
-            if cluster_dtype in (_polars.Float32, _polars.Float64):
-                _warnings.warn(
-                    f"Cluster column '{cluster}' is float; will be cast to string for grouping.",
-                    UserWarning,
-                    stacklevel=2
-                )
-        except Exception:
-            pass  # Let the Rust layer handle column not found errors
+    # Normalize fixed_effects to a list or None
+    fe_cols_list: _Optional[_List[str]] = None
+    if fixed_effects is not None:
+        if isinstance(fixed_effects, str):
+            fe_cols_list = [fixed_effects]
+        else:
+            fe_cols_list = list(fixed_effects)
+    
+    # Detect and convert pandas DataFrames if needed
+    all_cols = x_cols_list + [y_col]
+    if cluster:
+        all_cols.append(cluster)
+    if fe_cols_list:
+        all_cols.extend(fe_cols_list)
+    df = _convert_dataframe_if_pandas(df, all_cols)
+    
+    # Check for float cluster column and emit warning
+    _warn_if_float_cluster(df, cluster)
+    
+    # Check for float fixed_effects columns and emit warning
+    if fe_cols_list is not None:
+        for fe_col in fe_cols_list:
+            try:
+                fe_dtype = df[fe_col].dtype
+                if fe_dtype in (_pl.Float32, _pl.Float64):
+                    _warnings.warn(
+                        f"Fixed effect column '{fe_col}' is float; will be cast to integer for grouping.",
+                        UserWarning,
+                        stacklevel=2
+                    )
+            except (KeyError, AttributeError, _ColumnNotFoundError):
+                pass  # Let the Rust layer handle column not found errors
     
     # Normalize bootstrap_method to lowercase for case-insensitive matching
     bootstrap_method_normalized = bootstrap_method.lower()
@@ -523,14 +770,15 @@ def logistic_regression(
         bootstrap_iterations,
         seed,
         bootstrap_method_normalized,
+        fe_cols_list,
     )
     
-    # Check for small cluster count and emit warning (REQ-060)
+    # Check for small cluster count and emit warning
     if result.n_clusters is not None and not bootstrap:
-        if result.n_clusters < 42:
+        if result.n_clusters < _SMALL_CLUSTER_THRESHOLD:
             _warnings.warn(
                 f"Only {result.n_clusters} clusters detected. Score bootstrap "
-                f"(bootstrap=True) is recommended when clusters < 42.",
+                f"(bootstrap=True) is recommended when clusters < {_SMALL_CLUSTER_THRESHOLD}.",
                 UserWarning,
                 stacklevel=2
             )
@@ -539,7 +787,7 @@ def logistic_regression(
 
 
 def synthetic_did(
-    df: _polars.DataFrame,
+    df: _Union[_pl.DataFrame, "pd.DataFrame"],
     unit_col: str,
     time_col: str,
     outcome_col: str,
@@ -562,9 +810,10 @@ def synthetic_did(
     
     Parameters
     ----------
-    df : pl.DataFrame
+    df : pl.DataFrame or pd.DataFrame
         Panel data in long format with one row per unit-time observation.
         Must be a balanced panel (all units observed in all time periods).
+        Accepts both Polars and pandas DataFrames.
     unit_col : str
         Column name identifying unique units (e.g., "state", "firm_id").
         Must be integer or string type.
@@ -699,6 +948,14 @@ def synthetic_did(
     linear_regression : For standard regression analysis.
     """
     # ========================================================================
+    # pandas Conversion
+    # ========================================================================
+    
+    # Detect and convert pandas DataFrames if needed
+    all_cols = [unit_col, time_col, outcome_col, treatment_col]
+    df = _convert_dataframe_if_pandas(df, all_cols, int_columns=[unit_col, time_col])
+    
+    # ========================================================================
     # Input Validation
     # ========================================================================
     
@@ -718,20 +975,20 @@ def synthetic_did(
     
     # Check unit_col is not float
     unit_dtype = df[unit_col].dtype
-    if unit_dtype in (_polars.Float32, _polars.Float64):
+    if unit_dtype in (_pl.Float32, _pl.Float64):
         raise ValueError(f"unit_col must be integer or string, not float")
     
     # Check time_col is not float
     time_dtype = df[time_col].dtype
-    if time_dtype in (_polars.Float32, _polars.Float64):
+    if time_dtype in (_pl.Float32, _pl.Float64):
         raise ValueError(f"time_col must be integer or string, not float")
     
     # Check outcome_col is numeric
     outcome_dtype = df[outcome_col].dtype
     numeric_types = (
-        _polars.Float32, _polars.Float64,
-        _polars.Int8, _polars.Int16, _polars.Int32, _polars.Int64,
-        _polars.UInt8, _polars.UInt16, _polars.UInt32, _polars.UInt64,
+        _pl.Float32, _pl.Float64,
+        _pl.Int8, _pl.Int16, _pl.Int32, _pl.Int64,
+        _pl.UInt8, _pl.UInt16, _pl.UInt32, _pl.UInt64,
     )
     if outcome_dtype not in numeric_types:
         raise ValueError(f"outcome_col must be numeric")
@@ -779,7 +1036,7 @@ def synthetic_did(
     # Treated units: treatment=1 in at least one period
     unit_max_treatment = (
         df.group_by(unit_col)
-        .agg(_polars.col(treatment_col).max().alias("max_treatment"))
+        .agg(_pl.col(treatment_col).max().alias("max_treatment"))
     )
     
     control_units = []
@@ -810,7 +1067,7 @@ def synthetic_did(
     # Post-periods: at least one treated unit has treatment=1
     period_max_treatment = (
         df.group_by(time_col)
-        .agg(_polars.col(treatment_col).max().alias("max_treatment"))
+        .agg(_pl.col(treatment_col).max().alias("max_treatment"))
     )
     
     pre_periods = []
@@ -847,7 +1104,7 @@ def synthetic_did(
     # Since df is sorted by (unit, time), outcomes are already in row-major order:
     # [unit_0_period_0, unit_0_period_1, ..., unit_N-1_period_T-1]
     # This is O(1) extraction vs O(n_units × n_periods) for the filter loop
-    outcomes = df_sorted[outcome_col].cast(_polars.Float64).to_list()
+    outcomes = df_sorted[outcome_col].cast(_pl.Float64).to_list()
     
     # Create index arrays
     control_indices = [unit_to_idx[u] for u in control_units]
@@ -878,7 +1135,7 @@ def synthetic_did(
     # Check for unit weight concentration
     if result.unit_weights:
         max_unit_weight = max(result.unit_weights)
-        if max_unit_weight > 0.5:
+        if max_unit_weight > _WEIGHT_CONCENTRATION_THRESHOLD:
             max_idx = result.unit_weights.index(max_unit_weight)
             _warnings.warn(
                 f"Unit weight concentration: control unit at index {max_idx} has "
@@ -890,7 +1147,7 @@ def synthetic_did(
     # Check for time weight concentration
     if result.time_weights:
         max_time_weight = max(result.time_weights)
-        if max_time_weight > 0.5:
+        if max_time_weight > _WEIGHT_CONCENTRATION_THRESHOLD:
             max_idx = result.time_weights.index(max_time_weight)
             _warnings.warn(
                 f"Time weight concentration: pre-period at index {max_idx} has "
@@ -900,9 +1157,9 @@ def synthetic_did(
             )
     
     # Check for low bootstrap iterations
-    if bootstrap_iterations < 100:
+    if bootstrap_iterations < _MIN_RELIABLE_BOOTSTRAP_ITERATIONS:
         _warnings.warn(
-            f"bootstrap_iterations={bootstrap_iterations} is less than 100. "
+            f"bootstrap_iterations={bootstrap_iterations} is less than {_MIN_RELIABLE_BOOTSTRAP_ITERATIONS}. "
             f"Standard error estimates may be unreliable.",
             UserWarning,
             stacklevel=2
@@ -912,7 +1169,7 @@ def synthetic_did(
 
 
 def synthetic_control(
-    df: _polars.DataFrame,
+    df: _Union[_pl.DataFrame, "pd.DataFrame"],
     unit_col: str,
     time_col: str,
     outcome_col: str,
@@ -940,9 +1197,10 @@ def synthetic_control(
     
     Parameters
     ----------
-    df : pl.DataFrame
+    df : pl.DataFrame or pd.DataFrame
         Panel data in long format with one row per unit-time observation.
         Must be a balanced panel (all units observed in all time periods).
+        Accepts both Polars and pandas DataFrames.
     unit_col : str
         Column name identifying unique units (e.g., "state", "firm_id").
         Must be integer or string type.
@@ -1127,6 +1385,14 @@ def synthetic_control(
     synthetic_did : For multiple treated units with DID adjustment.
     """
     # ========================================================================
+    # pandas Conversion
+    # ========================================================================
+    
+    # Detect and convert pandas DataFrames if needed
+    all_cols = [unit_col, time_col, outcome_col, treatment_col]
+    df = _convert_dataframe_if_pandas(df, all_cols, int_columns=[unit_col, time_col])
+    
+    # ========================================================================
     # Input Validation
     # ========================================================================
     
@@ -1146,20 +1412,20 @@ def synthetic_control(
     
     # Check unit_col is not float
     unit_dtype = df[unit_col].dtype
-    if unit_dtype in (_polars.Float32, _polars.Float64):
+    if unit_dtype in (_pl.Float32, _pl.Float64):
         raise ValueError("unit_col must be integer or string, not float")
     
     # Check time_col is not float
     time_dtype = df[time_col].dtype
-    if time_dtype in (_polars.Float32, _polars.Float64):
+    if time_dtype in (_pl.Float32, _pl.Float64):
         raise ValueError("time_col must be integer or string, not float")
     
     # Check outcome_col is numeric
     outcome_dtype = df[outcome_col].dtype
     numeric_types = (
-        _polars.Float32, _polars.Float64,
-        _polars.Int8, _polars.Int16, _polars.Int32, _polars.Int64,
-        _polars.UInt8, _polars.UInt16, _polars.UInt32, _polars.UInt64,
+        _pl.Float32, _pl.Float64,
+        _pl.Int8, _pl.Int16, _pl.Int32, _pl.Int64,
+        _pl.UInt8, _pl.UInt16, _pl.UInt32, _pl.UInt64,
     )
     if outcome_dtype not in numeric_types:
         raise ValueError("outcome_col must be numeric")
@@ -1215,7 +1481,7 @@ def synthetic_control(
     # Treated unit: treatment=1 in at least one period
     unit_max_treatment = (
         df.group_by(unit_col)
-        .agg(_polars.col(treatment_col).max().alias("max_treatment"))
+        .agg(_pl.col(treatment_col).max().alias("max_treatment"))
     )
     
     control_units = []
@@ -1257,7 +1523,7 @@ def synthetic_control(
     # Post-periods: at least one treated unit has treatment=1
     period_max_treatment = (
         df.group_by(time_col)
-        .agg(_polars.col(treatment_col).max().alias("max_treatment"))
+        .agg(_pl.col(treatment_col).max().alias("max_treatment"))
     )
     
     pre_periods = []
@@ -1300,7 +1566,7 @@ def synthetic_control(
     # Since df is sorted by (unit, time), outcomes are already in row-major order:
     # [unit_0_period_0, unit_0_period_1, ..., unit_N-1_period_T-1]
     # This is O(1) extraction vs O(n_units × n_periods) for the filter loop
-    outcomes = df_sorted[outcome_col].cast(_polars.Float64).to_list()
+    outcomes = df_sorted[outcome_col].cast(_pl.Float64).to_list()
     
     # Create index arrays
     control_indices = [unit_to_idx[u] for u in control_units]
@@ -1339,7 +1605,7 @@ def synthetic_control(
     # Check for unit weight concentration
     if result.unit_weights:
         max_unit_weight = max(result.unit_weights)
-        if max_unit_weight > 0.5:
+        if max_unit_weight > _WEIGHT_CONCENTRATION_THRESHOLD:
             max_idx = result.unit_weights.index(max_unit_weight)
             _warnings.warn(
                 f"Unit weight concentration: control unit at index {max_idx} has "
@@ -1352,7 +1618,7 @@ def synthetic_control(
     outcome_std = df[outcome_col].std()
     if outcome_std is not None and outcome_std > 0:
         relative_rmse = result.pre_treatment_rmse / outcome_std
-        if relative_rmse > 0.1:
+        if relative_rmse > _POOR_FIT_RMSE_RATIO:
             _warnings.warn(
                 f"Pre-treatment RMSE ({result.pre_treatment_rmse:.4f}) is "
                 f"{relative_rmse:.1%} of outcome std ({outcome_std:.4f}). "
@@ -1364,17 +1630,537 @@ def synthetic_control(
     return result
 
 
-def about():
-    """Print information about the causers package."""
-    print(f"causers version {__version__}")
-    print("High-performance statistical operations for Polars DataFrames")
-    print("Powered by Rust via PyO3/maturin")
-    print("")
-    print("Features:")
-    print("  - Linear regression with HC3 robust standard errors")
-    print("  - Logistic regression with Newton-Raphson MLE")
-    print("  - Cluster-robust standard errors (analytical and bootstrap)")
-    print("  - Wild cluster bootstrap for small cluster counts (linear)")
-    print("  - Score bootstrap for small cluster counts (logistic)")
-    print("  - Synthetic Difference-in-Differences (SDID)")
-    print("  - Synthetic Control (SC) with multiple method variants")
+def dml(
+    df: _Union[_pl.DataFrame, "pd.DataFrame"],
+    y_col: str,
+    d_col: str,
+    x_cols: _Union[str, _List[str]],
+    n_folds: int = 5,
+    treatment_type: str = "binary",
+    estimate_cate: bool = False,
+    alpha: float = 0.05,
+    propensity_clip: tuple = (0.01, 0.99),
+    cluster: _Optional[str] = None,
+    seed: _Optional[int] = None,
+) -> DMLResult:
+    """
+    Estimate causal treatment effects using Double Machine Learning (DML).
+    
+    Implements the DML estimator from Chernozhukov et al. (2018) with cross-fitting
+    for debiased inference. Uses linear regression for outcome model and
+    logistic (binary) or linear (continuous) regression for propensity model.
+    
+    Parameters
+    ----------
+    df : pl.DataFrame or pd.DataFrame
+        The DataFrame containing the data. Accepts both Polars and pandas.
+    y_col : str
+        Name of the outcome variable column
+    d_col : str
+        Name of the treatment variable column
+    x_cols : str or List[str]
+        Name(s) of the covariate columns to control for
+    n_folds : int, default=5
+        Number of cross-fitting folds. Must be >= 2.
+    treatment_type : str, default="binary"
+        Type of treatment variable:
+        - "binary": 0/1 treatment (uses logistic propensity model)
+        - "continuous": Continuous treatment (uses linear propensity model)
+    estimate_cate : bool, default=False
+        Whether to estimate Conditional Average Treatment Effect (CATE)
+        coefficients. If True, returns CATE as linear function of X.
+    alpha : float, default=0.05
+        Significance level for confidence intervals. 0.05 = 95% CI.
+    propensity_clip : tuple, default=(0.01, 0.99)
+        Bounds for propensity score clipping (binary treatment only).
+        Extreme propensity scores are clipped to these bounds.
+    cluster : str, optional
+        Column name for cluster identifiers for cluster-robust standard errors.
+        When specified, uses cluster-robust Neyman-orthogonal variance estimation
+        with G/(G-1) small-sample adjustment. Requires at least 2 clusters.
+    seed : int, optional
+        Random seed for reproducible fold assignment. When None,
+        uses deterministic row-order assignment.
+    
+    Returns
+    -------
+    DMLResult
+        Result object with the following attributes:
+        
+        - theta : float
+            Average Treatment Effect (ATE) point estimate
+        - standard_error : float
+            Neyman-orthogonal robust standard error
+        - confidence_interval : Tuple[float, float]
+            (1-alpha) confidence interval bounds (lower, upper)
+        - p_value : float
+            Two-sided p-value for H₀: θ = 0
+        - n_samples : int
+            Number of observations used
+        - n_folds : int
+            Number of cross-fitting folds used
+        - propensity_residual_var : float
+            Variance of treatment residuals Var(D̃)
+        - outcome_residual_var : float
+            Variance of outcome residuals Var(Ỹ)
+        - outcome_r_squared : float
+            Average R² of outcome nuisance model across folds
+        - propensity_r_squared : float
+            Average R² (or pseudo-R²) of propensity model across folds
+        - n_propensity_clipped : int
+            Count of propensity scores clipped to bounds
+        - cate_coefficients : Dict[str, float] or None
+            CATE coefficients keyed by covariate name (if estimate_cate=True)
+        - cate_standard_errors : Dict[str, float] or None
+            CATE coefficient standard errors (if estimate_cate=True)
+    
+    Raises
+    ------
+    ValueError
+        - If x_cols is empty
+        - If n_folds is not 2, 5, or 10
+        - If n_folds >= n_samples
+        - If treatment_type is not "binary" or "continuous"
+        - If binary treatment doesn't contain both 0 and 1
+        - If binary treatment contains non-0/1 values
+        - If alpha is not in (0, 1)
+        - If propensity_clip bounds are invalid
+        - If treatment has no variation
+        - If treatment is fully explained by covariates
+        - If nuisance model fails to converge
+        - If covariate matrix is singular in any fold
+    
+    Examples
+    --------
+    Basic ATE estimation with binary treatment:
+    
+    >>> import polars as pl
+    >>> import causers
+    >>> df = pl.DataFrame({
+    ...     "y": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+    ...     "d": [0, 0, 0, 0, 0, 1, 1, 1, 1, 1],
+    ...     "x1": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+    ...     "x2": [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9]
+    ... })
+    >>> result = causers.dml(df, "y", "d", ["x1", "x2"], n_folds=2, seed=42)
+    >>> print(f"ATE: {result.theta:.4f} ± {result.standard_error:.4f}")
+    ATE: ... ± ...
+    
+    With CATE estimation:
+    
+    >>> result = causers.dml(
+    ...     df, "y", "d", ["x1", "x2"],
+    ...     estimate_cate=True, seed=42
+    ... )
+    >>> print(f"CATE coefficients: {result.cate_coefficients}")
+    CATE coefficients: {...}
+    
+    Continuous treatment:
+    
+    >>> df["d_cont"] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    >>> result = causers.dml(
+    ...     df, "y", "d_cont", ["x1", "x2"],
+    ...     treatment_type="continuous", seed=42
+    ... )
+    >>> print(f"ATE: {result.theta:.4f}")
+    ATE: ...
+    
+    Accessing diagnostics:
+    
+    >>> print(f"Outcome R²: {result.outcome_r_squared:.3f}")
+    Outcome R²: ...
+    >>> print(f"Propensity R²: {result.propensity_r_squared:.3f}")
+    Propensity R²: ...
+    >>> print(result.summary())  # Formatted summary
+    Double Machine Learning Results
+    ...
+    
+    Notes
+    -----
+    **Algorithm Overview**
+    
+    The DML estimator uses cross-fitting (sample splitting) to avoid overfitting
+    bias in the nuisance models:
+    
+    1. Partition data into K folds for cross-fitting
+    2. For each fold k:
+       - Train outcome model ℓ(X) on observations NOT in fold k
+       - Train propensity model m(X) on observations NOT in fold k
+       - Predict for observations IN fold k (out-of-fold predictions)
+    3. Compute residuals: Ỹ = Y - ℓ̂(X), D̃ = D - m̂(X)
+    4. Final-stage regression: θ̂ = (D̃'D̃)⁻¹ D̃'Ỹ
+    5. Neyman-orthogonal variance: V̂ = (1/N) × J⁻² × Σψ²ᵢ
+    
+    **CATE Estimation**
+    
+    When estimate_cate=True, estimates heterogeneous treatment effects as:
+    
+        τ(X) = θ₀ + X'γ
+    
+    where γ coefficients capture how treatment effect varies with covariates.
+    
+    **Standard Errors**
+    
+    Uses Neyman-orthogonal variance estimation which provides:
+    - Robustness to first-stage nuisance estimation error
+    - Valid inference even with moderate sample sizes
+    - Automatic bias correction from cross-fitting
+    
+    References
+    ----------
+    Chernozhukov, V., Chetverikov, D., Demirer, M., Duflo, E., Hansen, C.,
+    Newey, W., & Robins, J. (2018). Double/debiased machine learning for
+    treatment and structural parameters. *The Econometrics Journal*, 21(1), C1-C68.
+    
+    See Also
+    --------
+    DMLResult : Result class with ATE, CATE, and diagnostics.
+    linear_regression : For standard regression analysis.
+    """
+    # Normalize x_cols to always be a list
+    if isinstance(x_cols, str):
+        x_cols_list = [x_cols]
+    else:
+        x_cols_list = list(x_cols)
+    
+    # Detect and convert pandas DataFrames if needed
+    all_cols = [y_col, d_col] + x_cols_list
+    if cluster:
+        all_cols.append(cluster)
+    df = _convert_dataframe_if_pandas(df, all_cols)
+    
+    # Normalize treatment_type to lowercase for case-insensitive matching
+    treatment_type_normalized = treatment_type.lower()
+    
+    # Extract propensity_clip bounds
+    propensity_clip_low, propensity_clip_high = propensity_clip
+    
+    # Call the Rust implementation
+    result = _dml_impl(
+        df,
+        y_col,
+        d_col,
+        x_cols_list,
+        n_folds,
+        treatment_type_normalized,
+        estimate_cate,
+        alpha,
+        propensity_clip_low,
+        propensity_clip_high,
+        cluster,
+        seed,
+    )
+    
+    return result
+
+
+def two_stage_least_squares(
+    df: _Union[_pl.DataFrame, "pd.DataFrame"],
+    y_col: str,
+    d_cols: _Union[str, _List[str]],
+    z_cols: _Union[str, _List[str]],
+    x_cols: _Optional[_Union[str, _List[str]]] = None,
+    include_intercept: bool = True,
+    robust: bool = False,
+    cluster: _Optional[str] = None,
+) -> TwoStageLSResult:
+    """
+    Estimate causal effects using Two-Stage Least Squares (2SLS) instrumental variables.
+    
+    The 2SLS estimator addresses endogeneity problems where treatment variables
+    are correlated with the error term. It uses instrumental variables (Z) that
+    affect the outcome (Y) only through their effect on the endogenous treatment (D).
+    
+    **Algorithm**:
+    
+    *First Stage*: Regress each endogenous variable on instruments and exogenous controls:
+    
+    .. math::
+    
+        D = Z\\pi + X\\delta + \\nu
+    
+    *Second Stage*: Regress outcome on predicted endogenous values and controls:
+    
+    .. math::
+    
+        Y = \\hat{D}\\beta + X\\gamma + \\epsilon
+    
+    **CRITICAL**: Standard errors are computed using residuals from the **original D**,
+    not the predicted D̂. Using D̂ would understate variance.
+    
+    Parameters
+    ----------
+    df : pl.DataFrame or pd.DataFrame
+        The DataFrame containing the data. Accepts both Polars and pandas.
+    y_col : str
+        Name of the outcome variable column
+    d_cols : str or List[str]
+        Name(s) of the endogenous treatment variable column(s).
+        These are the variables suspected to be correlated with the error term.
+    z_cols : str or List[str]
+        Name(s) of the excluded instrument column(s).
+        Instruments must:
+        - Affect Y only through D (exclusion restriction)
+        - Be correlated with D (relevance)
+        - Be uncorrelated with the error (exogeneity)
+    x_cols : str or List[str], optional
+        Name(s) of exogenous control variable column(s).
+        These variables are included in both stages.
+    include_intercept : bool, default=True
+        Whether to include an intercept term in both stages.
+    robust : bool, default=False
+        If True, compute HC3 heteroskedasticity-robust standard errors.
+        If False, compute conventional (homoskedastic) standard errors.
+    cluster : str, optional
+        Column name for cluster identifiers for cluster-robust SE.
+        When specified, computes cluster-robust standard errors.
+    
+    Returns
+    -------
+    TwoStageLSResult
+        Result object with the following attributes:
+        
+        - coefficients : List[float]
+            Structural coefficients for endogenous + exogenous variables
+            (excluding intercept). Order: d_cols first, then x_cols.
+        - standard_errors : List[float]
+            Standard errors for all coefficients
+        - intercept : float or None
+            Intercept term (None if include_intercept=False)
+        - intercept_se : float or None
+            Standard error for intercept
+        - n_samples : int
+            Number of observations used
+        - n_endogenous : int
+            Number of endogenous regressors
+        - n_instruments : int
+            Number of excluded instruments
+        - first_stage_f : List[float]
+            F-statistics for each endogenous variable.
+            Rule of thumb: F < 10 suggests weak instruments.
+            F < 4 raises an error (too weak for reliable inference).
+        - first_stage_coefficients : List[List[float]]
+            First-stage coefficients for instruments only (per endogenous variable)
+        - cragg_donald : float or None
+            Cragg-Donald statistic for multiple endogenous variables.
+            None for single endogenous (use first_stage_f instead).
+        - stock_yogo_critical : float or None
+            Stock-Yogo 10% maximal bias critical value for comparison
+            with Cragg-Donald statistic
+        - r_squared : float
+            R² from structural equation (using original D)
+        - se_type : str
+            Type of standard errors: "conventional", "hc3", or "clustered"
+        - n_clusters : int or None
+            Number of clusters if clustered SE used
+    
+    Raises
+    ------
+    ValueError
+        - If d_cols is empty
+        - If z_cols is empty
+        - If number of instruments < number of endogenous variables (under-identified)
+        - If first-stage F-statistic < 4 for any endogenous variable
+        - If first-stage or second-stage design matrix is singular
+        - If not enough observations for the number of parameters
+        - If any column contains null values
+        - If any column has zero variance
+        - If cluster column not found when cluster specified
+    
+    Warns
+    -----
+    UserWarning
+        - If first-stage F-statistic < 10 (weak instruments warning)
+        - If Cragg-Donald < Stock-Yogo critical value
+        - If number of instruments > n_samples/10
+    
+    Examples
+    --------
+    Basic IV regression with one endogenous variable:
+    
+    >>> import polars as pl
+    >>> import causers
+    >>> # Angrist-Krueger style: quarter of birth as instrument for education
+    >>> df = pl.DataFrame({
+    ...     "wage": [2.5, 3.0, 2.8, 3.5, 3.2, 4.0, 3.8, 4.5, 4.2, 5.0],
+    ...     "educ": [10, 11, 10, 12, 11, 14, 13, 15, 14, 16],
+    ...     "quarter_born": [1, 4, 2, 3, 1, 4, 2, 4, 3, 4],
+    ...     "age": [30, 32, 31, 33, 34, 35, 36, 38, 40, 42]
+    ... })
+    >>> result = causers.two_stage_least_squares(
+    ...     df,
+    ...     y_col="wage",
+    ...     d_cols="educ",
+    ...     z_cols="quarter_born",
+    ...     x_cols="age"
+    ... )
+    >>> print(f"Returns to education: {result.coefficients[0]:.4f}")
+    Returns to education: ...
+    >>> print(f"First-stage F: {result.first_stage_f[0]:.1f}")
+    First-stage F: ...
+    
+    Multiple endogenous variables:
+    
+    >>> # Two endogenous vars with two instruments
+    >>> result = causers.two_stage_least_squares(
+    ...     df,
+    ...     y_col="wage",
+    ...     d_cols=["educ", "age"],
+    ...     z_cols=["quarter_born", "year_born"]
+    ... )
+    >>> print(f"Cragg-Donald: {result.cragg_donald}")
+    Cragg-Donald: ...
+    
+    Robust standard errors:
+    
+    >>> result = causers.two_stage_least_squares(
+    ...     df, "wage", "educ", "quarter_born",
+    ...     robust=True
+    ... )
+    >>> print(f"SE type: {result.se_type}")
+    SE type: hc3
+    
+    Clustered standard errors:
+    
+    >>> df = df.with_columns(_pl.lit([1, 1, 2, 2, 3, 3, 4, 4, 5, 5]).alias("state"))
+    >>> result = causers.two_stage_least_squares(
+    ...     df, "wage", "educ", "quarter_born",
+    ...     cluster="state"
+    ... )
+    >>> print(f"N clusters: {result.n_clusters}")
+    N clusters: 5
+    
+    Notes
+    -----
+    **Identification Requirements**
+    
+    The model is identified when:
+    - m ≥ k₁ (number of instruments ≥ number of endogenous variables)
+    - m = k₁: exactly identified (use all instruments)
+    - m > k₁: over-identified (more instruments than needed)
+    
+    **Weak Instrument Detection**
+    
+    Weak instruments (those poorly correlated with D) lead to:
+    - Biased 2SLS estimates (toward OLS bias)
+    - Unreliable inference (undersized confidence intervals)
+    
+    This function uses two diagnostics:
+    
+    1. **First-stage F-statistic**: For single endogenous variable.
+       Rule of thumb: F > 10 is generally considered acceptable.
+       F < 4 raises an error as inference is unreliable.
+    
+    2. **Cragg-Donald statistic**: For multiple endogenous variables.
+       Compare to Stock-Yogo critical values for desired bias/size control.
+    
+    **Standard Errors**
+    
+    Three options are available:
+    
+    - **Conventional**: Assumes homoskedasticity. Use when error variance
+      is believed constant across observations.
+    
+    - **HC3 Robust**: Heteroskedasticity-consistent standard errors.
+      Recommended when error variance may vary with X.
+    
+    - **Clustered**: For data with within-cluster correlation
+      (e.g., students within schools, observations over time).
+    
+    References
+    ----------
+    Angrist, J. D., & Pischke, J. S. (2009). Mostly Harmless Econometrics:
+    An Empiricist's Companion. Princeton University Press.
+    
+    Stock, J. H., & Yogo, M. (2005). Testing for Weak Instruments in Linear
+    IV Regression. In D. W. K. Andrews & J. H. Stock (Eds.), Identification
+    and Inference for Econometric Models (pp. 80-108). Cambridge University Press.
+    
+    Staiger, D., & Stock, J. H. (1997). Instrumental Variables Regression with
+    Weak Instruments. Econometrica, 65(3), 557-586.
+    
+    See Also
+    --------
+    TwoStageLSResult : Result class with coefficients and diagnostics.
+    linear_regression : For standard OLS regression without instruments.
+    dml : For causal inference using machine learning methods.
+    """
+    # Normalize d_cols to always be a list
+    if isinstance(d_cols, str):
+        d_cols_list = [d_cols]
+    else:
+        d_cols_list = list(d_cols)
+    
+    # Normalize z_cols to always be a list
+    if isinstance(z_cols, str):
+        z_cols_list = [z_cols]
+    else:
+        z_cols_list = list(z_cols)
+    
+    # Normalize x_cols to a list or None
+    x_cols_list: _Optional[_List[str]] = None
+    if x_cols is not None:
+        if isinstance(x_cols, str):
+            x_cols_list = [x_cols]
+        else:
+            x_cols_list = list(x_cols)
+    
+    # Detect and convert pandas DataFrames if needed
+    all_cols = [y_col] + d_cols_list + z_cols_list
+    if x_cols_list:
+        all_cols.extend(x_cols_list)
+    if cluster:
+        all_cols.append(cluster)
+    df = _convert_dataframe_if_pandas(df, all_cols)
+    
+    # Check for float cluster column and emit warning
+    _warn_if_float_cluster(df, cluster)
+    
+    # Call the Rust implementation
+    result = _two_stage_least_squares_rust(
+        df,
+        y_col,
+        d_cols_list,
+        z_cols_list,
+        x_cols_list,
+        include_intercept,
+        robust,
+        cluster,
+    )
+    
+    # ========================================================================
+    # Emit warnings via warnings.warn()
+    # ========================================================================
+    
+    # Weak instruments warning (F < 10 but >= 4)
+    # Note: F < 4 raises an error in Rust, so we only warn for 4 <= F < 10
+    for i, f_stat in enumerate(result.first_stage_f):
+        if f_stat < 10.0:
+            endog_name = d_cols_list[i] if i < len(d_cols_list) else f"D{i}"
+            _warnings.warn(
+                f"Weak instruments: first-stage F-statistic ({f_stat:.2f}) is below 10 "
+                f"for endogenous variable '{endog_name}'",
+                UserWarning,
+                stacklevel=2,
+            )
+    
+    # Cragg-Donald below Stock-Yogo critical value
+    if result.cragg_donald is not None and result.stock_yogo_critical is not None:
+        if result.cragg_donald < result.stock_yogo_critical:
+            _warnings.warn(
+                f"Cragg-Donald statistic ({result.cragg_donald:.2f}) is below "
+                f"Stock-Yogo 10% critical value ({result.stock_yogo_critical:.2f})",
+                UserWarning,
+                stacklevel=2,
+            )
+    
+    # Many instruments relative to sample size
+    if result.n_instruments > result.n_samples // 10:
+        _warnings.warn(
+            f"Large number of instruments ({result.n_instruments}) relative to "
+            f"sample size ({result.n_samples}); consider using fewer",
+            UserWarning,
+            stacklevel=2,
+        )
+    
+    return result

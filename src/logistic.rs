@@ -23,13 +23,14 @@
 use crate::linalg::{
     cholesky_solve, compute_hc3_logistic_vcov, compute_residuals_inplace,
     compute_weighted_leverages_batch, compute_weights_inplace, compute_xtr_inplace,
-    compute_xtwx_inplace, invert_xtx, mat_to_vec, mat_vec_mul, mat_vec_mul_inplace, vec_to_mat,
-    LinalgError,
+    compute_xtwx_inplace, invert_xtx, mat_to_vec, mat_vec_mul, mat_vec_mul_inplace,
+    matrix_vector_multiply, vec_to_mat, LinalgError,
 };
 use faer::{Col, Mat};
 use pyo3::prelude::*;
 
 // Re-export vec_to_mat for external use (tests, lib.rs)
+#[allow(unused_imports)]
 pub use crate::linalg::vec_to_mat as linalg_vec_to_mat;
 
 /// Result of a logistic regression computation.
@@ -86,6 +87,21 @@ pub struct LogisticRegressionResult {
     /// McFadden's pseudo R² = 1 - (LL_model / LL_null)
     #[pyo3(get)]
     pub pseudo_r_squared: f64,
+
+    /// Number of unique groups per FE dimension (e.g., [100, 20] for 100 entities, 20 time periods)
+    /// None when fixed_effects is not used.
+    #[pyo3(get)]
+    pub fixed_effects_absorbed: Option<Vec<usize>>,
+
+    /// Column names of absorbed fixed effects (e.g., ["entity", "time"])
+    /// None when fixed_effects is not used.
+    #[pyo3(get)]
+    pub fixed_effects_names: Option<Vec<String>>,
+
+    /// Pseudo R² computed on the Mundlak-augmented model (within-pseudo R²)
+    /// None when fixed_effects is not used.
+    #[pyo3(get)]
+    pub within_pseudo_r_squared: Option<f64>,
 }
 
 #[pymethods]
@@ -112,8 +128,20 @@ impl LogisticRegressionResult {
             Some(b) => b.to_string(),
             None => "None".to_string(),
         };
+        let fe_absorbed_str = match &self.fixed_effects_absorbed {
+            Some(v) => format!("{:?}", v),
+            None => "None".to_string(),
+        };
+        let fe_names_str = match &self.fixed_effects_names {
+            Some(v) => format!("{:?}", v),
+            None => "None".to_string(),
+        };
+        let within_r2_str = match self.within_pseudo_r_squared {
+            Some(r) => format!("{:.6}", r),
+            None => "None".to_string(),
+        };
         format!(
-            "LogisticRegressionResult(coefficients={:?}, intercept={}, standard_errors={:?}, intercept_se={}, n_samples={}, n_clusters={}, cluster_se_type={}, bootstrap_iterations_used={}, converged={}, iterations={}, log_likelihood={:.6}, pseudo_r_squared={:.6})",
+            "LogisticRegressionResult(coefficients={:?}, intercept={}, standard_errors={:?}, intercept_se={}, n_samples={}, n_clusters={}, cluster_se_type={}, bootstrap_iterations_used={}, converged={}, iterations={}, log_likelihood={:.6}, pseudo_r_squared={:.6}, fixed_effects_absorbed={}, fixed_effects_names={}, within_pseudo_r_squared={})",
             self.coefficients,
             intercept_str,
             self.standard_errors,
@@ -125,7 +153,10 @@ impl LogisticRegressionResult {
             self.converged,
             self.iterations,
             self.log_likelihood,
-            self.pseudo_r_squared
+            self.pseudo_r_squared,
+            fe_absorbed_str,
+            fe_names_str,
+            within_r2_str
         )
     }
 
@@ -176,6 +207,21 @@ impl LogisticRegressionResult {
             ));
         }
 
+        // Add fixed effects info if present
+        if let Some(ref fe_names) = self.fixed_effects_names {
+            if let Some(ref fe_absorbed) = self.fixed_effects_absorbed {
+                let fe_info: Vec<String> = fe_names
+                    .iter()
+                    .zip(fe_absorbed.iter())
+                    .map(|(name, count)| format!("{} ({} groups)", name, count))
+                    .collect();
+                output.push_str(&format!("\n  Fixed Effects: {}", fe_info.join(", ")));
+            }
+            if let Some(within_r2) = self.within_pseudo_r_squared {
+                output.push_str(&format!("\n  Within Pseudo R²: {:.3}", within_r2));
+            }
+        }
+
         output
     }
 }
@@ -218,6 +264,10 @@ impl std::fmt::Display for LogisticError {
 impl std::error::Error for LogisticError {}
 
 /// Internal result from MLE optimization.
+///
+/// This structure contains all intermediate results from the Newton-Raphson
+/// optimization process, including coefficient estimates, convergence status,
+/// and diagnostic information needed for computing standard errors.
 pub struct MleResult {
     /// Estimated coefficients (including intercept if applicable)
     pub beta: Vec<f64>,
@@ -259,6 +309,10 @@ pub fn dot(a: &[f64], b: &[f64]) -> f64 {
 /// Compute X' × v (X transpose times vector).
 ///
 /// X is (n × p), v is (n,), result is (p,).
+///
+/// Note: This is a legacy Vec<Vec> implementation kept for compatibility.
+/// New code should use faer-based operations from the linalg module.
+#[allow(dead_code)]
 pub fn xt_vector_multiply(x: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
     if x.is_empty() {
         return vec![];
@@ -278,6 +332,10 @@ pub fn xt_vector_multiply(x: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
 /// Compute X' W X where W is a diagonal matrix represented as a vector.
 ///
 /// X is (n × p), W is diagonal (n,), result is (p × p).
+///
+/// Note: This is a legacy Vec<Vec> implementation kept for compatibility.
+/// New code should use faer-based operations from the linalg module.
+#[allow(dead_code)]
 pub fn xt_w_x(x: &[Vec<f64>], w: &[f64]) -> Vec<Vec<f64>> {
     if x.is_empty() {
         return vec![];
@@ -296,121 +354,6 @@ pub fn xt_w_x(x: &[Vec<f64>], w: &[f64]) -> Vec<Vec<f64>> {
     result
 }
 
-/// Multiply a matrix by a vector: result = A × v
-pub fn matrix_vector_multiply(a: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
-    let m = a.len();
-    let mut result = Vec::with_capacity(m);
-
-    for row in a.iter() {
-        let mut sum = 0.0;
-        for (j, &val) in row.iter().enumerate() {
-            sum += val * v[j];
-        }
-        result.push(sum);
-    }
-
-    result
-}
-
-/// Multiply two matrices: C = A × B
-pub fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let m = a.len();
-    if m == 0 {
-        return vec![];
-    }
-    let k = a[0].len();
-    if k == 0 || b.is_empty() {
-        return vec![vec![]; m];
-    }
-    let n = b[0].len();
-
-    let mut result = vec![vec![0.0; n]; m];
-
-    for (i, a_row) in a.iter().enumerate() {
-        for j in 0..n {
-            let mut sum = 0.0;
-            for (l, &a_val) in a_row.iter().enumerate() {
-                sum += a_val * b[l][j];
-            }
-            result[i][j] = sum;
-        }
-    }
-
-    result
-}
-
-/// Invert a square matrix using Gauss-Jordan elimination with partial pivoting.
-pub fn invert_matrix(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, LogisticError> {
-    let n = a.len();
-    if n == 0 {
-        return Err(LogisticError::SingularHessian);
-    }
-
-    // Verify square matrix
-    for row in a.iter() {
-        if row.len() != n {
-            return Err(LogisticError::SingularHessian);
-        }
-    }
-
-    // Create augmented matrix [A|I]
-    let mut aug: Vec<Vec<f64>> = Vec::with_capacity(n);
-    for (i, a_row) in a.iter().enumerate() {
-        let mut row = Vec::with_capacity(2 * n);
-        row.extend_from_slice(a_row);
-        for j in 0..n {
-            row.push(if i == j { 1.0 } else { 0.0 });
-        }
-        aug.push(row);
-    }
-
-    // Gauss-Jordan elimination with partial pivoting
-    for col in 0..n {
-        // Find pivot
-        let mut max_row = col;
-        let mut max_val = aug[col][col].abs();
-        #[allow(clippy::needless_range_loop)]
-        for row in (col + 1)..n {
-            // Index needed for row swapping and in-place modification
-            let val = aug[row][col].abs();
-            if val > max_val {
-                max_val = val;
-                max_row = row;
-            }
-        }
-
-        if max_val < 1e-10 {
-            return Err(LogisticError::SingularHessian);
-        }
-
-        if max_row != col {
-            aug.swap(col, max_row);
-        }
-
-        let pivot = aug[col][col];
-        for j in 0..(2 * n) {
-            aug[col][j] /= pivot;
-        }
-
-        for row in 0..n {
-            if row != col {
-                let factor = aug[row][col];
-                for j in 0..(2 * n) {
-                    aug[row][j] -= factor * aug[col][j];
-                }
-            }
-        }
-    }
-
-    // Extract inverse
-    let mut inverse: Vec<Vec<f64>> = Vec::with_capacity(n);
-    for aug_row in aug.iter() {
-        inverse.push(aug_row[n..(2 * n)].to_vec());
-    }
-
-    Ok(inverse)
-}
-
 // ============================================================================
 // Log-likelihood computation
 // ============================================================================
@@ -420,6 +363,10 @@ pub fn invert_matrix(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, LogisticError> {
 /// L(β) = Σᵢ [yᵢ log(πᵢ) + (1-yᵢ) log(1-πᵢ)]
 ///
 /// Handles numerical stability by clipping probabilities to [1e-15, 1-1e-15].
+///
+/// Note: This is a legacy Vec<Vec> implementation kept for compatibility.
+/// New code should use [`compute_log_likelihood_faer`] for better performance.
+#[allow(dead_code)]
 pub fn compute_log_likelihood(x: &[Vec<f64>], y: &[f64], beta: &[f64]) -> f64 {
     let mut ll = 0.0;
     let epsilon = 1e-15;
@@ -445,10 +392,10 @@ pub fn compute_log_likelihood(x: &[Vec<f64>], y: &[f64], beta: &[f64]) -> f64 {
 #[inline]
 pub fn compute_log_likelihood_faer(x_mat: &Mat<f64>, y: &[f64], beta: &[f64]) -> f64 {
     let epsilon = 1e-15;
-    
+
     // Compute all linear predictions at once: Xβ
     let linear_preds = mat_vec_mul(x_mat, beta);
-    
+
     // Compute log-likelihood
     let mut ll = 0.0;
     for (&lp, &yi) in linear_preds.iter().zip(y.iter()) {
@@ -456,7 +403,7 @@ pub fn compute_log_likelihood_faer(x_mat: &Mat<f64>, y: &[f64], beta: &[f64]) ->
         let pi_clipped = pi.max(epsilon).min(1.0 - epsilon);
         ll += yi * pi_clipped.ln() + (1.0 - yi) * (1.0 - pi_clipped).ln();
     }
-    
+
     ll
 }
 
@@ -493,10 +440,10 @@ pub fn compute_pseudo_r_squared(ll_model: f64, ll_null: f64) -> f64 {
 // Newton-Raphson MLE solver
 // ============================================================================
 
-/// Maximum number of Newton-Raphson iterations (REQ-012)
+/// Maximum number of Newton-Raphson iterations
 const MAX_ITERATIONS: usize = 35;
 
-/// Convergence tolerance for gradient norm (REQ-013)
+/// Convergence tolerance for gradient norm
 const CONVERGENCE_TOL: f64 = 1e-8;
 
 /// Minimum weight floor to prevent numerical issues
@@ -529,40 +476,6 @@ fn detect_separation(beta: &[f64], pi: &[f64]) -> bool {
 /// Check for NaN or Inf in a vector.
 fn has_invalid_values(v: &[f64]) -> bool {
     v.iter().any(|&x| x.is_nan() || x.is_infinite())
-}
-
-/// Compute Newton step with step halving for numerical stability.
-///
-/// Returns true if a valid step was found, false otherwise.
-fn newton_step_with_halving(beta: &mut [f64], delta: &[f64], x: &[Vec<f64>], y: &[f64]) -> bool {
-    let old_ll = compute_log_likelihood(x, y, beta);
-    let p = beta.len();
-
-    for halving in 0..MAX_STEP_HALVINGS {
-        let step_size = 0.5_f64.powi(halving);
-
-        // Compute new beta
-        let beta_new: Vec<f64> = beta
-            .iter()
-            .zip(delta.iter())
-            .map(|(&b, &d)| b + step_size * d)
-            .collect();
-
-        // Check for invalid values
-        if has_invalid_values(&beta_new) {
-            continue;
-        }
-
-        let new_ll = compute_log_likelihood(x, y, &beta_new);
-
-        // Accept step if log-likelihood improves (or is close enough)
-        if new_ll >= old_ll - 1e-8 || (halving == MAX_STEP_HALVINGS - 1 && !new_ll.is_nan()) {
-            beta[..p].copy_from_slice(&beta_new[..p]);
-            return true;
-        }
-    }
-
-    false
 }
 
 /// Compute logistic regression MLE using Newton-Raphson algorithm.
@@ -601,7 +514,7 @@ pub fn compute_logistic_mle(x_mat: &Mat<f64>, y: &[f64]) -> Result<MleResult, Lo
     let mut converged = false;
     let mut iterations = 0;
     let mut info_inv_mat: Mat<f64> = Mat::zeros(p, p);
-    
+
     // Pre-allocate all buffers ONCE (reuse across iterations)
     // This eliminates ~n×6 allocations per iteration
     let mut linear_pred = vec![0.0; n];
@@ -611,11 +524,11 @@ pub fn compute_logistic_mle(x_mat: &Mat<f64>, y: &[f64]) -> Result<MleResult, Lo
     let mut gradient = vec![0.0; p];
     let mut x_weighted = Mat::<f64>::zeros(n, p);
     let mut hessian_mat = Mat::<f64>::zeros(p, p);
-    
+
     // Pre-allocate faer::Col buffers for SIMD matmul operations
     let mut linear_pred_col = Col::<f64>::zeros(n);
     let mut gradient_col = Col::<f64>::zeros(p);
-    
+
     // Cache log-likelihood for step halving optimization
     // Use faer for initial LL computation
     let mut current_ll = compute_log_likelihood_faer(x_mat, y, &beta);
@@ -626,7 +539,7 @@ pub fn compute_logistic_mle(x_mat: &Mat<f64>, y: &[f64]) -> Result<MleResult, Lo
         // Compute π = sigmoid(Xβ) using pre-allocated buffers and faer SIMD
         // Step 1: Compute linear predictions Xβ in-place with reusable Col buffer
         mat_vec_mul_inplace(x_mat, &beta, &mut linear_pred, &mut linear_pred_col);
-        
+
         // Step 2: Apply sigmoid in-place, storing results in pi
         for (p_i, &lp) in pi.iter_mut().zip(linear_pred.iter()) {
             *p_i = sigmoid(lp);
@@ -702,7 +615,8 @@ pub fn compute_logistic_mle(x_mat: &Mat<f64>, y: &[f64]) -> Result<MleResult, Lo
 
         // Apply Newton step with step halving using faer SIMD
         // Returns (success, new_ll) to avoid redundant LL recomputation
-        let (step_success, new_ll) = newton_step_with_halving_faer(&mut beta, &delta, x_mat, y, current_ll);
+        let (step_success, new_ll) =
+            newton_step_with_halving_faer(&mut beta, &delta, x_mat, y, current_ll);
 
         if !step_success {
             // Could not improve - check if we're close to optimum
@@ -765,48 +679,6 @@ pub fn compute_logistic_mle(x_mat: &Mat<f64>, y: &[f64]) -> Result<MleResult, Lo
     })
 }
 
-/// Compute Newton step with step halving, using cached likelihood.
-///
-/// This is an optimized version that avoids recomputing the old likelihood.
-///
-/// Returns true if a valid step was found, false otherwise.
-#[allow(dead_code)]
-fn newton_step_with_halving_cached(
-    beta: &mut [f64],
-    delta: &[f64],
-    x: &[Vec<f64>],
-    y: &[f64],
-    old_ll: f64,
-) -> bool {
-    let p = beta.len();
-
-    for halving in 0..MAX_STEP_HALVINGS {
-        let step_size = 0.5_f64.powi(halving);
-
-        // Compute new beta
-        let beta_new: Vec<f64> = beta
-            .iter()
-            .zip(delta.iter())
-            .map(|(&b, &d)| b + step_size * d)
-            .collect();
-
-        // Check for invalid values
-        if has_invalid_values(&beta_new) {
-            continue;
-        }
-
-        let new_ll = compute_log_likelihood(x, y, &beta_new);
-
-        // Accept step if log-likelihood improves (or is close enough)
-        if new_ll >= old_ll - 1e-8 || (halving == MAX_STEP_HALVINGS - 1 && !new_ll.is_nan()) {
-            beta[..p].copy_from_slice(&beta_new[..p]);
-            return true;
-        }
-    }
-
-    false
-}
-
 /// Compute Newton step with step halving using faer matrix for batch predictions.
 ///
 /// This is the optimized version that uses faer's mat_vec_mul for computing
@@ -850,66 +722,6 @@ fn newton_step_with_halving_faer(
     (false, old_ll)
 }
 
-/// Compute Newton step with step halving using pre-allocated buffers.
-///
-/// This version eliminates allocations during step halving by reusing
-/// pre-allocated beta_new and linear_pred buffers.
-///
-/// Returns true if a valid step was found, false otherwise.
-fn newton_step_with_halving_inplace(
-    beta: &mut [f64],
-    delta: &[f64],
-    x_mat: &Mat<f64>,
-    y: &[f64],
-    old_ll: f64,
-    beta_new: &mut [f64],
-    linear_pred: &mut [f64],
-) -> bool {
-    let n = x_mat.nrows();
-    let p = beta.len();
-    let epsilon = 1e-15;
-
-    for halving in 0..MAX_STEP_HALVINGS {
-        let step_size = 0.5_f64.powi(halving);
-
-        // Compute new beta in-place
-        for j in 0..p {
-            beta_new[j] = beta[j] + step_size * delta[j];
-        }
-
-        // Check for invalid values
-        if has_invalid_values(beta_new) {
-            continue;
-        }
-
-        // Compute log-likelihood without allocation
-        // Step 1: Compute linear predictions Xβ directly into linear_pred
-        for i in 0..n {
-            let mut sum = 0.0;
-            for j in 0..p {
-                sum += x_mat.read(i, j) * beta_new[j];
-            }
-            linear_pred[i] = sum;
-        }
-
-        // Step 2: Compute log-likelihood from linear predictions
-        let mut new_ll = 0.0;
-        for i in 0..n {
-            let pi = sigmoid(linear_pred[i]);
-            let pi_clipped = pi.max(epsilon).min(1.0 - epsilon);
-            new_ll += y[i] * pi_clipped.ln() + (1.0 - y[i]) * (1.0 - pi_clipped).ln();
-        }
-
-        // Accept step if log-likelihood improves (or is close enough)
-        if new_ll >= old_ll - 1e-8 || (halving == MAX_STEP_HALVINGS - 1 && !new_ll.is_nan()) {
-            beta[..p].copy_from_slice(&beta_new[..p]);
-            return true;
-        }
-    }
-
-    false
-}
-
 // ============================================================================
 // HC3 Standard Errors for Logistic Regression
 // ============================================================================
@@ -918,6 +730,10 @@ fn newton_step_with_halving_inplace(
 ///
 /// h_ii = w_i × x_i' (X'WX)⁻¹ x_i
 #[allow(dead_code)]
+#[deprecated(
+    since = "0.5.0",
+    note = "Legacy Vec<Vec> implementation. Use faer-based compute_leverages_faer instead."
+)]
 fn compute_weighted_leverages(
     x: &[Vec<f64>],
     weights: &[f64],
@@ -965,6 +781,10 @@ fn compute_weighted_leverages(
 ///
 /// # Returns
 /// * `Result<Vec<f64>, LogisticError>` - Standard errors (p,)
+///
+/// Note: This is a legacy Vec<Vec> implementation kept for compatibility.
+/// New code should use [`compute_hc3_logistic_faer`] for better performance.
+#[allow(dead_code)]
 pub fn compute_hc3_logistic(
     x: &[Vec<f64>],
     y: &[f64],
@@ -984,17 +804,16 @@ pub fn compute_hc3_logistic(
     let residuals: Vec<f64> = y.iter().zip(pi).map(|(&yi, &pi)| yi - pi).collect();
 
     // Compute weighted leverages using faer batch operation
-    let leverages = compute_weighted_leverages_batch(&x_mat, &weights, &info_inv_mat).map_err(
-        |e| match e {
+    let leverages =
+        compute_weighted_leverages_batch(&x_mat, &weights, &info_inv_mat).map_err(|e| match e {
             LinalgError::NumericalInstability => LogisticError::NumericalInstability {
-                message:
-                    "Extreme leverage detected; HC3 standard errors may be unreliable".to_string(),
+                message: "Extreme leverage detected; HC3 standard errors may be unreliable"
+                    .to_string(),
             },
             _ => LogisticError::NumericalInstability {
                 message: "Error in leverage computation".to_string(),
             },
-        },
-    )?;
+        })?;
 
     // Compute HC3 variance-covariance using faer
     let vcov_mat = compute_hc3_logistic_vcov(&x_mat, &residuals, &leverages, &info_inv_mat);
@@ -1042,17 +861,16 @@ pub fn compute_hc3_logistic_faer(
     let residuals: Vec<f64> = y.iter().zip(pi).map(|(&yi, &pi)| yi - pi).collect();
 
     // Compute weighted leverages using faer batch operation
-    let leverages = compute_weighted_leverages_batch(x_mat, &weights, info_inv_mat).map_err(
-        |e| match e {
+    let leverages =
+        compute_weighted_leverages_batch(x_mat, &weights, info_inv_mat).map_err(|e| match e {
             LinalgError::NumericalInstability => LogisticError::NumericalInstability {
-                message:
-                    "Extreme leverage detected; HC3 standard errors may be unreliable".to_string(),
+                message: "Extreme leverage detected; HC3 standard errors may be unreliable"
+                    .to_string(),
             },
             _ => LogisticError::NumericalInstability {
                 message: "Error in leverage computation".to_string(),
             },
-        },
-    )?;
+        })?;
 
     // Compute HC3 variance-covariance using faer
     let vcov_mat = compute_hc3_logistic_vcov(x_mat, &residuals, &leverages, info_inv_mat);
@@ -1179,26 +997,5 @@ mod tests {
         let beta_normal = vec![1.0, 2.0];
         let pi_normal = vec![0.3, 0.7];
         assert!(!detect_separation(&beta_normal, &pi_normal));
-    }
-
-    #[test]
-    fn test_invert_matrix_2x2() {
-        // Test matrix inversion on simple 2x2
-        let a = vec![vec![4.0, 7.0], vec![2.0, 6.0]];
-        let a_inv = invert_matrix(&a).unwrap();
-
-        // Expected: [[0.6, -0.7], [-0.2, 0.4]]
-        assert_relative_eq!(a_inv[0][0], 0.6, epsilon = 1e-10);
-        assert_relative_eq!(a_inv[0][1], -0.7, epsilon = 1e-10);
-        assert_relative_eq!(a_inv[1][0], -0.2, epsilon = 1e-10);
-        assert_relative_eq!(a_inv[1][1], 0.4, epsilon = 1e-10);
-    }
-
-    #[test]
-    fn test_singular_matrix_error() {
-        // Singular matrix should return error
-        let a = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
-        let result = invert_matrix(&a);
-        assert!(result.is_err());
     }
 }

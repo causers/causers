@@ -1,15 +1,17 @@
 """Edge case tests for causers package.
 
 This module validates the handling of edge cases and error conditions:
-- REQ-020: Error messages are clear and actionable
-- REQ-050: Memory safety without unsafe blocks
+- Error messages are clear and actionable
+- Memory safety without unsafe blocks
 """
 
-import pytest
-import polars as pl
-import numpy as np
-from causers import linear_regression, LinearRegressionResult
 import warnings
+
+import numpy as np
+import polars as pl
+import pytest
+
+from causers import linear_regression, LinearRegressionResult
 
 
 class TestEdgeCases:
@@ -19,7 +21,7 @@ class TestEdgeCases:
         """Test handling of single data point.
         
         With only one data point, regression is undefined.
-        Should raise a clear error (REQ-020).
+        Should raise a clear error.
         """
         df = pl.DataFrame({
             "x": [1.0],
@@ -29,7 +31,7 @@ class TestEdgeCases:
         with pytest.raises(ValueError) as excinfo:
             linear_regression(df, "x", "y")
         
-        # REQ-020: Error messages should be clear and actionable
+        # Error messages should be clear and actionable
         assert "variance" in str(excinfo.value).lower() or \
                "single" in str(excinfo.value).lower() or \
                "at least" in str(excinfo.value).lower(), \
@@ -73,7 +75,7 @@ class TestEdgeCases:
         """Test handling when all x values are the same.
         
         When x has zero variance, regression is undefined.
-        Should raise a clear error (REQ-020).
+        Should raise a clear error.
         """
         df = pl.DataFrame({
             "x": [5.0, 5.0, 5.0, 5.0],
@@ -83,7 +85,7 @@ class TestEdgeCases:
         with pytest.raises(ValueError) as excinfo:
             linear_regression(df, "x", "y")
         
-        # REQ-020: Error messages should be clear and actionable
+        # Error messages should be clear and actionable
         # Zero variance leads to singular matrix (X'X is not invertible)
         assert "zero variance" in str(excinfo.value).lower() or \
                "constant" in str(excinfo.value).lower() or \
@@ -124,7 +126,7 @@ class TestEdgeCases:
             # If it succeeds, check that NaNs were handled
             assert result.n_samples <= 4  # Should exclude the NaN row
         except Exception as e:
-            # If it raises an error, it should be clear (REQ-020)
+            # If it raises an error, it should be clear
             # Updated to accept "singular" as Rust returns this for NaN cases
             error_lower = str(e).lower()
             assert any(word in error_lower for word in ["nan", "missing", "singular"]), \
@@ -146,7 +148,7 @@ class TestEdgeCases:
             # If it succeeds, check that NaNs were handled
             assert result.n_samples <= 4  # Should exclude the NaN row
         except Exception as e:
-            # If it raises an error, it should be clear (REQ-020)
+            # If it raises an error, it should be clear
             assert "nan" in str(e).lower() or "missing" in str(e).lower(), \
                    f"Error message not clear for NaN values: {e}"
     
@@ -168,7 +170,7 @@ class TestEdgeCases:
             assert np.isfinite(result.slope)
             assert np.isfinite(result.intercept)
         except Exception as e:
-            # REQ-020: Error should be clear
+            # Error should be clear
             assert "inf" in str(e).lower() or "infinite" in str(e).lower(), \
                    f"Error message not clear for infinite values: {e}"
     
@@ -190,7 +192,7 @@ class TestEdgeCases:
             assert np.isfinite(result.slope)
             assert np.isfinite(result.intercept)
         except Exception as e:
-            # REQ-020: Error should be clear
+            # Error should be clear
             assert "inf" in str(e).lower() or "infinite" in str(e).lower(), \
                    f"Error message not clear for infinite values: {e}"
     
@@ -209,7 +211,7 @@ class TestEdgeCases:
             assert np.isfinite(result.slope)
             assert np.isfinite(result.intercept)
         except Exception as e:
-            # REQ-020: Error should be clear
+            # Error should be clear
             assert "inf" in str(e).lower() or "infinite" in str(e).lower(), \
                    f"Error message not clear for negative infinite values: {e}"
     
@@ -344,7 +346,7 @@ class TestEdgeCases:
     def test_empty_after_filtering(self):
         """Test case where filtering NaN/inf leaves no valid data.
         
-        Should raise a clear error (REQ-020).
+        Should raise a clear error.
         """
         df = pl.DataFrame({
             "x": [np.nan, np.nan, np.nan],
@@ -355,7 +357,7 @@ class TestEdgeCases:
         with pytest.raises(Exception) as excinfo:
             linear_regression(df, "x", "y")
         
-        # REQ-020: Error message should be clear
+        # Error message should be clear
         error_msg = str(excinfo.value).lower()
         assert any(word in error_msg for word in ["empty", "no valid", "no data", "nan"]), \
                f"Error message not clear for empty data after filtering: {excinfo.value}"

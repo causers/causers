@@ -2,20 +2,21 @@
 
 This module validates performance expectations for regression with HC3 standard errors.
 
-Note: The original REQ-037 (<100ms for 1M rows) was for basic OLS without HC3.
+Note: The original target (<100ms for 1M rows) was for basic OLS without HC3.
 With HC3 standard error computation (which requires computing leverage for each
 observation), performance overhead is expected. The current implementation
 prioritizes correctness and numerical stability over raw speed.
 
-Additional tests added for TASK-020:
-- REQ-PERF-001: Webb bootstrap ≤ 1.10× Rademacher bootstrap time
+Additional tests added:
+- Webb bootstrap ≤ 1.10× Rademacher bootstrap time
 """
 
 import time
-import warnings
-import pytest
-import polars as pl
+
 import numpy as np
+import polars as pl
+import pytest
+
 from causers import linear_regression
 
 
@@ -81,7 +82,7 @@ class TestPerformance:
     def test_performance_large_dataset_with_hc3(self):
         """Test performance on large dataset (1,000,000 rows) with HC3.
         
-        Note: Original REQ-037 (<100ms for 1M rows) was for OLS without HC3.
+        Note: Original target (<100ms for 1M rows) was for OLS without HC3.
         With HC3 standard error computation, additional overhead is expected
         due to per-observation leverage computation.
         """
@@ -206,13 +207,8 @@ class TestPerformance:
         print(f"Worst-case data (1M rows): {elapsed:.2f}ms")
 
 
-# =============================================================================
-# TASK-020: Webb vs Rademacher Performance Tests (REQ-PERF-001)
-# =============================================================================
-
-
 class TestWebbPerformance:
-    """Performance tests comparing Webb vs Rademacher bootstrap (REQ-PERF-001).
+    """Performance tests comparing Webb vs Rademacher bootstrap.
     
     These tests verify that Webb weights do not significantly impact
     bootstrap performance compared to Rademacher weights.
@@ -220,7 +216,7 @@ class TestWebbPerformance:
     
     @pytest.mark.slow
     def test_webb_performance_parity(self):
-        """Verify Webb bootstrap is within 10% of Rademacher time (REQ-PERF-001).
+        """Verify Webb bootstrap is within 10% of Rademacher time.
         
         Per spec: Webb time ≤ 1.10 × Rademacher time
         Benchmark: N=100,000 rows, G=100 clusters, B=1000 iterations

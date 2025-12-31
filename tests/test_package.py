@@ -1,9 +1,11 @@
 """Tests for package-level functionality."""
 
-import pytest
-import causers
-from io import StringIO
 import sys
+from io import StringIO
+
+import pytest
+
+import causers
 
 
 class TestPackage:

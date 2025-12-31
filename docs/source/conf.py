@@ -5,8 +5,8 @@
 project = 'causers'
 copyright = '2025, James Nordlund'
 author = 'James Nordlund'
-version = '0.5.1'
-release = '0.5.1'
+version = '0.7.0'
+release = '0.7.0'
 
 # -- General configuration ---------------------------------------------------
 extensions = [

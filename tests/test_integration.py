@@ -4,12 +4,17 @@ This module validates the complete workflow and integration
 of all components working together.
 """
 
-import pytest
-import polars as pl
-import numpy as np
-from causers import linear_regression, LinearRegressionResult
-import tempfile
+# Standard library imports
 import os
+import tempfile
+
+# Third-party imports
+import numpy as np
+import polars as pl
+import pytest
+
+# Local imports
+from causers import LinearRegressionResult, linear_regression
 
 
 class TestIntegration:

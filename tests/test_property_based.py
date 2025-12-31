@@ -4,40 +4,52 @@ This module uses property-based testing to validate the mathematical
 properties and invariants of linear regression.
 """
 
-import pytest
-import polars as pl
+# Third-party imports
 import numpy as np
-from causers import linear_regression
+import polars as pl
+import pytest
+
 try:
-    from hypothesis import given, strategies as st, assume, settings
+    from hypothesis import assume, given, settings, strategies as st
     from hypothesis.extra import numpy as npst
     HYPOTHESIS_AVAILABLE = True
 except ImportError:
     HYPOTHESIS_AVAILABLE = False
+    
     # Define dummy decorators if hypothesis is not available
     def given(*args, **kwargs):
+        """Dummy decorator for when hypothesis is not available."""
         def decorator(func):
             func.skip_hypothesis = True
             return func
         return decorator
+    
     class st:
+        """Dummy strategies class for when hypothesis is not available."""
         @staticmethod
         def floats(*args, **kwargs):
             pass
+        
         @staticmethod
         def integers(*args, **kwargs):
             pass
+        
         @staticmethod
         def lists(*args, **kwargs):
             pass
+        
         @staticmethod
         def tuples(*args, **kwargs):
             pass
+    
     def settings(*args, **kwargs):
-        # Dummy decorator for settings when hypothesis is not available
+        """Dummy decorator for settings when hypothesis is not available."""
         def decorator(func):
             return func
         return decorator
+
+# Local imports
+from causers import linear_regression
 
 
 class TestPropertyBased:

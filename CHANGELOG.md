@@ -5,6 +5,416 @@ All notable changes to the causers project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [0.7.0] - 2025-12-30
+
+### 🎯 Overview
+
+Version 0.7.0 is a major feature release that adds four significant capabilities:
+
+1. **pandas DataFrame Support**: All causers functions now accept both Polars and pandas DataFrames seamlessly
+2. **Fixed Effects Estimation**: Control for entity-level or time-level unobserved heterogeneity
+   - **Linear Regression (OLS)**: Within-transformation (de-meaning) for efficient fixed effects absorption
+   - **Logistic Regression**: Mundlak (1978) approach for nonlinear models with fixed effects
+3. **Double Machine Learning (DML)**: Debiased causal inference with cross-fitting for ATE and CATE estimation (Chernozhukov et al., 2018)
+4. **Two-Stage Least Squares (IV/2SLS)**: Instrumental variables estimation for causal inference with endogenous treatments
+
+---
+
+### ✨ Features
+
+#### pandas DataFrame Input Support
+
+All main functions now accept both Polars and pandas DataFrames:
+
+```python
+import pandas as pd
+import causers
+
+# pandas DataFrames now work directly!
+df_pandas = pd.DataFrame({"x": [1, 2, 3, 4], "y": [2, 4, 6, 8]})
+result = causers.linear_regression(df_pandas, "x", "y")
+
+# Polars DataFrames continue to work unchanged
+import polars as pl
+df_polars = pl.DataFrame({"x": [1, 2, 3, 4], "y": [2, 4, 6, 8]})
+result = causers.linear_regression(df_polars, "x", "y")
+```
+
+**Dual Extraction Paths**: Optimized column extraction based on pandas column backend:
+- **Arrow-backed columns** (`pd.ArrowDtype`): Zero-copy extraction via PyArrow → Polars
+- **NumPy-backed columns** (traditional): Extraction via NumPy arrays with automatic dtype conversion
+
+**Optional Dependencies**: pandas support is optional to keep the package lightweight:
+```bash
+pip install causers           # Base installation (Polars only)
+pip install causers[pandas]   # With pandas support
+pip install causers[dev]      # All dependencies including pandas
+```
+
+#### Fixed Effects for Linear Regression
+
+The `linear_regression()` function now accepts an optional `fixed_effects` parameter:
+
+```python
+import polars as pl
+import causers
+
+# One-way fixed effects (entity FE)
+result = causers.linear_regression(
+    df=data,
+    x_cols=["x1", "x2"],
+    y_col="y",
+    fixed_effects=["entity_id"]
+)
+
+# Two-way fixed effects (entity + time FE)
+result = causers.linear_regression(
+    df=data,
+    x_cols=["x1", "x2"],
+    y_col="y",
+    fixed_effects=["entity_id", "time_id"]
+)
+```
+
+**Within-Transformation (De-meaning)**: For linear models, the standard within-transformation absorbs fixed effects efficiently:
+1. Compute group means of outcome and all covariates
+2. Subtract group means from each observation: (y_it - ȳ_i, X_it - X̄_i)
+3. Run standard OLS on the de-meaned data
+4. Intercept is not estimated (absorbed by fixed effects)
+
+**New Result Fields** (when `fixed_effects` is specified):
+- `fixed_effects_absorbed`: List[int] — Number of groups absorbed for each FE dimension
+- `fixed_effects_names`: List[str] — Names of the FE columns absorbed
+
+#### Fixed Effects for Logistic Regression
+
+The `logistic_regression()` function now accepts an optional `fixed_effects` parameter:
+
+```python
+import polars as pl
+import causers
+
+# One-way fixed effects (entity FE)
+result = causers.logistic_regression(
+    df=data,
+    x_cols=["x1", "x2"],
+    y_col="y",
+    fixed_effects=["entity_id"]
+)
+
+# Two-way fixed effects (entity + time FE)
+result = causers.logistic_regression(
+    df=data,
+    x_cols=["x1", "x2"],
+    y_col="y",
+    fixed_effects=["entity_id", "time_id"]
+)
+
+# Combined with clustering
+result = causers.logistic_regression(
+    df=data,
+    x_cols=["x1", "x2"],
+    y_col="y",
+    fixed_effects=["entity_id"],
+    cluster="cluster_id"
+)
+```
+
+**Mundlak Strategy**: For nonlinear models like logistic regression, standard within-transformation (demeaning) is not valid. The Mundlak (1978) approach provides an alternative:
+1. Compute group means of all covariates: X̄_g for each FE group g
+2. Augment the design matrix: [X | X̄_g1 | X̄_g2 | ...]
+3. Run standard logistic regression on the augmented model
+4. Return only the coefficients for the original X variables
+
+**Key behavior**:
+- Mundlak term coefficients are NOT reported in output (only original covariate coefficients)
+- Standard errors are computed on the full augmented model, then filtered to original covariates
+- Intercept is preserved (unlike linear regression demeaning)
+
+**New Result Fields** (when `fixed_effects` is specified):
+- `fixed_effects_absorbed`: List[int] — Number of groups absorbed for each FE dimension
+- `fixed_effects_names`: List[str] — Names of the FE columns absorbed
+- `within_pseudo_r_squared`: float — Pseudo R² computed on the Mundlak-augmented model
+
+#### Double Machine Learning (DML)
+
+New `dml()` function for debiased causal inference using the Chernozhukov et al. (2018) methodology:
+
+```python
+import polars as pl
+import causers
+
+result = causers.dml(
+    df,
+    y_col="outcome",           # Outcome variable
+    d_col="treatment",         # Binary treatment
+    x_cols=["age", "income"],  # Confounders/controls
+    n_folds=5,                 # Cross-fitting folds
+    alpha=0.05,                # Confidence level
+)
+
+print(f"ATE: {result.ate:.4f} ± {result.ate_se:.4f}")
+print(f"95% CI: [{result.ate_ci_lower:.4f}, {result.ate_ci_upper:.4f}]")
+```
+
+**Cross-Fitting Procedure**: DML uses cross-fitting to avoid overfitting bias:
+1. Split data into K folds (default: 5)
+2. For each fold, train nuisance models (outcome and propensity) on other folds
+3. Predict on held-out fold to get residualized outcomes
+4. Estimate treatment effect from residualized data
+5. Aggregate across folds for final ATE estimate
+
+**DMLResult**: New result class with comprehensive output:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ate` | `float` | Average Treatment Effect estimate |
+| `ate_se` | `float` | Standard error of ATE |
+| `ate_ci_lower` | `float` | Lower bound of confidence interval |
+| `ate_ci_upper` | `float` | Upper bound of confidence interval |
+| `n_samples` | `int` | Number of observations |
+| `n_treated` | `int` | Number of treated units |
+| `n_control` | `int` | Number of control units |
+| `n_folds` | `int` | Number of cross-fitting folds used |
+| `propensity_mean` | `float` | Mean predicted propensity score |
+| `outcome_r_squared` | `float` | R² of outcome model |
+| `n_clusters` | `int \| None` | Number of clusters (if clustered SE) |
+
+#### Two-Stage Least Squares (IV/2SLS)
+
+New `two_stage_least_squares()` function for instrumental variables estimation:
+
+```python
+import polars as pl
+import causers
+
+result = causers.two_stage_least_squares(
+    df,
+    y_col="wage",           # Outcome variable
+    d_cols="education",     # Endogenous treatment(s)
+    z_cols="quarter_born",  # Excluded instrument(s)
+    x_cols="age",           # Exogenous controls (optional)
+    robust=True,            # HC3 standard errors
+)
+
+print(f"Coefficient: {result.coefficients[0]:.4f}")
+print(f"First-stage F: {result.first_stage_f[0]:.1f}")
+```
+
+**Weak Instrument Diagnostics**: Comprehensive diagnostics for detecting weak instruments:
+- **First-stage F-statistic**: Per-endogenous-variable test; F > 10 is rule-of-thumb for strong instruments
+- **Cragg-Donald statistic**: Multivariate generalization for multiple endogenous variables
+- **Stock-Yogo critical values**: Lookup table for 10% maximal bias threshold
+
+```python
+# Diagnostics available in result
+print(f"First-stage F: {result.first_stage_f}")
+print(f"Cragg-Donald: {result.cragg_donald}")
+print(f"Stock-Yogo 10% critical: {result.stock_yogo_critical}")
+```
+
+**Three Standard Error Types**:
+- **Conventional**: Homoskedastic SE (default, matches statsmodels)
+- **HC3 Robust**: Heteroskedasticity-consistent via `robust=True`
+- **Clustered**: Cluster-robust SE via `cluster="cluster_col"`
+
+**TwoStageLSResult**: New result class with comprehensive output:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `coefficients` | `List[float]` | Structural equation coefficients (endogenous + exogenous) |
+| `standard_errors` | `List[float]` | Standard errors for all coefficients |
+| `intercept` | `float \| None` | Intercept term (if included) |
+| `intercept_se` | `float \| None` | SE for intercept |
+| `n_samples` | `int` | Number of observations |
+| `n_endogenous` | `int` | Number of endogenous regressors |
+| `n_instruments` | `int` | Number of excluded instruments |
+| `first_stage_f` | `List[float]` | F-statistics per endogenous variable |
+| `first_stage_coefficients` | `List[List[float]]` | First-stage coefficients (instruments only) |
+| `cragg_donald` | `float \| None` | Cragg-Donald statistic (multiple endogenous) |
+| `stock_yogo_critical` | `float \| None` | Stock-Yogo 10% critical value |
+| `r_squared` | `float` | R² from structural equation |
+| `se_type` | `str` | "conventional", "hc3", or "clustered" |
+| `n_clusters` | `int \| None` | Number of clusters (if clustered) |
+
+---
+
+### 🛠️ Technical Details
+
+**pandas Compatibility:**
+- New `python/causers/_pandas_compat.py` module handles all pandas compatibility
+- O(1) DataFrame type detection via `isinstance()` checks
+- Selective column extraction (only needed columns converted, not full DataFrame)
+- Input immutability guaranteed - original pandas DataFrame never modified
+- Version requirements: pandas ≥2.0.0, pyarrow ≥10.0.0
+
+**Fixed Effects:**
+- New `compute_mundlak_terms()` function in [`src/fixed_effects.rs`](src/fixed_effects.rs)
+- Extended `LogisticRegressionResult` struct with FE fields in [`src/logistic.rs`](src/logistic.rs)
+- Validation and augmentation logic in [`src/lib.rs`](src/lib.rs)
+- 24 new tests covering one-way FE, two-way FE, edge cases, and error conditions
+
+**Two-Stage Least Squares:**
+- New [`src/iv2sls.rs`](src/iv2sls.rs) module for 2SLS implementation
+- All numerical computation in Rust for performance
+- Matches statsmodels IV2SLS reference implementation
+
+---
+
+### 📖 API Changes
+
+**New Functions:**
+- `dml(df, y_col, d_col, x_cols, n_folds=5, alpha=0.05, propensity_clip=(0.01, 0.99), cluster=None, seed=None)` — Double Machine Learning for ATE estimation
+- `two_stage_least_squares(df, y_col, d_cols, z_cols, x_cols=None, include_intercept=True, robust=False, cluster=None)` — 2SLS estimation
+
+**New Classes:**
+- `DMLResult` — Container for DML results (ATE, SE, CI, diagnostics)
+- `TwoStageLSResult` — Container for 2SLS results and diagnostics
+
+**Updated Function Signatures:**
+
+All functions now accept `Union[pl.DataFrame, pd.DataFrame]` for the `df` parameter:
+- `linear_regression(df, x_cols, y_col, ...)` - Now accepts pandas; new `fixed_effects` parameter
+- `logistic_regression(df, x_cols, y_col, ...)` - Now accepts pandas; new `fixed_effects` parameter
+- `dml(df, y_col, d_col, x_cols, ...)` - Now accepts pandas
+- `synthetic_did(df, unit_col, time_col, ...)` - Now accepts pandas
+- `synthetic_control(df, unit_col, time_col, ...)` - Now accepts pandas
+
+**New Module:**
+- `causers._pandas_compat` - Internal pandas compatibility utilities
+
+**New Parameters (linear_regression, logistic_regression):**
+- `fixed_effects`: Column name(s) for fixed effects to absorb. Supports 1 or 2 columns.
+
+**New Parameters (dml):**
+- `y_col`: Outcome variable column
+- `d_col`: Binary treatment column
+- `x_cols`: Covariate/confounder columns
+- `n_folds`: Number of cross-fitting folds (2, 5, or 10; default: 5)
+- `alpha`: Significance level for confidence intervals (default: 0.05)
+- `propensity_clip`: Tuple for propensity score clipping (default: (0.01, 0.99))
+- `cluster`: Column for clustered standard errors (optional)
+- `seed`: Random seed for fold assignment (optional)
+
+**New Result Fields (LinearRegressionResult with fixed_effects):**
+- `fixed_effects_absorbed` (List[int] | None): Group counts per FE dimension
+- `fixed_effects_names` (List[str] | None): FE column names in order
+
+**New Result Fields (LogisticRegressionResult with fixed_effects):**
+- `fixed_effects_absorbed` (List[int] | None): Group counts per FE dimension
+- `fixed_effects_names` (List[str] | None): FE column names in order
+- `within_pseudo_r_squared` (float | None): Pseudo R² on augmented model
+
+**New Errors:**
+
+*pandas compatibility:*
+- `TypeError`: "Unsupported DataFrame type: {type}. Expected polars.DataFrame or pandas.DataFrame."
+- `ValueError`: "Column 'X' not found in DataFrame"
+- `ValueError`: "Column 'X' has object dtype which cannot be converted to numeric"
+- `ValueError`: "Column 'X' has datetime dtype which is not supported"
+- `ValueError`: "MultiIndex columns not supported. Please flatten column names."
+- `ValueError`: "MultiIndex rows not supported. Please reset_index() first."
+- `ValueError`: "Sparse columns not supported. Please convert to dense first."
+
+*Fixed effects:*
+- `ValueError`: "fixed_effects supports at most 2 columns"
+- `ValueError`: "Fixed effect column '{name}' not found in DataFrame"
+- `ValueError`: "Fixed effect column '{name}' cannot also be a covariate"
+- `ValueError`: "Fixed effect column '{name}' cannot be the outcome variable"
+- `ValueError`: "Fixed effect column '{name}' contains null values"
+- `ValueError`: "Fixed effect column '{name}' has only one unique value"
+- `ValueError`: "Mundlak terms cause collinearity; model is not identified"
+
+*Double Machine Learning:*
+- `ValueError`: "n_folds must be 2, 5, or 10; got N"
+- `ValueError`: "Number of folds K must be less than sample size N"
+- `ValueError`: "Treatment variable has no variation"
+- `ValueError`: "Treatment fully explained by covariates"
+- `ValueError`: "Propensity model failed to converge"
+- `ValueError`: "Covariate matrix is singular in fold N"
+- `ValueError`: "alpha must be in (0, 1)"
+- `ValueError`: "propensity_clip must satisfy 0 < low < high < 1"
+- `ValueError`: "Multi-valued categorical treatments not supported"
+- `ValueError`: "Multiple simultaneous treatments not supported"
+- `ValueError`: "Clustered standard errors require at least 2 clusters"
+- `ValueError`: "Column 'X' contains null values"
+- `ValueError`: "Numerical instability detected in fold N"
+
+*Two-Stage Least Squares:*
+- `ValueError`: "Number of instruments (m) must be ≥ number of endogenous variables (k₁)"
+- `ValueError`: "First stage design matrix is singular; check for collinear instruments"
+- `ValueError`: "Instruments too weak for reliable inference (F < 4)"
+- `ValueError`: "Column 'X' contains null values"
+
+**New Warnings:**
+
+*Fixed effects:*
+- `UserWarning`: When fixed_effects column is float type (implicit cast to integer)
+
+*Double Machine Learning:*
+- `UserWarning`: "Fold N has fewer than 100 observations; estimates may be unstable"
+
+*Two-Stage Least Squares:*
+- `UserWarning`: "Weak instruments: first-stage F-statistic (X.XX) is below 10 for endogenous variable 'D'"
+- `UserWarning`: "Cragg-Donald statistic (X.XX) is below Stock-Yogo 10% critical value (X.XX)"
+- `UserWarning`: "Large number of instruments (N) relative to sample size (M); consider using fewer"
+
+---
+
+### ✅ Validation
+
+**pandas Support:**
+- pandas and Polars produce numerically identical results (rtol=1e-6)
+- Comprehensive test coverage in `tests/test_pandas_support.py`
+- Benchmark tests for conversion paths in `tests/test_benchmark_performance.py`
+
+**Fixed Effects:**
+- Numerical accuracy validated against statsmodels (pyfixest does not support fixed effects for GLMs)
+- Coefficients match to rtol=1e-6
+- Standard errors match to rtol=1e-5
+- Log-likelihood match to rtol=1e-4
+- 24 new tests for fixed effects functionality
+- 100% Python API coverage maintained
+- Integration with clustering, bootstrap, and intercept options tested
+
+**Two-Stage Least Squares:**
+- Numerical accuracy validated against `statsmodels.regression.linear_model.IV2SLS`
+- Coefficients match to rtol=1e-6
+- Standard errors match to rtol=1e-5
+- First-stage F-statistic match to rtol=1e-4
+
+---
+
+### ⚠️ Breaking Changes
+
+None. All existing code continues to work unchanged. New parameters default to their backward-compatible values.
+
+---
+
+### 📦 Dependencies
+
+**New optional dependencies:**
+- `pandas>=2.0.0,<3.0.0` (optional)
+- `pyarrow>=10.0.0` (optional, for Arrow extraction path)
+
+Install with: `pip install causers[pandas]`
+
+No new runtime dependencies required for fixed effects or 2SLS features.
+
+---
+
+### 📚 References
+
+- Mundlak, Y. (1978). "On the Pooling of Time Series and Cross Section Data." *Econometrica*, 46(1), 69-85.
+- Wooldridge, J.M. (2010). *Econometric Analysis of Cross Section and Panel Data*. MIT Press, Chapter 15.
+- Chernozhukov, V., Chetverikov, D., Demirer, M., Duflo, E., Hansen, C., Newey, W., & Robins, J. (2018). "Double/debiased machine learning for treatment and structural parameters." *The Econometrics Journal*, 21(1), C1-C68.
+- Angrist, J. D., & Pischke, J. S. (2009). *Mostly Harmless Econometrics*. Princeton University Press.
+- Stock, J. H., & Yogo, M. (2005). "Testing for Weak Instruments in Linear IV Regression."
+- Staiger, D., & Stock, J. H. (1997). "Instrumental Variables Regression with Weak Instruments." *Econometrica*.
+
+---
+
 ## [0.6.0] - 2025-12-27
 
 ### 🎯 Overview: Performance Diagnostics and Improvements
@@ -636,8 +1046,8 @@ MIT License - see LICENSE file for details.
 
 ---
 
+[0.7.0]: https://github.com/causers/causers/releases/tag/v0.7.0
 [0.6.0]: https://github.com/causers/causers/releases/tag/v0.6.0
-[0.5.2]: https://github.com/causers/causers/releases/tag/v0.5.2
 [0.5.1]: https://github.com/causers/causers/releases/tag/v0.5.1
 [0.5.0]: https://github.com/causers/causers/releases/tag/v0.5.0
 [0.4.0]: https://github.com/causers/causers/releases/tag/v0.4.0

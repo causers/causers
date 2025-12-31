@@ -1,12 +1,24 @@
 //! Optimized linear algebra operations using faer.
 //!
-//! This module provides high-performance matrix operations for linear regression,
+//! This module provides high-performance matrix operations for causal inference and econometrics,
 //! leveraging the faer crate for BLAS-like performance without external dependencies.
+//!
+//! # Key Features
+//!
+//! - **Matrix operations**: Efficient computation of X'X, X'y, and matrix-vector products
+//! - **Solvers**: Numerically stable Cholesky-based equation solving
+//! - **Robust standard errors**: HC3 variance-covariance matrix computation
+//! - **Weighted operations**: Support for weighted regression (e.g., logistic regression)
+//! - **In-place operations**: Memory-efficient variants for iterative algorithms
+
+use std::error::Error;
+use std::fmt;
 
 use faer::linalg::matmul::matmul;
 use faer::linalg::matmul::triangular::{matmul as tri_matmul, BlockStructure};
 use faer::prelude::*;
 use faer::{Col, Mat, Parallelism};
+use pyo3::exceptions::PyValueError;
 use pyo3::PyResult;
 
 /// Error type for linear algebra operations
@@ -20,8 +32,8 @@ pub enum LinalgError {
     DimensionMismatch { expected: usize, got: usize },
 }
 
-impl std::fmt::Display for LinalgError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for LinalgError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LinalgError::SingularMatrix => write!(
                 f,
@@ -41,11 +53,11 @@ impl std::fmt::Display for LinalgError {
     }
 }
 
-impl std::error::Error for LinalgError {}
+impl Error for LinalgError {}
 
 impl From<LinalgError> for pyo3::PyErr {
-    fn from(e: LinalgError) -> pyo3::PyErr {
-        pyo3::exceptions::PyValueError::new_err(e.to_string())
+    fn from(e: LinalgError) -> Self {
+        PyValueError::new_err(e.to_string())
     }
 }
 
@@ -232,6 +244,191 @@ pub fn mat_vec_mul(x: &Mat<f64>, beta: &[f64]) -> Vec<f64> {
     col_to_vec(&result)
 }
 
+/// Multiply a matrix by a vector: result = A × v
+///
+/// This is a legacy Vec<Vec<f64>> implementation kept for compatibility.
+/// New code should use [`mat_vec_mul`] for faer-based matrix-vector multiplication.
+///
+/// # Arguments
+/// * `a` - Matrix of shape (m × n)
+/// * `v` - Vector of length n
+///
+/// # Returns
+/// * `Vec<f64>` - Result vector of length m
+#[allow(dead_code)]
+#[deprecated(
+    since = "0.5.0",
+    note = "Only used by deprecated Vec<Vec> functions. Use mat_vec_mul for new code."
+)]
+pub fn matrix_vector_multiply(a: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
+    let m = a.len();
+    let mut result = Vec::with_capacity(m);
+
+    for row in a.iter() {
+        let mut sum = 0.0;
+        for (j, &val) in row.iter().enumerate() {
+            sum += val * v[j];
+        }
+        result.push(sum);
+    }
+
+    result
+}
+
+/// Multiply two matrices: C = A × B
+///
+/// This is a legacy Vec<Vec<f64>> implementation kept for compatibility.
+/// New code should use faer-based matrix operations.
+///
+/// # Arguments
+/// * `a` - Matrix of shape (m × k)
+/// * `b` - Matrix of shape (k × n)
+///
+/// # Returns
+/// * `Vec<Vec<f64>>` - Result matrix of shape (m × n)
+///
+/// # Panics
+/// * Panics if dimensions are incompatible (a.ncols != b.nrows)
+#[allow(dead_code)]
+#[deprecated(
+    since = "0.5.0",
+    note = "Only used by deprecated Vec<Vec> functions. Use faer matmul for new code."
+)]
+pub fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let m = a.len();
+    if m == 0 {
+        return vec![];
+    }
+    let k = a[0].len();
+    if k == 0 || b.is_empty() {
+        return vec![vec![]; m];
+    }
+    let n = b[0].len();
+
+    let mut result = vec![vec![0.0; n]; m];
+
+    for (i, a_row) in a.iter().enumerate() {
+        for j in 0..n {
+            let mut sum = 0.0;
+            for (l, &a_val) in a_row.iter().enumerate() {
+                sum += a_val * b[l][j];
+            }
+            result[i][j] = sum;
+        }
+    }
+
+    result
+}
+
+/// Invert a square matrix using Gauss-Jordan elimination with partial pivoting.
+///
+/// This is a legacy Vec<Vec<f64>> implementation used by logistic regression and
+/// synthetic control methods. For new code, prefer faer-based operations.
+///
+/// # Algorithm
+/// Uses Gauss-Jordan elimination with partial pivoting:
+/// 1. Creates augmented matrix [A|I]
+/// 2. For each column, finds the pivot (row with maximum absolute value)
+/// 3. Swaps rows if needed for numerical stability
+/// 4. Scales pivot row to make diagonal element 1
+/// 5. Eliminates all other entries in the column
+/// 6. Extracts inverse from right half of augmented matrix
+///
+/// # Arguments
+/// * `a` - Square matrix to invert (n × n), stored as Vec<Vec<f64>>
+///
+/// # Returns
+/// * `Ok(inverse)` - Inverse matrix (n × n)
+/// * `Err(LinalgError::SingularMatrix)` - If matrix is singular (pivot < 1e-12)
+/// * `Err(LinalgError::DimensionMismatch)` - If matrix is not square or empty
+///
+/// # Example
+/// ```ignore
+/// let a = vec![vec![4.0, 7.0], vec![2.0, 6.0]];
+/// let a_inv = invert_matrix(&a).unwrap();
+/// // a_inv ≈ [[0.6, -0.7], [-0.2, 0.4]]
+/// ```
+pub fn invert_matrix(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, LinalgError> {
+    let n = a.len();
+    if n == 0 {
+        return Err(LinalgError::DimensionMismatch {
+            expected: 1,
+            got: 0,
+        });
+    }
+
+    // Verify square matrix
+    for row in a.iter() {
+        if row.len() != n {
+            return Err(LinalgError::DimensionMismatch {
+                expected: n,
+                got: row.len(),
+            });
+        }
+    }
+
+    // Create augmented matrix [A|I] of size (n × 2n)
+    let mut aug: Vec<Vec<f64>> = Vec::with_capacity(n);
+    for (i, a_row) in a.iter().enumerate() {
+        let mut row = Vec::with_capacity(2 * n);
+        // Copy A into left half
+        row.extend_from_slice(a_row);
+        // Add identity matrix to right half
+        for j in 0..n {
+            row.push(if i == j { 1.0 } else { 0.0 });
+        }
+        aug.push(row);
+    }
+
+    // Gauss-Jordan elimination with partial pivoting
+    for col in 0..n {
+        // Find pivot: row with maximum absolute value in current column
+        let mut max_row = col;
+        let mut max_val = aug[col][col].abs();
+        for row in (col + 1)..n {
+            let val = aug[row][col].abs();
+            if val > max_val {
+                max_val = val;
+                max_row = row;
+            }
+        }
+
+        // Check for singularity (pivot too small)
+        if max_val < 1e-12 {
+            return Err(LinalgError::SingularMatrix);
+        }
+
+        // Swap rows if needed
+        if max_row != col {
+            aug.swap(col, max_row);
+        }
+
+        // Scale pivot row so diagonal element becomes 1
+        let pivot = aug[col][col];
+        for j in 0..(2 * n) {
+            aug[col][j] /= pivot;
+        }
+
+        // Eliminate all other entries in this column (both above and below pivot)
+        for row in 0..n {
+            if row != col {
+                let factor = aug[row][col];
+                for j in 0..(2 * n) {
+                    aug[row][j] -= factor * aug[col][j];
+                }
+            }
+        }
+    }
+
+    // Extract inverse from right half of augmented matrix
+    let mut inverse: Vec<Vec<f64>> = Vec::with_capacity(n);
+    for aug_row in aug.iter() {
+        inverse.push(aug_row[n..(2 * n)].to_vec());
+    }
+
+    Ok(inverse)
+}
+
 /// Solve the normal equations (X'X)β = X'y via Cholesky decomposition.
 ///
 /// This is more numerically stable and faster than explicit matrix inversion.
@@ -308,10 +505,7 @@ pub fn invert_xtx(xtx: &Mat<f64>) -> Result<Mat<f64>, LinalgError> {
     // Try Cholesky decomposition
     let chol = xtx.cholesky(faer::Side::Lower);
 
-    let chol = match chol {
-        Ok(c) => c,
-        Err(_) => return Err(LinalgError::SingularMatrix),
-    };
+    let chol = chol.map_err(|_| LinalgError::SingularMatrix)?;
 
     // Solve for inverse by solving A * X = I
     let identity: Mat<f64> = Mat::identity(p, p);
@@ -367,7 +561,7 @@ pub fn compute_leverages_batch(x: &Mat<f64>, xtx_inv: &Mat<f64>) -> PyResult<Vec
         }
 
         if h_ii >= 0.99 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            return Err(PyValueError::new_err(format!(
                 "Observation {} has leverage ≥ 0.99; HC3 standard errors may be unreliable due to extreme leverage.",
                 i
             )));
@@ -538,10 +732,9 @@ pub fn cholesky_solve(h: &Mat<f64>, g: &[f64]) -> Result<Vec<f64>, LinalgError> 
     }
 
     // Attempt Cholesky decomposition
-    let chol = match h.cholesky(faer::Side::Lower) {
-        Ok(c) => c,
-        Err(_) => return Err(LinalgError::SingularMatrix),
-    };
+    let chol = h
+        .cholesky(faer::Side::Lower)
+        .map_err(|_| LinalgError::SingularMatrix)?;
 
     // Convert g to column matrix for solving
     let b = vec_to_col(g);
@@ -730,7 +923,12 @@ pub fn mat_vec_mul_inplace_direct(x: &Mat<f64>, beta: &[f64], result: &mut [f64]
 /// * `result` - Pre-allocated output buffer of shape (n,)
 /// * `result_col` - Pre-allocated faer::Col buffer of shape (n,)
 #[inline]
-pub fn mat_vec_mul_inplace(x: &Mat<f64>, beta: &[f64], result: &mut [f64], result_col: &mut Col<f64>) {
+pub fn mat_vec_mul_inplace(
+    x: &Mat<f64>,
+    beta: &[f64],
+    result: &mut [f64],
+    result_col: &mut Col<f64>,
+) {
     let n = x.nrows();
     let p = x.ncols();
     debug_assert_eq!(result.len(), n, "result buffer must have length n");
@@ -833,7 +1031,12 @@ pub fn compute_xtr_inplace(x: &Mat<f64>, r: &[f64], result: &mut [f64], result_c
 /// * `x_weighted` - Pre-allocated buffer for weighted X (n × p)
 /// * `result` - Pre-allocated output matrix (p × p)
 #[inline]
-pub fn compute_xtwx_inplace(x: &Mat<f64>, w: &[f64], x_weighted: &mut Mat<f64>, result: &mut Mat<f64>) {
+pub fn compute_xtwx_inplace(
+    x: &Mat<f64>,
+    w: &[f64],
+    x_weighted: &mut Mat<f64>,
+    result: &mut Mat<f64>,
+) {
     let n = x.nrows();
     let p = x.ncols();
 
@@ -850,7 +1053,7 @@ pub fn compute_xtwx_inplace(x: &Mat<f64>, w: &[f64], x_weighted: &mut Mat<f64>, 
     // Use Rayon parallelism for large matrices
     tri_matmul(
         result.as_mut(),
-        BlockStructure::TriangularLower,  // Only compute lower triangle
+        BlockStructure::TriangularLower, // Only compute lower triangle
         x_weighted.transpose(),
         BlockStructure::Rectangular,
         x_weighted.as_ref(),
@@ -1067,7 +1270,11 @@ mod tests {
 
         for i in 0..2 {
             for j in 0..2 {
-                assert_relative_eq!(result.read(i, j), 2.0 * xtx_result.read(i, j), epsilon = 1e-10);
+                assert_relative_eq!(
+                    result.read(i, j),
+                    2.0 * xtx_result.read(i, j),
+                    epsilon = 1e-10
+                );
             }
         }
     }
@@ -1130,17 +1337,17 @@ mod tests {
             vec![1.0, 3.0],
         ]);
         let weights = vec![0.25, 0.25, 0.25, 0.25];
-        
+
         // Compute X'WX and its inverse
         let xtwx = compute_xtwx(&x, &weights);
         let xtwx_inv = invert_xtx(&xtwx).unwrap();
-        
+
         let leverages = compute_weighted_leverages_batch(&x, &weights, &xtwx_inv);
         assert!(leverages.is_ok());
-        
+
         let h = leverages.unwrap();
         assert_eq!(h.len(), 4);
-        
+
         // All leverages should be positive and < 1
         for &h_ii in &h {
             assert!(h_ii >= 0.0);

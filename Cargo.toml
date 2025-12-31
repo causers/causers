@@ -1,6 +1,6 @@
 [package]
 name = "causers"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["James Nordlund"]
 license = "MIT"
@@ -27,6 +27,8 @@ polars = { version = "0.52", default-features = false, features = ["dtype-catego
 faer = "0.20"
 # rayon for parallel placebo bootstrap iterations
 rayon = "1.10"
+# statrs for statistical distributions (t-distribution CDF/quantile for inference)
+statrs = "0.18"
 
 [dev-dependencies]
 approx = "0.5"

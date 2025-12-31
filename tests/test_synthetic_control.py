@@ -1,25 +1,30 @@
 """Tests for Synthetic Control (SC) functionality.
 
 This test suite covers:
-- TASK-015: Basic unit tests for each method variant
-- TASK-016: Edge case tests and validation error tests
-- TASK-017: Traditional SC accuracy tests with known ATT
-- TASK-018: pysyncon parity tests (CRITICAL)
-- TASK-019: Regression tests with locked known-good values
-- TASK-020: Performance benchmark tests
+- Basic unit tests for each method variant
+- Edge case tests and validation error tests
+- Traditional SC accuracy tests with known ATT
+- pysyncon parity tests (CRITICAL)
+- Regression tests with locked known-good values
+- Performance benchmark tests
 """
 
-import pytest
-import polars as pl
-import warnings
-import numpy as np
+# Standard library imports
 import time
+import warnings
+
+# Third-party imports
+import numpy as np
+import polars as pl
+import pytest
+
+# Local imports
 import causers
-from causers import synthetic_control, SyntheticControlResult
+from causers import SyntheticControlResult, synthetic_control
 
 
 # ============================================================================
-# TASK-015: Test Fixtures and Helpers
+# Test Fixtures and Helpers
 # ============================================================================
 
 
@@ -190,7 +195,7 @@ def generate_sc_panel(
 
 
 # ============================================================================
-# TASK-015: Basic Unit Tests
+# Basic Unit Tests
 # ============================================================================
 
 
@@ -349,7 +354,7 @@ class TestResultAttributes:
 
 
 # ============================================================================
-# TASK-016: Edge Case and Validation Error Tests
+# Edge Case and Validation Error Tests
 # ============================================================================
 
 
@@ -597,7 +602,7 @@ class TestEdgeCases:
 
 
 # ============================================================================
-# TASK-017: Traditional SC Accuracy Tests
+# Traditional SC Accuracy Tests
 # ============================================================================
 
 
@@ -740,7 +745,7 @@ class TestTraditionalSC:
 
 
 # ============================================================================
-# TASK-018: pysyncon Parity Tests (CRITICAL)
+# pysyncon Parity Tests (CRITICAL)
 # ============================================================================
 
 
@@ -907,7 +912,7 @@ class TestPysynconParity:
 
 
 # ============================================================================
-# TASK-018b: Direct pysyncon Parity Tests (CRITICAL)
+# Direct pysyncon Parity Tests (CRITICAL)
 # ============================================================================
 
 
@@ -995,7 +1000,7 @@ class TestPysynconParityDirect:
         
         return pl.DataFrame(data)
 
-    def _polars_to_pandas(self, df_polars):
+    def _polars_to_pandas(self, df_polars: pl.DataFrame):
         """Convert polars DataFrame to pandas without pyarrow."""
         import pandas as pd
         
@@ -1003,7 +1008,7 @@ class TestPysynconParityDirect:
         data = {col: df_polars[col].to_list() for col in df_polars.columns}
         return pd.DataFrame(data)
 
-    def _prepare_pysyncon_matrices(self, df_pandas, n_pre, n_post):
+    def _prepare_pysyncon_matrices(self, df_pandas, n_pre: int, n_post: int):
         """Helper to prepare pysyncon matrices from pandas DataFrame."""
         import pandas as pd
         
@@ -1287,7 +1292,7 @@ class TestPysynconParityDirect:
 
 
 # ============================================================================
-# TASK-019: Regression Tests (Locked Values)
+# Regression Tests (Locked Values)
 # ============================================================================
 
 
@@ -1410,7 +1415,7 @@ class TestMethodVariants:
 
 
 # ============================================================================
-# TASK-020: Performance Tests
+# Performance Tests
 # ============================================================================
 
 
@@ -1419,9 +1424,9 @@ class TestPerformance:
     Performance benchmark tests for SC implementation.
     
     These tests verify latency requirements:
-    - NFR-001: 100 units × 50 periods < 1 second (excluding SE)
-    - NFR-002: 1000 units × 100 periods < 5 seconds (excluding SE)
-    - NFR-003: 100 units + SE computation < 30 seconds
+    - 100 units × 50 periods < 1 second (excluding SE)
+    - 1000 units × 100 periods < 5 seconds (excluding SE)
+    - 100 units + SE computation < 30 seconds
     """
 
     @pytest.mark.slow
@@ -1626,7 +1631,7 @@ class TestComplexWeightParity:
 
     def _generate_complex_weight_panel(
         self,
-        true_weights: list,
+        true_weights: list[float],
         n_pre: int = 10,
         n_post: int = 4,
         treatment_effect: float = 5.0,
@@ -1716,13 +1721,13 @@ class TestComplexWeightParity:
         
         return pl.DataFrame(data)
 
-    def _polars_to_pandas(self, df_polars):
+    def _polars_to_pandas(self, df_polars: pl.DataFrame):
         """Convert polars DataFrame to pandas."""
         import pandas as pd
         data = {col: df_polars[col].to_list() for col in df_polars.columns}
         return pd.DataFrame(data)
 
-    def _prepare_pysyncon_matrices(self, df_pandas, n_pre, n_post, n_control):
+    def _prepare_pysyncon_matrices(self, df_pandas, n_pre: int, n_post: int, n_control: int):
         """Helper to prepare pysyncon matrices from pandas DataFrame."""
         # Pre-period outcomes for controls
         Z0_pre = df_pandas[(df_pandas['unit'] > 0) & (df_pandas['time'] < n_pre)].pivot(
@@ -2216,13 +2221,13 @@ class TestComplexWeightParity:
 
 
 # ============================================================================
-# TASK-010: Parallel Synth Control SE Tests
+# Parallel Synth Control SE Tests
 # ============================================================================
 
 
 class TestParallelPlaceboSE:
     """
-    Tests for parallel in-space placebo SE computation (TASK-010).
+    Tests for parallel in-space placebo SE computation.
     
     These tests verify:
     - Determinism: Same seed produces same SE results
