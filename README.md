@@ -1,33 +1,35 @@
 # causers
 
-[![Build Status](https://github.com/causers/causers/actions/workflows/ci.yml/badge.svg)](https://github.com/causers/causers/actions)
 [![PyPI Version](https://img.shields.io/pypi/v/causers)](https://pypi.org/project/causers/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/causers)](https://pypi.org/project/causers/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Coverage: 100%](https://img.shields.io/badge/Coverage-100%25-brightgreen.svg)](https://github.com/causers/causers)
 [![Documentation Status](https://readthedocs.org/projects/causers/badge/?version=latest)](https://causers.readthedocs.io/en/latest/?badge=latest)
 
-A high-performance statistical package for Polars DataFrames, powered by Rust.
+A high-performance statistical package for Polars (and pandas) DataFrames, powered by Rust.
 
 ## 🚀 Overview
 
-`causers` provides blazing-fast statistical operations for Polars DataFrames, leveraging Rust's performance through PyO3 bindings. Designed for data scientists and analysts who need production-grade performance without sacrificing ease of use.
+`causers` provides blazing-fast statistical operations for both Polars and pandas DataFrames, leveraging Rust's performance through PyO3 bindings. Designed for data scientists and analysts who need production-grade performance without sacrificing ease of use.
 
 ### ✨ Key Features
 
 - **🏎️ High Performance**: Linear regression on 1M rows in ~250ms with HC3 standard errors
 - **📊 Multiple Regression**: Support for multiple covariates with matrix-based OLS
-- **🔮 Logistic Regression**: Binary outcome regression with Newton-Raphson MLE
+- **🔮 Logistic Regression**: Binary outcome regression with Newton-Raphson MLE, fixed effects via Mundlak strategy
 - **📈 Robust Standard Errors**: HC3 heteroskedasticity-consistent standard errors included
 - **🎯 Flexible Models**: Optional intercept for fully saturated models
 - **🏢 Clustered Standard Errors**: Cluster-robust SE for panel/grouped data
 - **🔄 Bootstrap Methods**: Wild cluster bootstrap (linear) and score bootstrap (logistic)
+- **📋 Two-Way Fixed Effects**: Panel data regression with entity and time fixed effects
 - **🧪 Synthetic DID**: Synthetic Difference-in-Differences for causal inference with panel data
 - **🎯 Synthetic Control**: Classic SC with 4 method variants (traditional, penalized, robust, augmented)
+- **🔬 Two-Stage Least Squares (IV)**: Instrumental variables estimation for causal inference with endogeneity
+- **🤖 Double Machine Learning**: Debiased/orthogonalized ML for causal inference with cross-fitting
 - **🔧 Native Polars Integration**: Zero-copy operations on Polars DataFrames
+- **🐼 pandas Support**: Seamlessly pass pandas DataFrames - automatic conversion with minimal overhead
 - **🦀 Rust-Powered**: Core computations in Rust for maximum throughput
 - **🐍 Pythonic API**: Clean, intuitive interface with full type hints
-- **🛡️ Production Ready**: Comprehensive test coverage, security rating B+
 - **🌍 Cross-Platform**: Works on Linux, macOS (Intel/ARM), and Windows
 
 ## 📦 Installation
@@ -36,6 +38,9 @@ A high-performance statistical package for Polars DataFrames, powered by Rust.
 
 ```bash
 pip install causers
+
+# With pandas support
+pip install causers[pandas]
 ```
 
 ### From Source (Development)
@@ -46,7 +51,7 @@ git clone https://github.com/causers/causers.git
 cd causers
 
 # Install build dependencies
-pip install maturin polars numpy
+pip install "maturin>=1.4,<2.0" "polars>=0.52" numpy
 
 # Build and install in development mode
 maturin develop --release
@@ -62,44 +67,12 @@ The notebook includes:
 
 | Function | Description |
 |----------|-------------|
+| `dml()` | Double Machine Learning |
 | `linear_regression()` | OLS with clustered standard errors |
 | `logistic_regression()` | Maximum likelihood with clustered SEs |
-| `synthetic_control()` | Abadie-style synthetic control method |
+| `two_stage_least_squares()` | IV/2SLS for causal inference with endogeneity |
+| `synthetic_control()` | Synthetic control method |
 | `synthetic_did()` | Synthetic difference-in-differences |
-
-All examples use reproducible random seeds and include interpretation guidance.
-
-## 🏗️ Architecture
-
-```mermaid
-graph TD
-    A[Python API] --> B[PyO3 Bridge]
-    B --> C[Rust Core]
-    C --> D[Statistical Engine]
-    
-    E[Polars DataFrame] --> B
-    D --> F[Results]
-    F --> A
-```
-
-### Project Structure
-
-```
-causers/
-├── src/                    # Rust source code
-│   ├── lib.rs             # PyO3 bindings and module definition
-│   ├── stats.rs           # Linear regression (OLS)
-│   ├── logistic.rs        # Logistic regression (MLE)
-│   ├── cluster.rs         # Clustered SE and bootstrap
-│   ├── linalg.rs          # Linear algebra utilities (faer integration)
-│   ├── sdid.rs            # Synthetic Difference-in-Differences
-│   └── synth_control.rs   # Synthetic Control methods
-├── python/                # Python package
-├── tests/                 # Comprehensive test suite (193+ tests)
-├── examples/              # Usage examples and benchmarks
-├── docs/                  # Sphinx documentation
-├── scripts/               # Development and build scripts
-```
 
 ## 🛠️ Development
 
@@ -130,6 +103,9 @@ maturin develop --release
 ### Running Tests
 
 ```bash
+# Install test dependencies (required for running tests)
+pip install -e ".[test]"
+
 # Run all tests with coverage
 pytest tests/ --cov=causers --cov-report=html
 

@@ -1,19 +1,23 @@
 """Tests for linear regression functionality."""
 
-import pytest
-import polars as pl
+# Third-party imports
 import numpy as np
+import polars as pl
+import pytest
 from numpy.testing import assert_allclose
-from causers import linear_regression, LinearRegressionResult
+
+# Local imports
+from causers import LinearRegressionResult, linear_regression
 
 # Optional statsmodels import for comparison tests
 try:
     import statsmodels.api as sm
-    HAS_STATSMODELS = True
+    HAS_STATSMODELS: bool = True
 except ImportError:
-    HAS_STATSMODELS = False
+    HAS_STATSMODELS: bool = False
     sm = None
 
+# Constants
 requires_statsmodels = pytest.mark.skipif(
     not HAS_STATSMODELS,
     reason="statsmodels not installed"
@@ -115,8 +119,7 @@ class TestLinearRegression:
         
         with pytest.raises(ValueError):
             linear_regression(df, "x", "y")
-
-
+    
     def test_multiple_covariates(self):
         """Test regression with multiple independent variables."""
         # y = 2*x1 + 3*x2 + 1

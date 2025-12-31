@@ -31,7 +31,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::cluster::{SplitMix64, WelfordState};
+use crate::cluster::WelfordState;
+use crate::linalg::invert_matrix;
 use crate::sdid::{FrankWolfeConfig, FrankWolfeSolver, StepSizeMethod};
 
 // ============================================================================
@@ -218,7 +219,7 @@ impl Default for SynthControlConfig {
 ///
 /// This struct holds the outcome data and panel structure needed for
 /// SC estimation. Unlike SDID which supports multiple treated units,
-/// SC requires exactly one treated unit (per NR-003).
+/// SC requires exactly one treated unit.
 ///
 /// # Memory Layout
 ///
@@ -475,7 +476,7 @@ impl SCPanelData {
 }
 
 // ============================================================================
-// Placebo View for Parallel SE Computation (TASK-007)
+// Placebo View for Parallel SE Computation
 // ============================================================================
 
 /// A lightweight view into panel data for placebo iteration.
@@ -492,22 +493,22 @@ impl SCPanelData {
 pub struct SCPlaceboView<'a> {
     /// Reference to original outcomes (row-major: unit × period)
     pub outcomes: &'a [f64],
-    
+
     /// Total number of units in the original panel
     pub n_units: usize,
-    
+
     /// Total number of periods in the original panel
     pub n_periods: usize,
-    
+
     /// Indices of control units for this placebo iteration
     pub control_indices: Vec<usize>,
-    
+
     /// Index of the placebo-treated unit
     pub treated_index: usize,
-    
+
     /// Indices of pre-treatment periods (borrowed from original)
     pub pre_period_indices: &'a [usize],
-    
+
     /// Indices of post-treatment periods (borrowed from original)
     pub post_period_indices: &'a [usize],
 }
@@ -520,19 +521,19 @@ impl<'a> SCPlaceboView<'a> {
         debug_assert!(period < self.n_periods, "Period index out of bounds");
         self.outcomes[unit * self.n_periods + period]
     }
-    
+
     /// Get number of control units.
     #[inline]
     pub fn n_control(&self) -> usize {
         self.control_indices.len()
     }
-    
+
     /// Get number of pre-treatment periods.
     #[inline]
     pub fn n_pre(&self) -> usize {
         self.pre_period_indices.len()
     }
-    
+
     /// Get number of post-treatment periods.
     #[inline]
     pub fn n_post(&self) -> usize {
@@ -541,7 +542,7 @@ impl<'a> SCPlaceboView<'a> {
 }
 
 // ============================================================================
-// View-based Helper Functions (TASK-008)
+// View-based Helper Functions
 // ============================================================================
 
 /// Compute traditional SC weights using a placebo view.
@@ -565,7 +566,7 @@ fn compute_traditional_weights_from_view(
 ) -> Result<WeightResult, SynthControlError> {
     let n_control = view.n_control();
     let n_pre = view.n_pre();
-    
+
     // Validate minimum requirements
     if n_control < 1 {
         return Err(SynthControlError::InvalidData {
@@ -577,7 +578,7 @@ fn compute_traditional_weights_from_view(
             message: "At least 1 pre-treatment period required".to_string(),
         });
     }
-    
+
     // Extract pre-treatment data using view's indices
     let mut y_control_pre = Vec::with_capacity(n_control * n_pre);
     for &ctrl_idx in &view.control_indices {
@@ -585,20 +586,20 @@ fn compute_traditional_weights_from_view(
             y_control_pre.push(view.outcome(ctrl_idx, t));
         }
     }
-    
+
     let mut y_treated_pre = Vec::with_capacity(n_pre);
     for &t in view.pre_period_indices {
         y_treated_pre.push(view.outcome(view.treated_index, t));
     }
-    
+
     // Precompute Y @ Y' and Y @ y
     let yyt = compute_yyt(&y_control_pre, n_control, n_pre);
     let yy = compute_yy(&y_control_pre, &y_treated_pre, n_control, n_pre);
-    
+
     // Create copies for closures
     let yyt_obj = yyt.clone();
     let yy_obj = yy.clone();
-    
+
     // Objective function: f(w) = w' @ YYt @ w - 2 × w' @ Yy + const
     let objective = move |w: &[f64]| -> f64 {
         let mut w_yyt_w = 0.0;
@@ -613,7 +614,7 @@ fn compute_traditional_weights_from_view(
         }
         w_yyt_w - 2.0 * w_yy
     };
-    
+
     // Gradient function: ∇f(w) = 2 × YYt @ w - 2 × Yy
     let gradient_fn = move |w: &[f64]| -> Vec<f64> {
         let mut grad = vec![0.0; n_control];
@@ -623,7 +624,7 @@ fn compute_traditional_weights_from_view(
         }
         grad
     };
-    
+
     // Configure Frank-Wolfe solver
     let fw_config = FrankWolfeConfig {
         max_iterations: config.max_iter,
@@ -633,7 +634,7 @@ fn compute_traditional_weights_from_view(
         armijo_sigma: 1e-4,
         use_relative_gap: true,
     };
-    
+
     // Create and run Frank-Wolfe solver
     let mut solver = FrankWolfeSolver::new(n_control, fw_config);
     let weights = solver.solve(&objective, gradient_fn).map_err(|e| {
@@ -641,10 +642,10 @@ fn compute_traditional_weights_from_view(
             message: format!("Frank-Wolfe solver error: {}", e),
         }
     })?;
-    
+
     // Compute final objective value
     let final_obj = objective(&weights);
-    
+
     Ok(WeightResult {
         weights,
         converged: true,
@@ -660,7 +661,7 @@ fn compute_penalized_weights_from_view(
 ) -> Result<WeightResult, SynthControlError> {
     let n_control = view.n_control();
     let n_pre = view.n_pre();
-    
+
     if n_control < 1 {
         return Err(SynthControlError::InvalidData {
             message: "At least 1 control unit required".to_string(),
@@ -671,7 +672,7 @@ fn compute_penalized_weights_from_view(
             message: "At least 1 pre-treatment period required".to_string(),
         });
     }
-    
+
     // Get lambda (use default if not specified - can't do LOOCV in view context)
     let lambda = config.lambda.unwrap_or(1.0);
     if lambda < 0.0 {
@@ -680,7 +681,7 @@ fn compute_penalized_weights_from_view(
             message: format!("lambda must be non-negative, got {}", lambda),
         });
     }
-    
+
     // Extract pre-treatment data using view's indices
     let mut y_control_pre = Vec::with_capacity(n_control * n_pre);
     for &ctrl_idx in &view.control_indices {
@@ -688,34 +689,55 @@ fn compute_penalized_weights_from_view(
             y_control_pre.push(view.outcome(ctrl_idx, t));
         }
     }
-    
+
     let mut y_treated_pre = Vec::with_capacity(n_pre);
     for &t in view.pre_period_indices {
         y_treated_pre.push(view.outcome(view.treated_index, t));
     }
-    
+
     // Compute Y @ Y' (n_control × n_control)
     let yyt = compute_yyt(&y_control_pre, n_control, n_pre);
-    
+
     // Add regularization: (Y @ Y' + λI)
     let mut yyt_regularized = yyt;
     for i in 0..n_control {
         yyt_regularized[i][i] += lambda;
     }
-    
+
     // Compute Y @ y (n_control × 1)
     let yy = compute_yy(&y_control_pre, &y_treated_pre, n_control, n_pre);
-    
+
     // Solve for unconstrained solution
-    let yyt_inv = invert_matrix(&yyt_regularized)?;
+    let yyt_inv = invert_matrix(&yyt_regularized).map_err(|e| match e {
+        crate::linalg::LinalgError::SingularMatrix => SynthControlError::NumericalInstability {
+            message: "Regularized Y@Y' matrix is singular; increase lambda".to_string(),
+        },
+        crate::linalg::LinalgError::NumericalInstability => {
+            SynthControlError::NumericalInstability {
+                message: "Numerical instability in matrix inversion".to_string(),
+            }
+        }
+        crate::linalg::LinalgError::DimensionMismatch { expected, got } => {
+            SynthControlError::NumericalInstability {
+                message: format!("Dimension mismatch: expected {}, got {}", expected, got),
+            }
+        }
+    })?;
     let w_unconstrained = matrix_vector_mult(&yyt_inv, &yy);
-    
+
     // Project onto simplex
     let weights = project_onto_simplex(&w_unconstrained);
-    
+
     // Compute objective value
-    let objective = compute_penalized_objective(&y_control_pre, &y_treated_pre, &weights, lambda, n_control, n_pre);
-    
+    let objective = compute_penalized_objective(
+        &y_control_pre,
+        &y_treated_pre,
+        &weights,
+        lambda,
+        n_control,
+        n_pre,
+    );
+
     Ok(WeightResult {
         weights,
         converged: true,
@@ -731,7 +753,7 @@ fn compute_robust_weights_from_view(
 ) -> Result<WeightResult, SynthControlError> {
     let n_control = view.n_control();
     let n_pre = view.n_pre();
-    
+
     if n_control < 1 {
         return Err(SynthControlError::InvalidData {
             message: "At least 1 control unit required".to_string(),
@@ -742,7 +764,7 @@ fn compute_robust_weights_from_view(
             message: "At least 1 pre-treatment period required".to_string(),
         });
     }
-    
+
     // Extract pre-treatment data using view's indices
     let mut y_control_pre = Vec::with_capacity(n_control * n_pre);
     for &ctrl_idx in &view.control_indices {
@@ -750,40 +772,38 @@ fn compute_robust_weights_from_view(
             y_control_pre.push(view.outcome(ctrl_idx, t));
         }
     }
-    
+
     let mut y_treated_pre = Vec::with_capacity(n_pre);
     for &t in view.pre_period_indices {
         y_treated_pre.push(view.outcome(view.treated_index, t));
     }
-    
+
     // De-mean control unit outcomes
     let mut y_control_demeaned = Vec::with_capacity(n_control * n_pre);
     for i in 0..n_control {
         let row_start = i * n_pre;
         let row_mean: f64 = (0..n_pre)
             .map(|t| y_control_pre[row_start + t])
-            .sum::<f64>() / n_pre as f64;
+            .sum::<f64>()
+            / n_pre as f64;
         for t in 0..n_pre {
             y_control_demeaned.push(y_control_pre[row_start + t] - row_mean);
         }
     }
-    
+
     // De-mean treated outcomes
     let treated_mean: f64 = y_treated_pre.iter().sum::<f64>() / n_pre as f64;
-    let y_treated_demeaned: Vec<f64> = y_treated_pre
-        .iter()
-        .map(|&y| y - treated_mean)
-        .collect();
-    
+    let y_treated_demeaned: Vec<f64> = y_treated_pre.iter().map(|&y| y - treated_mean).collect();
+
     // Compute Y @ Y' and Y @ y on de-meaned data
     let yyt = compute_yyt(&y_control_demeaned, n_control, n_pre);
     let yy = compute_yy(&y_control_demeaned, &y_treated_demeaned, n_control, n_pre);
-    
+
     let yyt_obj = yyt.clone();
     let yy_obj = yy.clone();
     let yyt_final = yyt.clone();
     let yy_final = yy.clone();
-    
+
     let objective = move |w: &[f64]| -> f64 {
         let mut w_yyt_w = 0.0;
         for i in 0..n_control {
@@ -797,7 +817,7 @@ fn compute_robust_weights_from_view(
         }
         w_yyt_w - 2.0 * w_yy
     };
-    
+
     let gradient_fn = move |w: &[f64]| -> Vec<f64> {
         let mut grad = vec![0.0; n_control];
         for i in 0..n_control {
@@ -806,7 +826,7 @@ fn compute_robust_weights_from_view(
         }
         grad
     };
-    
+
     let fw_config = FrankWolfeConfig {
         max_iterations: config.max_iter,
         tolerance: config.tol,
@@ -815,14 +835,14 @@ fn compute_robust_weights_from_view(
         armijo_sigma: 1e-4,
         use_relative_gap: true,
     };
-    
+
     let mut solver = FrankWolfeSolver::new(n_control, fw_config);
     let weights = solver.solve(&objective, gradient_fn).map_err(|e| {
         SynthControlError::NumericalInstability {
             message: format!("Frank-Wolfe solver error: {}", e),
         }
     })?;
-    
+
     let final_obj = {
         let mut w_yyt_w = 0.0;
         for i in 0..n_control {
@@ -836,7 +856,7 @@ fn compute_robust_weights_from_view(
         }
         w_yyt_w - 2.0 * w_yy
     };
-    
+
     Ok(WeightResult {
         weights,
         converged: true,
@@ -867,31 +887,28 @@ fn compute_weights_from_view(
 /// accesses outcomes through the view's indices.
 fn compute_att_from_view(view: &SCPlaceboView, weights: &[f64]) -> f64 {
     let n_post = view.n_post();
-    
+
     if n_post == 0 {
         return 0.0;
     }
-    
+
     let mut att_sum = 0.0;
-    
-    for (t_idx, &post_period) in view.post_period_indices.iter().enumerate() {
+
+    for (_t_idx, &post_period) in view.post_period_indices.iter().enumerate() {
         // Treated unit outcome
         let y_treated_t = view.outcome(view.treated_index, post_period);
-        
+
         // Compute synthetic control for this period
         let mut y_synth_t = 0.0;
         for (i, &ctrl_idx) in view.control_indices.iter().enumerate() {
             let y_control_it = view.outcome(ctrl_idx, post_period);
             y_synth_t += weights[i] * y_control_it;
         }
-        
+
         // Treatment effect at this period
         att_sum += y_treated_t - y_synth_t;
-        
-        // Suppress unused variable warning
-        let _ = t_idx;
     }
-    
+
     att_sum / n_post as f64
 }
 
@@ -1094,7 +1111,7 @@ pub fn compute_traditional_weights(
 
     Ok(WeightResult {
         weights,
-        converged: true, // Frank-Wolfe returns best solution found
+        converged: true,             // Frank-Wolfe returns best solution found
         iterations: config.max_iter, // Conservative estimate
         objective: final_obj,
     })
@@ -1119,14 +1136,13 @@ pub fn compute_traditional_weights(
 /// The estimated ATT
 pub fn compute_att(panel: &SCPanelData, weights: &[f64]) -> f64 {
     let n_post = panel.n_post();
-    
+
     if n_post == 0 {
         return 0.0;
     }
 
     let treated_post = panel.treated_post_vector();
     let control_post = panel.control_post_matrix();
-    let _n_control = panel.n_control();
 
     let mut att_sum = 0.0;
 
@@ -1163,14 +1179,13 @@ pub fn compute_att(panel: &SCPanelData, weights: &[f64]) -> f64 {
 /// The pre-treatment MSE
 pub fn compute_pre_treatment_mse(panel: &SCPanelData, weights: &[f64]) -> f64 {
     let n_pre = panel.n_pre();
-    
+
     if n_pre == 0 {
         return 0.0;
     }
 
     let treated_pre = panel.treated_pre_vector();
     let control_pre = panel.control_pre_matrix();
-    let _n_control = panel.n_control();
 
     let mut mse_sum = 0.0;
 
@@ -1237,7 +1252,8 @@ pub fn project_onto_simplex(v: &[f64]) -> Vec<f64> {
     }
 
     // Sort in descending order with indices
-    let mut sorted_with_idx: Vec<(f64, usize)> = v.iter().copied().enumerate().map(|(i, x)| (x, i)).collect();
+    let mut sorted_with_idx: Vec<(f64, usize)> =
+        v.iter().copied().enumerate().map(|(i, x)| (x, i)).collect();
     sorted_with_idx.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     // Find threshold rho
@@ -1259,107 +1275,15 @@ pub fn project_onto_simplex(v: &[f64]) -> Vec<f64> {
     v.iter().map(|&x| (x - theta).max(0.0)).collect()
 }
 
-// ============================================================================
-// Matrix Operations for Penalized SC
-// ============================================================================
-
-/// Invert a square matrix using Gauss-Jordan elimination with partial pivoting.
-///
-/// # Arguments
-/// * `a` - Square matrix to invert (n × n), stored as Vec<Vec<f64>>
-///
-/// # Returns
-/// * `Ok(inverse)` - Inverse matrix (n × n)
-/// * `Err(SynthControlError)` - If matrix is singular
-fn invert_matrix(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, SynthControlError> {
-    let n = a.len();
-    if n == 0 {
-        return Err(SynthControlError::NumericalInstability {
-            message: "Cannot invert empty matrix".to_string(),
-        });
-    }
-
-    // Verify square matrix
-    for row in a.iter() {
-        if row.len() != n {
-            return Err(SynthControlError::NumericalInstability {
-                message: "Cannot invert non-square matrix".to_string(),
-            });
-        }
-    }
-
-    // Create augmented matrix [A|I] of size (n × 2n)
-    let mut aug: Vec<Vec<f64>> = Vec::with_capacity(n);
-    for (i, a_row) in a.iter().enumerate() {
-        let mut row = Vec::with_capacity(2 * n);
-        // Copy A into left half
-        row.extend_from_slice(a_row);
-        // Add identity matrix to right half
-        for j in 0..n {
-            row.push(if i == j { 1.0 } else { 0.0 });
-        }
-        aug.push(row);
-    }
-
-    // Gauss-Jordan elimination with partial pivoting
-    for col in 0..n {
-        // Find pivot: row with maximum absolute value in current column
-        let mut max_row = col;
-        let mut max_val = aug[col][col].abs();
-        #[allow(clippy::needless_range_loop)]
-        for row in (col + 1)..n {
-            let val = aug[row][col].abs();
-            if val > max_val {
-                max_val = val;
-                max_row = row;
-            }
-        }
-
-        // Check for singularity (pivot too small)
-        if max_val < 1e-12 {
-            return Err(SynthControlError::NumericalInstability {
-                message: format!(
-                    "Singular matrix: pivot element {:.2e} too small at column {}",
-                    max_val, col
-                ),
-            });
-        }
-
-        // Swap rows if needed
-        if max_row != col {
-            aug.swap(col, max_row);
-        }
-
-        // Scale pivot row so diagonal element becomes 1
-        let pivot = aug[col][col];
-        for j in 0..(2 * n) {
-            aug[col][j] /= pivot;
-        }
-
-        // Eliminate all other entries in this column (both above and below pivot)
-        for row in 0..n {
-            if row != col {
-                let factor = aug[row][col];
-                for j in 0..(2 * n) {
-                    aug[row][j] -= factor * aug[col][j];
-                }
-            }
-        }
-    }
-
-    // Extract inverse from right half of augmented matrix
-    let mut inverse: Vec<Vec<f64>> = Vec::with_capacity(n);
-    for aug_row in aug.iter() {
-        inverse.push(aug_row[n..(2 * n)].to_vec());
-    }
-
-    Ok(inverse)
-}
-
 /// Multiply a matrix by a vector: result = A × v
 fn matrix_vector_mult(a: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
     a.iter()
-        .map(|row| row.iter().zip(v.iter()).map(|(&a_ij, &v_j)| a_ij * v_j).sum())
+        .map(|row| {
+            row.iter()
+                .zip(v.iter())
+                .map(|(&a_ij, &v_j)| a_ij * v_j)
+                .sum()
+        })
         .collect()
 }
 
@@ -1436,14 +1360,35 @@ pub fn compute_penalized_weights(
     let yy = compute_yy(&y_control_pre, &y_treated_pre, n_control, n_pre);
 
     // Solve (Y @ Y' + λI)^(-1) @ (Y @ y) for unconstrained solution
-    let yyt_inv = invert_matrix(&yyt_regularized)?;
+    let yyt_inv = invert_matrix(&yyt_regularized).map_err(|e| match e {
+        crate::linalg::LinalgError::SingularMatrix => SynthControlError::NumericalInstability {
+            message: "Regularized Y@Y' matrix is singular; increase lambda".to_string(),
+        },
+        crate::linalg::LinalgError::NumericalInstability => {
+            SynthControlError::NumericalInstability {
+                message: "Numerical instability in matrix inversion".to_string(),
+            }
+        }
+        crate::linalg::LinalgError::DimensionMismatch { expected, got } => {
+            SynthControlError::NumericalInstability {
+                message: format!("Dimension mismatch: expected {}, got {}", expected, got),
+            }
+        }
+    })?;
     let w_unconstrained = matrix_vector_mult(&yyt_inv, &yy);
 
     // Project onto simplex to satisfy w >= 0, sum(w) = 1
     let weights = project_onto_simplex(&w_unconstrained);
 
     // Compute objective value (includes regularization term)
-    let objective = compute_penalized_objective(&y_control_pre, &y_treated_pre, &weights, lambda, n_control, n_pre);
+    let objective = compute_penalized_objective(
+        &y_control_pre,
+        &y_treated_pre,
+        &weights,
+        lambda,
+        n_control,
+        n_pre,
+    );
 
     Ok(WeightResult {
         weights,
@@ -1490,9 +1435,7 @@ fn select_lambda_loocv(panel: &SCPanelData) -> Result<f64, SynthControlError> {
     let n_pre = panel.n_pre();
 
     // Lambda grid: logarithmically spaced from 1e-4 to 1e4
-    let lambda_grid: Vec<f64> = (-4..=4)
-        .map(|i| 10.0_f64.powi(i))
-        .collect();
+    let lambda_grid: Vec<f64> = (-4..=4).map(|i| 10.0_f64.powi(i)).collect();
 
     let y_control_pre = panel.control_pre_matrix();
     let y_treated_pre = panel.treated_pre_vector();
@@ -1514,7 +1457,7 @@ fn select_lambda_loocv(panel: &SCPanelData) -> Result<f64, SynthControlError> {
         // Solve for weights
         let yyt_inv = match invert_matrix(&yyt_reg) {
             Ok(inv) => inv,
-            Err(_) => continue, // Skip if singular
+            Err(_) => continue, // Skip if singular (LinalgError)
         };
         let w_unconstrained = matrix_vector_mult(&yyt_inv, &yy);
         let weights = project_onto_simplex(&w_unconstrained);
@@ -1596,7 +1539,8 @@ pub fn compute_robust_weights(
         let row_start = i * n_pre;
         let row_mean: f64 = (0..n_pre)
             .map(|t| y_control_pre[row_start + t])
-            .sum::<f64>() / n_pre as f64;
+            .sum::<f64>()
+            / n_pre as f64;
 
         // Subtract mean from each period
         for t in 0..n_pre {
@@ -1606,10 +1550,7 @@ pub fn compute_robust_weights(
 
     // De-mean treated outcomes
     let treated_mean: f64 = y_treated_pre.iter().sum::<f64>() / n_pre as f64;
-    let y_treated_demeaned: Vec<f64> = y_treated_pre
-        .iter()
-        .map(|&y| y - treated_mean)
-        .collect();
+    let y_treated_demeaned: Vec<f64> = y_treated_pre.iter().map(|&y| y - treated_mean).collect();
 
     // Compute Y @ Y' and Y @ y on de-meaned data
     let yyt = compute_yyt(&y_control_demeaned, n_control, n_pre);
@@ -1774,7 +1715,8 @@ pub fn compute_augmented_sc(
             let row_start = i * n_post;
             (0..n_post)
                 .map(|t| y_control_post[row_start + t])
-                .sum::<f64>() / n_post as f64
+                .sum::<f64>()
+                / n_post as f64
         })
         .collect();
 
@@ -1814,7 +1756,21 @@ pub fn compute_augmented_sc(
     }
 
     // Solve for ridge coefficients
-    let xtx_inv = invert_matrix(&xtx)?;
+    let xtx_inv = invert_matrix(&xtx).map_err(|e| match e {
+        crate::linalg::LinalgError::SingularMatrix => SynthControlError::NumericalInstability {
+            message: "X'X + λI matrix is singular in ridge regression".to_string(),
+        },
+        crate::linalg::LinalgError::NumericalInstability => {
+            SynthControlError::NumericalInstability {
+                message: "Numerical instability in ridge regression matrix inversion".to_string(),
+            }
+        }
+        crate::linalg::LinalgError::DimensionMismatch { expected, got } => {
+            SynthControlError::NumericalInstability {
+                message: format!("Dimension mismatch: expected {}, got {}", expected, got),
+            }
+        }
+    })?;
     let ridge_coefficients = matrix_vector_mult(&xtx_inv, &xty);
 
     // Step 3: Compute predictions for all units
@@ -1911,7 +1867,7 @@ pub fn compute_weights(
 }
 
 // ============================================================================
-// PyO3 Result Class (TASK-011)
+// PyO3 Result Class
 // ============================================================================
 
 /// Result of Synthetic Control estimation, exposed to Python via PyO3.
@@ -2026,7 +1982,7 @@ impl SyntheticControlResult {
 }
 
 // ============================================================================
-// In-Space Placebo SE Computation (TASK-014 + TASK-009 Parallel)
+// In-Space Placebo SE Computation
 // ============================================================================
 
 /// Compute standard error via in-space placebo bootstrap.
@@ -2060,10 +2016,10 @@ pub fn compute_placebo_se(
     config: &SynthControlConfig,
 ) -> Result<(f64, usize), SynthControlError> {
     let n_control = panel.n_control();
-    
+
     // Determine how many placebos to run
     let n_placebo = config.n_placebo.min(n_control);
-    
+
     if n_placebo < 2 {
         return Err(SynthControlError::InvalidData {
             message: format!(
@@ -2093,7 +2049,7 @@ pub fn compute_placebo_se(
             // Use iteration-indexed seed for determinism
             // (not used for selection here, but maintains pattern from SDID)
             let _iter_seed = initial_seed.wrapping_add(placebo_ctrl_idx as u64);
-            
+
             // Get the actual unit index for this control
             let placebo_treated_unit = panel.control_indices[placebo_ctrl_idx];
 
@@ -2162,7 +2118,7 @@ pub fn compute_placebo_se(
     for &att in &placebo_atts {
         welford.update(&[att]);
     }
-    
+
     // Compute SE as std of placebo ATTs
     let se = welford.standard_errors()[0];
 
@@ -2268,7 +2224,7 @@ mod tests {
     // ========================================================================
 
     /// Create a simple panel for testing.
-    /// 
+    ///
     /// Layout:
     /// - 1 treated unit (index 0)
     /// - 3 control units (indices 1, 2, 3)
@@ -2282,19 +2238,19 @@ mod tests {
         // Unit 3 (control): [0.0, 1.0, 2.0, 3.0]   <- parallel trend
         let outcomes = vec![
             1.0, 2.0, 3.0, 10.0, // treated
-            1.0, 2.0, 3.0, 4.0,  // control 1 - matches treated pre
-            2.0, 3.0, 4.0, 5.0,  // control 2
-            0.0, 1.0, 2.0, 3.0,  // control 3
+            1.0, 2.0, 3.0, 4.0, // control 1 - matches treated pre
+            2.0, 3.0, 4.0, 5.0, // control 2
+            0.0, 1.0, 2.0, 3.0, // control 3
         ];
 
         SCPanelData::new(
             outcomes,
-            4,                    // n_units
-            4,                    // n_periods
-            vec![1, 2, 3],        // control_indices
-            0,                    // treated_index
-            vec![0, 1, 2],        // pre_period_indices
-            vec![3],              // post_period_indices
+            4,             // n_units
+            4,             // n_periods
+            vec![1, 2, 3], // control_indices
+            0,             // treated_index
+            vec![0, 1, 2], // pre_period_indices
+            vec![3],       // post_period_indices
         )
         .unwrap()
     }
@@ -2303,20 +2259,11 @@ mod tests {
     fn create_perfect_match_panel() -> SCPanelData {
         let outcomes = vec![
             1.0, 2.0, 3.0, 10.0, // treated
-            1.0, 2.0, 3.0, 4.0,  // control 1 - EXACT match in pre-treatment
-            5.0, 6.0, 7.0, 8.0,  // control 2 - different pattern
+            1.0, 2.0, 3.0, 4.0, // control 1 - EXACT match in pre-treatment
+            5.0, 6.0, 7.0, 8.0, // control 2 - different pattern
         ];
 
-        SCPanelData::new(
-            outcomes,
-            3,
-            4,
-            vec![1, 2],
-            0,
-            vec![0, 1, 2],
-            vec![3],
-        )
-        .unwrap()
+        SCPanelData::new(outcomes, 3, 4, vec![1, 2], 0, vec![0, 1, 2], vec![3]).unwrap()
     }
 
     /// Create a panel with known treatment effect of 5.0.
@@ -2324,20 +2271,11 @@ mod tests {
         // All units have the same pre-treatment trend
         // Treated unit jumps by 5.0 in post-period
         let outcomes = vec![
-            1.0, 2.0, 3.0, 9.0,  // treated: 4.0 expected, got 9.0 -> effect = 5.0
-            1.0, 2.0, 3.0, 4.0,  // control 1: continues trend
+            1.0, 2.0, 3.0, 9.0, // treated: 4.0 expected, got 9.0 -> effect = 5.0
+            1.0, 2.0, 3.0, 4.0, // control 1: continues trend
         ];
 
-        SCPanelData::new(
-            outcomes,
-            2,
-            4,
-            vec![1],
-            0,
-            vec![0, 1, 2],
-            vec![3],
-        )
-        .unwrap()
+        SCPanelData::new(outcomes, 2, 4, vec![1], 0, vec![0, 1, 2], vec![3]).unwrap()
     }
 
     // ========================================================================
@@ -2419,7 +2357,10 @@ mod tests {
 
     #[test]
     fn test_method_default() {
-        assert_eq!(SynthControlMethod::default(), SynthControlMethod::Traditional);
+        assert_eq!(
+            SynthControlMethod::default(),
+            SynthControlMethod::Traditional
+        );
     }
 
     // ========================================================================
@@ -2456,13 +2397,13 @@ mod tests {
     #[test]
     fn test_panel_data_outcome_accessor() {
         let panel = create_simple_panel();
-        
+
         // Treated unit outcomes
         assert!((panel.outcome(0, 0) - 1.0).abs() < 1e-10);
         assert!((panel.outcome(0, 1) - 2.0).abs() < 1e-10);
         assert!((panel.outcome(0, 2) - 3.0).abs() < 1e-10);
         assert!((panel.outcome(0, 3) - 10.0).abs() < 1e-10);
-        
+
         // Control unit 1 outcomes
         assert!((panel.outcome(1, 0) - 1.0).abs() < 1e-10);
         assert!((panel.outcome(1, 3) - 4.0).abs() < 1e-10);
@@ -2472,7 +2413,7 @@ mod tests {
     fn test_panel_data_treated_pre_vector() {
         let panel = create_simple_panel();
         let treated_pre = panel.treated_pre_vector();
-        
+
         assert_eq!(treated_pre.len(), 3);
         assert!((treated_pre[0] - 1.0).abs() < 1e-10);
         assert!((treated_pre[1] - 2.0).abs() < 1e-10);
@@ -2483,15 +2424,15 @@ mod tests {
     fn test_panel_data_control_pre_matrix() {
         let panel = create_simple_panel();
         let control_pre = panel.control_pre_matrix();
-        
+
         // 3 control units × 3 pre-periods = 9 elements
         assert_eq!(control_pre.len(), 9);
-        
+
         // Control 1 (index 1): [1.0, 2.0, 3.0]
         assert!((control_pre[0] - 1.0).abs() < 1e-10);
         assert!((control_pre[1] - 2.0).abs() < 1e-10);
         assert!((control_pre[2] - 3.0).abs() < 1e-10);
-        
+
         // Control 2 (index 2): [2.0, 3.0, 4.0]
         assert!((control_pre[3] - 2.0).abs() < 1e-10);
         assert!((control_pre[4] - 3.0).abs() < 1e-10);
@@ -2502,7 +2443,7 @@ mod tests {
     fn test_panel_data_treated_post_vector() {
         let panel = create_simple_panel();
         let treated_post = panel.treated_post_vector();
-        
+
         assert_eq!(treated_post.len(), 1);
         assert!((treated_post[0] - 10.0).abs() < 1e-10);
     }
@@ -2511,12 +2452,12 @@ mod tests {
     fn test_panel_data_control_post_matrix() {
         let panel = create_simple_panel();
         let control_post = panel.control_post_matrix();
-        
+
         // 3 control units × 1 post-period = 3 elements
         assert_eq!(control_post.len(), 3);
-        assert!((control_post[0] - 4.0).abs() < 1e-10);  // Control 1
-        assert!((control_post[1] - 5.0).abs() < 1e-10);  // Control 2
-        assert!((control_post[2] - 3.0).abs() < 1e-10);  // Control 3
+        assert!((control_post[0] - 4.0).abs() < 1e-10); // Control 1
+        assert!((control_post[1] - 5.0).abs() < 1e-10); // Control 2
+        assert!((control_post[2] - 3.0).abs() < 1e-10); // Control 3
     }
 
     #[test]
@@ -2545,7 +2486,7 @@ mod tests {
             vec![1.0, 2.0],
             1,
             2,
-            vec![],  // No controls
+            vec![], // No controls
             0,
             vec![0],
             vec![1],
@@ -2565,7 +2506,7 @@ mod tests {
             vec![1.0, 2.0, 3.0, 4.0],
             2,
             2,
-            vec![0, 1],  // Treated (0) in control list
+            vec![0, 1], // Treated (0) in control list
             0,
             vec![0],
             vec![1],
@@ -2586,14 +2527,14 @@ mod tests {
     #[test]
     fn test_compute_yyt() {
         let y_control_pre = vec![
-            1.0, 2.0,  // Control 0
-            3.0, 4.0,  // Control 1
+            1.0, 2.0, // Control 0
+            3.0, 4.0, // Control 1
         ];
         let n_control = 2;
         let n_pre = 2;
-        
+
         let yyt = compute_yyt(&y_control_pre, n_control, n_pre);
-        
+
         // YYt[0,0] = 1*1 + 2*2 = 5
         assert!((yyt[0][0] - 5.0).abs() < 1e-10);
         // YYt[0,1] = 1*3 + 2*4 = 11
@@ -2607,15 +2548,15 @@ mod tests {
     #[test]
     fn test_compute_yy() {
         let y_control_pre = vec![
-            1.0, 2.0,  // Control 0
-            3.0, 4.0,  // Control 1
+            1.0, 2.0, // Control 0
+            3.0, 4.0, // Control 1
         ];
         let y_treated_pre = vec![2.0, 3.0];
         let n_control = 2;
         let n_pre = 2;
-        
+
         let yy = compute_yy(&y_control_pre, &y_treated_pre, n_control, n_pre);
-        
+
         // Yy[0] = 1*2 + 2*3 = 8
         assert!((yy[0] - 8.0).abs() < 1e-10);
         // Yy[1] = 3*2 + 4*3 = 18
@@ -2626,9 +2567,9 @@ mod tests {
     fn test_traditional_weights_sum_to_one() {
         let panel = create_simple_panel();
         let config = SynthControlConfig::default();
-        
+
         let result = compute_traditional_weights(&panel, &config).unwrap();
-        
+
         let sum: f64 = result.weights.iter().sum();
         assert!(
             (sum - 1.0).abs() < 1e-10,
@@ -2641,16 +2582,11 @@ mod tests {
     fn test_traditional_weights_non_negative() {
         let panel = create_simple_panel();
         let config = SynthControlConfig::default();
-        
+
         let result = compute_traditional_weights(&panel, &config).unwrap();
-        
+
         for (i, &w) in result.weights.iter().enumerate() {
-            assert!(
-                w >= -1e-15,
-                "Weight {} must be non-negative, got {}",
-                i,
-                w
-            );
+            assert!(w >= -1e-15, "Weight {} must be non-negative, got {}", i, w);
         }
     }
 
@@ -2659,9 +2595,9 @@ mod tests {
         // When one control perfectly matches treated, it should get high weight
         let panel = create_perfect_match_panel();
         let config = SynthControlConfig::default();
-        
+
         let result = compute_traditional_weights(&panel, &config).unwrap();
-        
+
         // Control 1 (index 0 in weights) should get most weight
         assert!(
             result.weights[0] > 0.9,
@@ -2674,9 +2610,9 @@ mod tests {
     fn test_traditional_weights_objective_finite() {
         let panel = create_simple_panel();
         let config = SynthControlConfig::default();
-        
+
         let result = compute_traditional_weights(&panel, &config).unwrap();
-        
+
         assert!(
             result.objective.is_finite(),
             "Objective should be finite, got {}",
@@ -2692,39 +2628,27 @@ mod tests {
     fn test_att_known_treatment_effect() {
         // Panel where treated unit has known effect of 5.0
         let panel = create_known_effect_panel();
-        
+
         // With single control that matches treated, weight = [1.0]
         let weights = vec![1.0];
         let att = compute_att(&panel, &weights);
-        
+
         // Expected: treated_post (9.0) - control_post (4.0) = 5.0
-        assert!(
-            (att - 5.0).abs() < 1e-10,
-            "ATT should be 5.0, got {}",
-            att
-        );
+        assert!((att - 5.0).abs() < 1e-10, "ATT should be 5.0, got {}", att);
     }
 
     #[test]
     fn test_att_zero_treatment_effect() {
         // Create panel where treated and control have same trajectory
         let outcomes = vec![
-            1.0, 2.0, 3.0, 4.0,  // treated
-            1.0, 2.0, 3.0, 4.0,  // control (identical)
+            1.0, 2.0, 3.0, 4.0, // treated
+            1.0, 2.0, 3.0, 4.0, // control (identical)
         ];
-        let panel = SCPanelData::new(
-            outcomes,
-            2,
-            4,
-            vec![1],
-            0,
-            vec![0, 1, 2],
-            vec![3],
-        ).unwrap();
-        
+        let panel = SCPanelData::new(outcomes, 2, 4, vec![1], 0, vec![0, 1, 2], vec![3]).unwrap();
+
         let weights = vec![1.0];
         let att = compute_att(&panel, &weights);
-        
+
         assert!(
             att.abs() < 1e-10,
             "ATT should be 0 when no treatment effect, got {}",
@@ -2735,66 +2659,42 @@ mod tests {
     #[test]
     fn test_att_with_weighted_control() {
         let panel = create_simple_panel();
-        
+
         // Use uniform weights: [1/3, 1/3, 1/3]
         let weights = vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0];
         let att = compute_att(&panel, &weights);
-        
+
         // Synthetic post = (4 + 5 + 3) / 3 = 4.0
         // ATT = 10 - 4 = 6.0
-        assert!(
-            (att - 6.0).abs() < 1e-10,
-            "ATT should be 6.0, got {}",
-            att
-        );
+        assert!((att - 6.0).abs() < 1e-10, "ATT should be 6.0, got {}", att);
     }
 
     #[test]
     fn test_att_multiple_post_periods() {
         let outcomes = vec![
-            1.0, 2.0, 8.0, 9.0,  // treated: post = [8, 9]
-            1.0, 2.0, 3.0, 4.0,  // control: post = [3, 4]
+            1.0, 2.0, 8.0, 9.0, // treated: post = [8, 9]
+            1.0, 2.0, 3.0, 4.0, // control: post = [3, 4]
         ];
-        let panel = SCPanelData::new(
-            outcomes,
-            2,
-            4,
-            vec![1],
-            0,
-            vec![0, 1],
-            vec![2, 3],
-        ).unwrap();
-        
+        let panel = SCPanelData::new(outcomes, 2, 4, vec![1], 0, vec![0, 1], vec![2, 3]).unwrap();
+
         let weights = vec![1.0];
         let att = compute_att(&panel, &weights);
-        
+
         // ATT = mean((8-3), (9-4)) = mean(5, 5) = 5
-        assert!(
-            (att - 5.0).abs() < 1e-10,
-            "ATT should be 5.0, got {}",
-            att
-        );
+        assert!((att - 5.0).abs() < 1e-10, "ATT should be 5.0, got {}", att);
     }
 
     #[test]
     fn test_att_negative_effect() {
         let outcomes = vec![
-            5.0, 6.0, 7.0, 3.0,  // treated: drops in post
-            5.0, 6.0, 7.0, 8.0,  // control: continues trend
+            5.0, 6.0, 7.0, 3.0, // treated: drops in post
+            5.0, 6.0, 7.0, 8.0, // control: continues trend
         ];
-        let panel = SCPanelData::new(
-            outcomes,
-            2,
-            4,
-            vec![1],
-            0,
-            vec![0, 1, 2],
-            vec![3],
-        ).unwrap();
-        
+        let panel = SCPanelData::new(outcomes, 2, 4, vec![1], 0, vec![0, 1, 2], vec![3]).unwrap();
+
         let weights = vec![1.0];
         let att = compute_att(&panel, &weights);
-        
+
         // ATT = 3 - 8 = -5
         assert!(
             (att - (-5.0)).abs() < 1e-10,
@@ -2810,16 +2710,12 @@ mod tests {
     #[test]
     fn test_pre_treatment_mse_perfect_fit() {
         let panel = create_perfect_match_panel();
-        
+
         // Control 0 perfectly matches treated, so give it all weight
         let weights = vec![1.0, 0.0];
         let mse = compute_pre_treatment_mse(&panel, &weights);
-        
-        assert!(
-            mse < 1e-15,
-            "MSE should be 0 for perfect fit, got {}",
-            mse
-        );
+
+        assert!(mse < 1e-15, "MSE should be 0 for perfect fit, got {}", mse);
     }
 
     #[test]
@@ -2827,7 +2723,7 @@ mod tests {
         let panel = create_perfect_match_panel();
         let weights = vec![1.0, 0.0];
         let rmse = compute_pre_treatment_rmse(&panel, &weights);
-        
+
         assert!(
             rmse < 1e-10,
             "RMSE should be 0 for perfect fit, got {}",
@@ -2838,22 +2734,14 @@ mod tests {
     #[test]
     fn test_pre_treatment_mse_known_value() {
         let outcomes = vec![
-            2.0, 4.0, 6.0, 10.0,  // treated
-            1.0, 2.0, 3.0, 5.0,   // control (half of treated in pre)
+            2.0, 4.0, 6.0, 10.0, // treated
+            1.0, 2.0, 3.0, 5.0, // control (half of treated in pre)
         ];
-        let panel = SCPanelData::new(
-            outcomes,
-            2,
-            4,
-            vec![1],
-            0,
-            vec![0, 1, 2],
-            vec![3],
-        ).unwrap();
-        
+        let panel = SCPanelData::new(outcomes, 2, 4, vec![1], 0, vec![0, 1, 2], vec![3]).unwrap();
+
         let weights = vec![1.0];
         let mse = compute_pre_treatment_mse(&panel, &weights);
-        
+
         // Diffs: (2-1)=1, (4-2)=2, (6-3)=3
         // MSE = (1 + 4 + 9) / 3 = 14/3 ≈ 4.667
         let expected_mse = (1.0 + 4.0 + 9.0) / 3.0;
@@ -2867,23 +2755,12 @@ mod tests {
 
     #[test]
     fn test_pre_treatment_rmse_known_value() {
-        let outcomes = vec![
-            2.0, 4.0, 6.0, 10.0,
-            1.0, 2.0, 3.0, 5.0,
-        ];
-        let panel = SCPanelData::new(
-            outcomes,
-            2,
-            4,
-            vec![1],
-            0,
-            vec![0, 1, 2],
-            vec![3],
-        ).unwrap();
-        
+        let outcomes = vec![2.0, 4.0, 6.0, 10.0, 1.0, 2.0, 3.0, 5.0];
+        let panel = SCPanelData::new(outcomes, 2, 4, vec![1], 0, vec![0, 1, 2], vec![3]).unwrap();
+
         let weights = vec![1.0];
         let rmse = compute_pre_treatment_rmse(&panel, &weights);
-        
+
         let expected_rmse = ((1.0 + 4.0 + 9.0) / 3.0_f64).sqrt();
         assert!(
             (rmse - expected_rmse).abs() < 1e-10,
@@ -2896,20 +2773,16 @@ mod tests {
     #[test]
     fn test_pre_treatment_mse_with_weighted_control() {
         let panel = create_perfect_match_panel();
-        
+
         // Weights: 50% on perfect match, 50% on different control
         let weights = vec![0.5, 0.5];
         let mse = compute_pre_treatment_mse(&panel, &weights);
-        
+
         // Synthetic = 0.5 * [1,2,3] + 0.5 * [5,6,7] = [3, 4, 5]
         // Treated = [1, 2, 3]
         // Diffs = [-2, -2, -2]
         // MSE = (4 + 4 + 4) / 3 = 4
-        assert!(
-            (mse - 4.0).abs() < 1e-10,
-            "MSE should be 4.0, got {}",
-            mse
-        );
+        assert!((mse - 4.0).abs() < 1e-10, "MSE should be 4.0, got {}", mse);
     }
 
     // ========================================================================
@@ -2920,21 +2793,21 @@ mod tests {
     fn test_full_pipeline() {
         let panel = create_simple_panel();
         let config = SynthControlConfig::default();
-        
+
         // Compute weights
         let weight_result = compute_traditional_weights(&panel, &config).unwrap();
-        
+
         // Verify weight constraints
         let sum: f64 = weight_result.weights.iter().sum();
         assert!((sum - 1.0).abs() < 1e-10, "Weights must sum to 1");
         for &w in &weight_result.weights {
             assert!(w >= -1e-15, "Weights must be non-negative");
         }
-        
+
         // Compute ATT
         let att = compute_att(&panel, &weight_result.weights);
         assert!(att.is_finite(), "ATT must be finite");
-        
+
         // Compute pre-treatment fit
         let rmse = compute_pre_treatment_rmse(&panel, &weight_result.weights);
         assert!(rmse >= 0.0, "RMSE must be non-negative");
@@ -2945,16 +2818,16 @@ mod tests {
     fn test_optimized_weights_improve_fit() {
         let panel = create_simple_panel();
         let config = SynthControlConfig::default();
-        
+
         // Uniform weights
         let n_control = panel.n_control();
         let uniform_weights: Vec<f64> = vec![1.0 / n_control as f64; n_control];
         let uniform_mse = compute_pre_treatment_mse(&panel, &uniform_weights);
-        
+
         // Optimized weights
         let result = compute_traditional_weights(&panel, &config).unwrap();
         let optimized_mse = compute_pre_treatment_mse(&panel, &result.weights);
-        
+
         // Optimized should be at least as good as uniform
         assert!(
             optimized_mse <= uniform_mse + 1e-10,
@@ -3164,10 +3037,7 @@ mod tests {
 
         let weight_result = result.unwrap();
         let sum: f64 = weight_result.weights.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-10,
-            "Weights should still sum to 1.0"
-        );
+        assert!((sum - 1.0).abs() < 1e-10, "Weights should still sum to 1.0");
     }
 
     // ========================================================================
@@ -3213,19 +3083,12 @@ mod tests {
         // Create panel where controls have different levels but same dynamics
         // Robust SC should focus on matching dynamics, not levels
         let outcomes = vec![
-            0.0, 1.0, 2.0, 7.0,   // treated: mean = 1, dynamics = [0,1,2]
-            10.0, 11.0, 12.0, 13.0,  // control 1: high level, same dynamics
-            0.0, 1.0, 2.0, 3.0,   // control 2: same level and dynamics as treated
+            0.0, 1.0, 2.0, 7.0, // treated: mean = 1, dynamics = [0,1,2]
+            10.0, 11.0, 12.0, 13.0, // control 1: high level, same dynamics
+            0.0, 1.0, 2.0, 3.0, // control 2: same level and dynamics as treated
         ];
-        let panel = SCPanelData::new(
-            outcomes,
-            3,
-            4,
-            vec![1, 2],
-            0,
-            vec![0, 1, 2],
-            vec![3],
-        ).unwrap();
+        let panel =
+            SCPanelData::new(outcomes, 3, 4, vec![1, 2], 0, vec![0, 1, 2], vec![3]).unwrap();
 
         let mut config = SynthControlConfig::default();
         config.method = SynthControlMethod::Robust;
@@ -3241,22 +3104,13 @@ mod tests {
     /// Create a panel suitable for Augmented SC (requires 2+ controls, 2+ pre-periods)
     fn create_augmented_panel() -> SCPanelData {
         let outcomes = vec![
-            1.0, 2.0, 3.0, 10.0, 11.0,  // treated
-            1.0, 2.0, 3.0, 4.0, 5.0,    // control 1 - perfect pre-treatment match
-            2.0, 3.0, 4.0, 5.0, 6.0,    // control 2
-            0.0, 1.0, 2.0, 3.0, 4.0,    // control 3
+            1.0, 2.0, 3.0, 10.0, 11.0, // treated
+            1.0, 2.0, 3.0, 4.0, 5.0, // control 1 - perfect pre-treatment match
+            2.0, 3.0, 4.0, 5.0, 6.0, // control 2
+            0.0, 1.0, 2.0, 3.0, 4.0, // control 3
         ];
 
-        SCPanelData::new(
-            outcomes,
-            4,
-            5,
-            vec![1, 2, 3],
-            0,
-            vec![0, 1, 2],
-            vec![3, 4],
-        )
-        .unwrap()
+        SCPanelData::new(outcomes, 4, 5, vec![1, 2, 3], 0, vec![0, 1, 2], vec![3, 4]).unwrap()
     }
 
     #[test]
@@ -3270,7 +3124,7 @@ mod tests {
         assert!(result.is_ok(), "Augmented SC should compute successfully");
 
         let asc_result = result.unwrap();
-        
+
         // Check weights are valid
         let sum: f64 = asc_result.weight_result.weights.iter().sum();
         assert!(
@@ -3278,7 +3132,7 @@ mod tests {
             "Augmented SC weights must sum to 1.0, got {}",
             sum
         );
-        
+
         // Check ridge coefficients are computed
         assert_eq!(
             asc_result.ridge_coefficients.len(),
@@ -3301,7 +3155,10 @@ mod tests {
         let att_augmented = compute_augmented_att(&panel, &asc_result);
 
         // Both should be finite
-        assert!(att_traditional.is_finite(), "Traditional ATT should be finite");
+        assert!(
+            att_traditional.is_finite(),
+            "Traditional ATT should be finite"
+        );
         assert!(att_augmented.is_finite(), "Augmented ATT should be finite");
 
         // The difference should be the bias adjustment
@@ -3317,19 +3174,8 @@ mod tests {
     #[test]
     fn test_augmented_requires_min_controls() {
         // Only 1 control unit - should fail
-        let outcomes = vec![
-            1.0, 2.0, 3.0, 10.0,
-            1.0, 2.0, 3.0, 4.0,
-        ];
-        let panel = SCPanelData::new(
-            outcomes,
-            2,
-            4,
-            vec![1],
-            0,
-            vec![0, 1, 2],
-            vec![3],
-        ).unwrap();
+        let outcomes = vec![1.0, 2.0, 3.0, 10.0, 1.0, 2.0, 3.0, 4.0];
+        let panel = SCPanelData::new(outcomes, 2, 4, vec![1], 0, vec![0, 1, 2], vec![3]).unwrap();
 
         let mut config = SynthControlConfig::default();
         config.method = SynthControlMethod::Augmented;
@@ -3342,27 +3188,18 @@ mod tests {
     #[test]
     fn test_augmented_requires_min_pre_periods() {
         // Only 1 pre-treatment period - should fail
-        let outcomes = vec![
-            1.0, 10.0, 11.0,
-            1.0, 4.0, 5.0,
-            2.0, 5.0, 6.0,
-        ];
-        let panel = SCPanelData::new(
-            outcomes,
-            3,
-            3,
-            vec![1, 2],
-            0,
-            vec![0],
-            vec![1, 2],
-        ).unwrap();
+        let outcomes = vec![1.0, 10.0, 11.0, 1.0, 4.0, 5.0, 2.0, 5.0, 6.0];
+        let panel = SCPanelData::new(outcomes, 3, 3, vec![1, 2], 0, vec![0], vec![1, 2]).unwrap();
 
         let mut config = SynthControlConfig::default();
         config.method = SynthControlMethod::Augmented;
         config.lambda = Some(1.0);
 
         let result = compute_augmented_sc(&panel, &config);
-        assert!(result.is_err(), "Augmented SC should require 2+ pre-periods");
+        assert!(
+            result.is_err(),
+            "Augmented SC should require 2+ pre-periods"
+        );
     }
 
     // ========================================================================
@@ -3481,10 +3318,7 @@ mod tests {
     #[test]
     fn test_matrix_inversion_identity() {
         // Invert identity matrix should give identity
-        let identity = vec![
-            vec![1.0, 0.0],
-            vec![0.0, 1.0],
-        ];
+        let identity = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let inv = invert_matrix(&identity).unwrap();
 
         for i in 0..2 {
@@ -3493,7 +3327,10 @@ mod tests {
                 assert!(
                     (inv[i][j] - expected).abs() < 1e-10,
                     "Identity inverse[{}][{}] should be {}, got {}",
-                    i, j, expected, inv[i][j]
+                    i,
+                    j,
+                    expected,
+                    inv[i][j]
                 );
             }
         }
@@ -3502,10 +3339,7 @@ mod tests {
     #[test]
     fn test_matrix_inversion_simple() {
         // Simple 2x2 matrix
-        let a = vec![
-            vec![4.0, 7.0],
-            vec![2.0, 6.0],
-        ];
+        let a = vec![vec![4.0, 7.0], vec![2.0, 6.0]];
         let inv = invert_matrix(&a).unwrap();
 
         // Check A * A^-1 = I
@@ -3519,7 +3353,10 @@ mod tests {
                 assert!(
                     (sum - expected).abs() < 1e-10,
                     "A * A^-1 at [{},{}] should be {}, got {}",
-                    i, j, expected, sum
+                    i,
+                    j,
+                    expected,
+                    sum
                 );
             }
         }
@@ -3528,10 +3365,7 @@ mod tests {
     #[test]
     fn test_matrix_inversion_singular_fails() {
         // Singular matrix should fail
-        let singular = vec![
-            vec![1.0, 2.0],
-            vec![2.0, 4.0],
-        ];
+        let singular = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
         let result = invert_matrix(&singular);
         assert!(result.is_err());
     }

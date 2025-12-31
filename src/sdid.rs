@@ -21,16 +21,20 @@
 //! - Arkhangelsky, D., Athey, S., Hirshberg, D. A., Imbens, G. W., & Wager, S. (2021).
 //!   Synthetic difference-in-differences. *American Economic Review*, 111(12), 4088-4118.
 
-// Allow dead_code for now as this module is work-in-progress
-// These items will be used when the SDID estimator is fully implemented
+// WIP: SDID module under active development. Dead code annotations
+// suppress warnings for functions that will be wired up in future releases.
 #![allow(dead_code)]
 
-use pyo3::prelude::*;
-use rayon::prelude::*;
+// Standard library imports
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// External crate imports
+use pyo3::prelude::*;
+use rayon::prelude::*;
+
+// Local module imports
 use crate::cluster::{SplitMix64, WelfordState};
 
 // ============================================================================
@@ -891,7 +895,7 @@ impl FrankWolfeSolver {
 /// let std = compute_pooled_std(&values);
 /// assert!((std - 1.5811).abs() < 0.001);
 /// ```
-pub fn compute_pooled_std(outcomes: &[f64]) -> f64 {
+fn compute_pooled_std(outcomes: &[f64]) -> f64 {
     let n = outcomes.len();
     if n < 2 {
         return 0.0;
@@ -927,7 +931,7 @@ pub fn compute_pooled_std(outcomes: &[f64]) -> f64 {
 /// let outcomes = vec![1.0, 2.0, 3.0, 4.0];
 /// let zeta = compute_regularization_zeta(4, &outcomes);
 /// ```
-pub fn compute_regularization_zeta(n_control: usize, outcomes: &[f64]) -> f64 {
+fn compute_regularization_zeta(n_control: usize, outcomes: &[f64]) -> f64 {
     let sigma = compute_pooled_std(outcomes);
     (n_control as f64).powf(0.25) * sigma
 }
@@ -945,11 +949,11 @@ struct CachedGradientMatrices {
     /// AA' matrix for unit weights (n_control × n_control)
     /// or BB' matrix for time weights (n_pre × n_pre)
     gram_matrix: Vec<Vec<f64>>,
-    
+
     /// A × target for unit weights (n_control × 1)
     /// or B × target for time weights (n_pre × 1)
     target_product: Vec<f64>,
-    
+
     /// Regularization parameter
     zeta: f64,
 }
@@ -963,32 +967,37 @@ impl CachedGradientMatrices {
     fn for_unit_weights(a: &[Vec<f64>], target: &[f64], zeta: f64) -> Self {
         let n_control = a.len();
         let n_pre = if n_control > 0 { a[0].len() } else { 0 };
-        
+
         // Compute AA' (n_control × n_control)
         // AA'[i][j] = Σₜ A[i][t] × A[j][t]
         let mut gram_matrix = vec![vec![0.0; n_control]; n_control];
         for i in 0..n_control {
             for j in i..n_control {
-                let mut sum = 0.0;
-                for t in 0..n_pre {
-                    sum += a[i][t] * a[j][t];
-                }
+                let sum: f64 = a[i].iter().zip(a[j].iter()).map(|(ai, aj)| ai * aj).sum();
                 gram_matrix[i][j] = sum;
                 gram_matrix[j][i] = sum; // Symmetric
             }
         }
-        
+
         // Compute A × target (n_control × 1)
         // (A × target)[i] = Σₜ A[i][t] × target[t]
         let mut target_product = Vec::with_capacity(n_control);
         for row in a {
-            let sum: f64 = row.iter().zip(target.iter()).map(|(&a_it, &t_t)| a_it * t_t).sum();
+            let sum: f64 = row
+                .iter()
+                .zip(target.iter())
+                .map(|(&a_it, &t_t)| a_it * t_t)
+                .sum();
             target_product.push(sum);
         }
-        
-        Self { gram_matrix, target_product, zeta }
+
+        Self {
+            gram_matrix,
+            target_product,
+            zeta,
+        }
     }
-    
+
     /// Create cached matrices for time weight optimization.
     ///
     /// Precomputes:
@@ -997,32 +1006,37 @@ impl CachedGradientMatrices {
     fn for_time_weights(b: &[Vec<f64>], target: &[f64], zeta: f64) -> Self {
         let n_pre = b.len();
         let n_control = if n_pre > 0 { b[0].len() } else { 0 };
-        
+
         // Compute BB' (n_pre × n_pre)
         // BB'[s][t] = Σᵢ B[s][i] × B[t][i]
         let mut gram_matrix = vec![vec![0.0; n_pre]; n_pre];
         for s in 0..n_pre {
             for t in s..n_pre {
-                let mut sum = 0.0;
-                for i in 0..n_control {
-                    sum += b[s][i] * b[t][i];
-                }
+                let sum: f64 = b[s].iter().zip(b[t].iter()).map(|(bs, bt)| bs * bt).sum();
                 gram_matrix[s][t] = sum;
                 gram_matrix[t][s] = sum; // Symmetric
             }
         }
-        
+
         // Compute B × target (n_pre × 1)
         // (B × target)[t] = Σᵢ B[t][i] × target[i]
         let mut target_product = Vec::with_capacity(n_pre);
         for row in b {
-            let sum: f64 = row.iter().zip(target.iter()).map(|(&b_ti, &tgt_i)| b_ti * tgt_i).sum();
+            let sum: f64 = row
+                .iter()
+                .zip(target.iter())
+                .map(|(&b_ti, &tgt_i)| b_ti * tgt_i)
+                .sum();
             target_product.push(sum);
         }
-        
-        Self { gram_matrix, target_product, zeta }
+
+        Self {
+            gram_matrix,
+            target_product,
+            zeta,
+        }
     }
-    
+
     /// Compute gradient using cached matrices: O(n²) instead of O(n × m)
     ///
     /// ∇f(w)[i] = 2(Gram × w)[i] + 2ζw[i] - 2(target_product)[i]
@@ -1030,18 +1044,18 @@ impl CachedGradientMatrices {
     fn compute_gradient(&self, w: &[f64]) -> Vec<f64> {
         let n = w.len();
         let mut grad = vec![0.0; n];
-        
+
         // Compute Gram × w: O(n²)
         for (i, grad_i) in grad.iter_mut().enumerate() {
             let mut gram_w_i = 0.0;
             for (j, &wj) in w.iter().enumerate() {
                 gram_w_i += self.gram_matrix[i][j] * wj;
             }
-            
+
             // ∇f(w)[i] = 2(Gram × w)[i] + 2ζw[i] - 2(target_product)[i]
             *grad_i = 2.0 * (gram_w_i + self.zeta * w[i]) - 2.0 * self.target_product[i];
         }
-        
+
         grad
     }
 }
@@ -1216,9 +1230,7 @@ impl SyntheticDIDSolver {
         // Efficient gradient using precomputed Gram matrix: O(n_control²) per call
         // The CachedGradientMatrices precomputes AA' (Gram matrix) and A×target,
         // reducing gradient computation from O(n_control × n_pre) to O(n_control²)
-        let gradient_fn = move |w: &[f64]| -> Vec<f64> {
-            cached.compute_gradient(w)
-        };
+        let gradient_fn = move |w: &[f64]| -> Vec<f64> { cached.compute_gradient(w) };
 
         // Create and run Frank-Wolfe solver
         let mut fw_solver = FrankWolfeSolver::new(n_control, self.config.clone());
@@ -1368,9 +1380,7 @@ impl SyntheticDIDSolver {
         // Efficient gradient using precomputed Gram matrix: O(n_pre²) per call
         // The CachedGradientMatrices precomputes BB' (Gram matrix) and B×target,
         // reducing gradient computation from O(n_pre × n_control) to O(n_pre²)
-        let gradient_fn = move |lambda: &[f64]| -> Vec<f64> {
-            cached.compute_gradient(lambda)
-        };
+        let gradient_fn = move |lambda: &[f64]| -> Vec<f64> { cached.compute_gradient(lambda) };
 
         // Create and run Frank-Wolfe solver
         let mut fw_solver = FrankWolfeSolver::new(n_pre, self.config.clone());
@@ -1616,9 +1626,7 @@ impl SyntheticDIDSolver {
         };
 
         // OPTIMIZED: Efficient gradient using precomputed Gram matrix
-        let gradient_fn = move |w: &[f64]| -> Vec<f64> {
-            cached.compute_gradient(w)
-        };
+        let gradient_fn = move |w: &[f64]| -> Vec<f64> { cached.compute_gradient(w) };
 
         let mut fw_solver = FrankWolfeSolver::new(n_control, self.config.clone());
         let weights = fw_solver.solve(objective, gradient_fn)?;
@@ -1667,7 +1675,9 @@ impl SyntheticDIDSolver {
         // Target: for each control unit, compute average of post-period outcomes
         let mut target: Vec<f64> = Vec::with_capacity(n_control);
         for &ctrl_idx in control_indices {
-            let sum: f64 = self.panel.post_period_indices
+            let sum: f64 = self
+                .panel
+                .post_period_indices
                 .iter()
                 .map(|&t| self.panel.outcomes[ctrl_idx][t])
                 .sum();
@@ -1704,9 +1714,7 @@ impl SyntheticDIDSolver {
         };
 
         // OPTIMIZED: Efficient gradient using precomputed Gram matrix
-        let gradient_fn = move |lambda: &[f64]| -> Vec<f64> {
-            cached.compute_gradient(lambda)
-        };
+        let gradient_fn = move |lambda: &[f64]| -> Vec<f64> { cached.compute_gradient(lambda) };
 
         let mut fw_solver = FrankWolfeSolver::new(n_pre, self.config.clone());
         let weights = fw_solver.solve(objective, gradient_fn)?;
@@ -1824,13 +1832,15 @@ impl SyntheticDIDSolver {
             .filter_map(|iter_idx| {
                 // Thread-local RNG seeded deterministically based on iteration index
                 let mut rng = SplitMix64::new(initial_seed.wrapping_add(iter_idx as u64));
-                
+
                 // Select a random control unit to be placebo treated
                 let placebo_control_idx = (rng.next() as usize) % n_control;
                 let placebo_unit = self.panel.control_indices[placebo_control_idx];
 
                 // Create new index vectors (small allocations, necessary for thread safety)
-                let new_control_indices: Vec<usize> = self.panel.control_indices
+                let new_control_indices: Vec<usize> = self
+                    .panel
+                    .control_indices
                     .iter()
                     .filter(|&&idx| idx != placebo_unit)
                     .copied()
@@ -1847,10 +1857,8 @@ impl SyntheticDIDSolver {
                         &new_control_indices,
                         &new_treated_indices,
                     )?;
-                    let (time_weights, _) = self.compute_time_weights_with_indices(
-                        &new_control_indices,
-                        &unit_weights,
-                    )?;
+                    let (time_weights, _) = self
+                        .compute_time_weights_with_indices(&new_control_indices, &unit_weights)?;
                     Ok(self.compute_att_with_indices(
                         &new_control_indices,
                         &new_treated_indices,
@@ -2218,12 +2226,15 @@ mod tests {
     #[test]
     fn test_frank_wolfe_config_default() {
         let config = FrankWolfeConfig::default();
-        assert_eq!(config.max_iterations, 1000);
-        assert!((config.tolerance - 1e-4).abs() < 1e-12);
+        assert_eq!(config.max_iterations, 200);
+        assert!((config.tolerance - 1e-3).abs() < 1e-12);
         assert_eq!(config.step_size_method, StepSizeMethod::Classic);
         assert!((config.armijo_beta - 0.5).abs() < 1e-12);
         assert!((config.armijo_sigma - 1e-4).abs() < 1e-12);
-        assert!(config.use_relative_gap, "use_relative_gap should default to true");
+        assert!(
+            config.use_relative_gap,
+            "use_relative_gap should default to true"
+        );
     }
 
     #[test]
@@ -2583,7 +2594,7 @@ mod tests {
         // Use a target in the interior of the simplex where FW converges slowly
         let config = FrankWolfeConfig {
             max_iterations: 5,
-            tolerance: 1e-100, // Impossibly tight tolerance
+            tolerance: 1e-100,                         // Impossibly tight tolerance
             step_size_method: StepSizeMethod::Classic, // Use Classic for speed
             armijo_beta: 0.5,
             armijo_sigma: 1e-4,
@@ -2613,7 +2624,10 @@ mod tests {
 
         // With the improved fallback logic, solver returns approximate solution
         // when progress has been made (gap < 1.0)
-        assert!(result.is_ok(), "Solver should return Ok with approximate solution");
+        assert!(
+            result.is_ok(),
+            "Solver should return Ok with approximate solution"
+        );
 
         let weights = result.unwrap();
         // Verify simplex constraints

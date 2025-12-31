@@ -8,6 +8,93 @@ from causers import synthetic_did, SyntheticDIDResult
 
 
 # ============================================================================
+# Helper Functions
+# ============================================================================
+
+
+def generate_synthetic_panel(
+    n_units: int,
+    n_periods: int,
+    n_treated: int,
+    n_pre: int,
+    treatment_effect: float = 5.0,
+    seed: int = 42
+) -> pl.DataFrame:
+    """
+    Generate a synthetic panel dataset for performance testing.
+    
+    Creates panel data with parallel trends (same slope for all units)
+    which is the ideal scenario for SDID estimation.
+    
+    Parameters
+    ----------
+    n_units : int
+        Total number of units (treated + control)
+    n_periods : int
+        Total number of time periods (pre + post)
+    n_treated : int
+        Number of treated units (must be < n_units)
+    n_pre : int
+        Number of pre-treatment periods (must be < n_periods)
+    treatment_effect : float
+        The true treatment effect to apply
+    seed : int
+        Random seed for reproducibility
+    
+    Returns
+    -------
+    pl.DataFrame
+        Panel data in long format with columns: unit, time, y, treated
+    """
+    import numpy as np
+    
+    np.random.seed(seed)
+    
+    n_control = n_units - n_treated
+    n_post = n_periods - n_pre
+    
+    units = []
+    times = []
+    outcomes = []
+    treatments = []
+    
+    # Generate unit-level fixed effects (intercepts only)
+    # Use uniform distribution for more stable data
+    unit_intercepts = np.random.uniform(0.0, 5.0, n_units)
+    
+    # Common time trend slope for parallel trends assumption
+    common_slope = 1.0
+    
+    for unit_id in range(n_units):
+        is_treated_unit = unit_id < n_treated
+        
+        for t in range(n_periods):
+            # Base outcome: unit fixed effect + common time trend
+            # Parallel trends: all units have same slope
+            base = unit_intercepts[unit_id] + t * common_slope
+            
+            if is_treated_unit and t >= n_pre:
+                # Apply treatment effect in post-period for treated units
+                outcome = base + treatment_effect
+                treatment = 1
+            else:
+                outcome = base
+                treatment = 0
+            
+            units.append(unit_id)
+            times.append(t)
+            outcomes.append(outcome)
+            treatments.append(treatment)
+    
+    return pl.DataFrame({
+        'unit': units,
+        'time': times,
+        'y': outcomes,
+        'treated': treatments
+    })
+
+
+# ============================================================================
 # Fixtures
 # ============================================================================
 
@@ -732,7 +819,7 @@ class TestIntegration:
 
 
 # ============================================================================
-# azcausal Integration Tests (REQ-088, REQ-089)
+# azcausal Integration Tests
 # ============================================================================
 
 
@@ -741,8 +828,8 @@ class TestAzcausalIntegration:
     Integration tests comparing causers SDID against azcausal reference implementation.
     
     These tests verify:
-    - REQ-088: ATT matches azcausal to rtol=1e-6
-    - REQ-089: Placebo bootstrap SE matches azcausal.core.error.Placebo to rtol=1e-2
+    - ATT matches azcausal to rtol=1e-6
+    - Placebo bootstrap SE matches azcausal.core.error.Placebo to rtol=1e-2
     
     API Differences (azcausal vs causers):
     ----------------------------------------
@@ -998,7 +1085,7 @@ class TestAzcausalIntegration:
 
     def test_att_matches_azcausal_simple(self, azcausal_imports, simple_panel_data):
         """
-        REQ-088: ATT matches azcausal to rtol=1e-6 for simple parallel trends.
+        ATT matches azcausal to rtol=1e-6 for simple parallel trends.
         
         With perfect parallel trends, both implementations should produce
         identical ATT estimates.
@@ -1037,7 +1124,7 @@ class TestAzcausalIntegration:
 
     def test_att_matches_azcausal_complex(self, azcausal_imports, complex_panel_data):
         """
-        REQ-088: ATT matches azcausal to rtol=1e-6 for complex non-parallel trends.
+        ATT matches azcausal to rtol=1e-6 for complex non-parallel trends.
         
         With non-parallel trends, both implementations should still produce
         similar ATT estimates (within tolerance), though small differences
@@ -1082,7 +1169,7 @@ class TestAzcausalIntegration:
 
     def test_se_matches_azcausal_placebo_simple(self, azcausal_imports, simple_panel_data):
         """
-        REQ-089: Placebo bootstrap SE matches azcausal.core.error.Placebo.
+        Placebo bootstrap SE matches azcausal.core.error.Placebo.
         
         For simple parallel trends, SE should be very close to 0 for both.
         """
@@ -1126,7 +1213,7 @@ class TestAzcausalIntegration:
 
     def test_se_matches_azcausal_placebo_complex(self, azcausal_imports, complex_panel_data):
         """
-        REQ-089: Placebo bootstrap SE matches azcausal.core.error.Placebo to rtol=1e-2.
+        Placebo bootstrap SE matches azcausal.core.error.Placebo to rtol=1e-2.
         
         For complex non-parallel trends, both should produce similar SE estimates.
         
@@ -1184,7 +1271,7 @@ class TestAzcausalIntegration:
 
     def test_nonzero_se_with_noisy_data(self, azcausal_imports, noisy_panel_data):
         """
-        REQ-089: Verify non-zero SE with noisy data.
+        Verify non-zero SE with noisy data.
         
         This test uses panel data with random noise in outcomes to ensure
         the placebo bootstrap produces non-trivial standard error estimates.
@@ -1336,90 +1423,8 @@ class TestAzcausalIntegration:
 
 
 # ============================================================================
-# Performance Tests (REQ-049, REQ-050)
+# Performance Tests
 # ============================================================================
-
-
-def generate_synthetic_panel(
-    n_units: int,
-    n_periods: int,
-    n_treated: int,
-    n_pre: int,
-    treatment_effect: float = 5.0,
-    seed: int = 42
-) -> pl.DataFrame:
-    """
-    Generate a synthetic panel dataset for performance testing.
-    
-    Creates panel data with parallel trends (same slope for all units)
-    which is the ideal scenario for SDID estimation.
-    
-    Parameters
-    ----------
-    n_units : int
-        Total number of units (treated + control)
-    n_periods : int
-        Total number of time periods (pre + post)
-    n_treated : int
-        Number of treated units (must be < n_units)
-    n_pre : int
-        Number of pre-treatment periods (must be < n_periods)
-    treatment_effect : float
-        The true treatment effect to apply
-    seed : int
-        Random seed for reproducibility
-    
-    Returns
-    -------
-    pl.DataFrame
-        Panel data in long format with columns: unit, time, y, treated
-    """
-    import numpy as np
-    
-    np.random.seed(seed)
-    
-    n_control = n_units - n_treated
-    n_post = n_periods - n_pre
-    
-    units = []
-    times = []
-    outcomes = []
-    treatments = []
-    
-    # Generate unit-level fixed effects (intercepts only)
-    # Use uniform distribution for more stable data
-    unit_intercepts = np.random.uniform(0.0, 5.0, n_units)
-    
-    # Common time trend slope for parallel trends assumption
-    common_slope = 1.0
-    
-    for unit_id in range(n_units):
-        is_treated_unit = unit_id < n_treated
-        
-        for t in range(n_periods):
-            # Base outcome: unit fixed effect + common time trend
-            # Parallel trends: all units have same slope
-            base = unit_intercepts[unit_id] + t * common_slope
-            
-            if is_treated_unit and t >= n_pre:
-                # Apply treatment effect in post-period for treated units
-                outcome = base + treatment_effect
-                treatment = 1
-            else:
-                outcome = base
-                treatment = 0
-            
-            units.append(unit_id)
-            times.append(t)
-            outcomes.append(outcome)
-            treatments.append(treatment)
-    
-    return pl.DataFrame({
-        'unit': units,
-        'time': times,
-        'y': outcomes,
-        'treated': treatments
-    })
 
 
 class TestPerformance:
@@ -1427,8 +1432,8 @@ class TestPerformance:
     Performance tests for SDID implementation.
     
     These tests verify latency requirements from the specification:
-    - REQ-049: 1000 units × 100 periods < 1 second (excluding bootstrap)
-    - REQ-050: 100 units × 50 periods + 200 bootstrap < 30 seconds
+    - 1000 units × 100 periods < 1 second (excluding bootstrap)
+    - 100 units × 50 periods + 200 bootstrap < 30 seconds
     
     Use `pytest -m slow` to run only slow tests, or `pytest -m "not slow"` to skip them.
     
@@ -1447,7 +1452,7 @@ class TestPerformance:
     @pytest.mark.slow
     def test_performance_1000x100(self):
         """
-        REQ-049: 1000 units × 100 periods < 1 second (excluding bootstrap).
+        1000 units × 100 periods < 1 second (excluding bootstrap).
         
         Generate synthetic panel:
         - 1000 units total (~100 treated, ~900 control)
@@ -1516,7 +1521,7 @@ class TestPerformance:
     @pytest.mark.slow
     def test_performance_bootstrap(self):
         """
-        REQ-050: 100 units × 50 periods + 200 bootstrap < 30 seconds.
+        100 units × 50 periods + 200 bootstrap < 30 seconds.
         
         Generate panel:
         - 100 units (~20 treated, ~80 control)

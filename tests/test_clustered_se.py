@@ -2,18 +2,18 @@
 Tests for Clustered Standard Errors in causers.linear_regression
 
 This module validates:
-- TASK-013: Analytical clustered SE against statsmodels (rtol=1e-6)
-- TASK-014: Bootstrap SE against wildboottest (rtol=1e-2)
-- TASK-015: Warning emission for small cluster counts and float columns
-- TASK-016: Edge case handling (single-obs clusters, all-one-cluster, G=N, etc.)
-- TASK-017: Performance benchmarks (analytical ≤ 2× HC3)
+- Analytical clustered SE against statsmodels (rtol=1e-6)
+- Bootstrap SE against wildboottest (rtol=1e-2)
+- Warning emission for small cluster counts and float columns
+- Edge case handling (single-obs clusters, all-one-cluster, G=N, etc.)
+- Performance benchmarks (analytical ≤ 2× HC3)
 
 Requirements Traced:
-- REQ-012: Analytical clustered SE matches statsmodels within rtol=1e-6
-- REQ-023: Bootstrap SE matches wildboottest within rtol=1e-2
-- REQ-030: Warning when clusters < 42 and bootstrap=False
-- REQ-031: Warning when cluster column is float
-- REQ-200-211: Error handling for invalid inputs
+- Analytical clustered SE matches statsmodels within rtol=1e-6
+- Bootstrap SE matches wildboottest within rtol=1e-2
+- Warning when clusters < 42 and bootstrap=False
+- Warning when cluster column is float
+- Error handling for invalid inputs
 """
 
 import time
@@ -24,6 +24,21 @@ import polars as pl
 import pytest
 
 import causers
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+# Expected Webb weight values
+WEBB_WEIGHTS = [
+    -1.224744871391589,   # -√(3/2)
+    -0.7071067811865476,  # -√(1/2)
+    -0.4082482904638631,  # -√(1/6)
+     0.4082482904638631,  #  √(1/6)
+     0.7071067811865476,  #  √(1/2)
+     1.224744871391589,   #  √(3/2)
+]
 
 
 # =============================================================================
@@ -122,12 +137,12 @@ def small_cluster_data():
 
 
 # =============================================================================
-# TASK-013: Analytical Clustered SE vs statsmodels
+# Analytical Clustered SE vs statsmodels
 # =============================================================================
 
 
 class TestAnalyticalClusteredSE:
-    """Test analytical clustered SE matches statsmodels (REQ-012)."""
+    """Test analytical clustered SE matches statsmodels."""
     
     def test_analytical_se_matches_statsmodels_single_covariate(self, large_clustered_data):
         """Test single covariate clustered SE matches statsmodels within rtol=1e-6."""
@@ -217,7 +232,7 @@ class TestAnalyticalClusteredSE:
         )
     
     def test_coefficients_unchanged_with_clustering(self, large_clustered_data):
-        """Coefficients should be identical with and without clustering (REQ-050)."""
+        """Coefficients should be identical with and without clustering."""
         df = large_clustered_data
         
         # Without clustering
@@ -241,7 +256,7 @@ class TestAnalyticalClusteredSE:
             "Intercept changed with clustering"
     
     def test_r_squared_unchanged_with_clustering(self, large_clustered_data):
-        """R-squared should be identical with and without clustering (REQ-051)."""
+        """R-squared should be identical with and without clustering."""
         df = large_clustered_data
         
         result_no_cluster = causers.linear_regression(df, "x1", "y")
@@ -271,12 +286,12 @@ class TestAnalyticalClusteredSE:
 
 
 # =============================================================================
-# TASK-014: Bootstrap SE vs wildboottest
+# Bootstrap SE vs wildboottest
 # =============================================================================
 
 
 class TestBootstrapSE:
-    """Test bootstrap SE matches wildboottest (REQ-023)."""
+    """Test bootstrap SE matches wildboottest."""
     
     def test_bootstrap_se_matches_wildboottest(self, small_cluster_data):
         """Test bootstrap SE matches wildboottest within rtol=1e-2."""
@@ -354,7 +369,7 @@ class TestBootstrapSE:
                 assert abs(t_stat) < 3.0, f"t-stat {t_stat} too large for p={wild_pval}"
     
     def test_bootstrap_reproducibility_with_seed(self, small_cluster_data):
-        """Bootstrap with same seed should produce identical results (REQ-022)."""
+        """Bootstrap with same seed should produce identical results."""
         df = small_cluster_data
         
         result1 = causers.linear_regression(
@@ -438,12 +453,12 @@ class TestBootstrapSE:
 
 
 # =============================================================================
-# TASK-015: Warning Emission Tests
+# Warning Emission Tests
 # =============================================================================
 
 
 class TestWarnings:
-    """Test warning emission for small clusters and float columns (REQ-030, REQ-031)."""
+    """Test warning emission for small clusters and float columns."""
     
     def test_small_cluster_warning(self, small_cluster_data):
         """Warning should be emitted when clusters < 42 and bootstrap=False."""
@@ -486,7 +501,7 @@ class TestWarnings:
         assert result.n_clusters == 50
     
     def test_float_cluster_column_warning(self):
-        """Warning should be emitted for float cluster column (REQ-031)."""
+        """Warning should be emitted for float cluster column."""
         df = pl.DataFrame({
             "x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             "y": [2.0, 4.0, 5.0, 8.0, 9.0, 12.0],
@@ -500,7 +515,7 @@ class TestWarnings:
             )
     
     def test_imbalanced_cluster_warning(self):
-        """Warning should be emitted when any cluster has >50% of observations (REQ-032)."""
+        """Warning should be emitted when any cluster has >50% of observations."""
         # Create data where cluster 1 has 7/10 observations (70% > 50%)
         df = pl.DataFrame({
             "x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
@@ -537,7 +552,7 @@ class TestWarnings:
 
 
 # =============================================================================
-# TASK-016: Edge Case Tests
+# Edge Case Tests
 # =============================================================================
 
 
@@ -545,7 +560,7 @@ class TestEdgeCases:
     """Test edge cases and error handling."""
     
     def test_single_observation_cluster_analytical_error(self):
-        """Single-observation cluster should error for analytical SE (REQ-211)."""
+        """Single-observation cluster should error for analytical SE."""
         df = pl.DataFrame({
             "x": [1.0, 2.0, 3.0, 4.0],
             "y": [2.0, 4.0, 5.0, 8.0],
@@ -581,7 +596,7 @@ class TestEdgeCases:
         assert result.n_clusters == 3
     
     def test_all_observations_in_one_cluster_error(self):
-        """All observations in one cluster should error (REQ-210)."""
+        """All observations in one cluster should error."""
         df = pl.DataFrame({
             "x": [1.0, 2.0, 3.0, 4.0, 5.0],
             "y": [2.0, 4.0, 6.0, 8.0, 10.0],
@@ -614,7 +629,7 @@ class TestEdgeCases:
         assert result.cluster_se_type == "bootstrap_rademacher"
     
     def test_missing_cluster_column_error(self):
-        """Missing cluster column should raise ValueError (REQ-200)."""
+        """Missing cluster column should raise ValueError."""
         df = pl.DataFrame({
             "x": [1.0, 2.0, 3.0, 4.0],
             "y": [2.0, 4.0, 6.0, 8.0],
@@ -627,7 +642,7 @@ class TestEdgeCases:
             )
     
     def test_cluster_column_with_nulls_error(self):
-        """Cluster column with nulls should error (REQ-201)."""
+        """Cluster column with nulls should error."""
         df = pl.DataFrame({
             "x": [1.0, 2.0, 3.0, 4.0],
             "y": [2.0, 4.0, 6.0, 8.0],
@@ -641,7 +656,7 @@ class TestEdgeCases:
             )
     
     def test_bootstrap_without_cluster_error(self):
-        """bootstrap=True without cluster should error (REQ-202)."""
+        """bootstrap=True without cluster should error."""
         df = pl.DataFrame({
             "x": [1.0, 2.0, 3.0, 4.0],
             "y": [2.0, 4.0, 6.0, 8.0],
@@ -654,7 +669,7 @@ class TestEdgeCases:
             )
     
     def test_bootstrap_iterations_zero_error(self):
-        """bootstrap_iterations < 1 should error (REQ-203)."""
+        """bootstrap_iterations < 1 should error."""
         df = pl.DataFrame({
             "x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             "y": [2.0, 4.0, 5.0, 8.0, 9.0, 12.0],
@@ -746,7 +761,7 @@ class TestEdgeCases:
 
 
 # =============================================================================
-# TASK-017: Performance Benchmarks
+# Performance Benchmarks
 # =============================================================================
 
 
@@ -755,7 +770,7 @@ class TestPerformance:
     
     @pytest.mark.slow
     def test_analytical_cluster_se_performance(self):
-        """Analytical clustered SE should be ≤ 2× HC3 runtime (REQ-300)."""
+        """Analytical clustered SE should be ≤ 2× HC3 runtime."""
         np.random.seed(42)
         n = 10000
         n_clusters = 100
@@ -797,7 +812,7 @@ class TestPerformance:
     
     @pytest.mark.slow
     def test_bootstrap_performance(self):
-        """Bootstrap with B=1000 on 100K rows should complete in reasonable time (REQ-310).
+        """Bootstrap with B=1000 on 100K rows should complete in reasonable time.
         
         Note: The spec target is ≤5s, but this is for release builds.
         Development builds may be slightly slower. We use 6s as the threshold.
@@ -835,7 +850,7 @@ class TestPerformance:
     
     @pytest.mark.slow
     def test_bootstrap_memory_constant_in_iterations(self):
-        """Memory usage should remain constant as B increases (REQ-311)."""
+        """Memory usage should remain constant as B increases."""
         # This test verifies the algorithm doesn't store all B coefficient vectors
         # by checking that increasing B doesn't proportionally increase time
         
@@ -941,7 +956,7 @@ class TestIntegration:
 
 
 # =============================================================================
-# TASK-014: Webb Weight Unit Tests (REQ-010, REQ-011)
+# Webb Weight Unit Tests
 # =============================================================================
 
 
@@ -955,16 +970,6 @@ class TestWebbWeights:
     - Mean is approximately zero (E[w] ≈ 0)
     - Variance is approximately one (E[w²] ≈ 1)
     """
-    
-    # Expected Webb weight values per REQ-010
-    WEBB_WEIGHTS = [
-        -1.224744871391589,   # -√(3/2)
-        -0.7071067811865476,  # -√(1/2)
-        -0.4082482904638631,  # -√(1/6)
-         0.4082482904638631,  #  √(1/6)
-         0.7071067811865476,  #  √(1/2)
-         1.224744871391589,   #  √(3/2)
-    ]
     
     @pytest.fixture
     def webb_test_data(self):
@@ -1070,7 +1075,7 @@ class TestWebbWeights:
             "Webb and Rademacher produced identical SEs - distributions should differ"
     
     def test_webb_case_insensitive(self, webb_test_data):
-        """Verify bootstrap_method='webb' is case-insensitive (REQ-003)."""
+        """Verify bootstrap_method='webb' is case-insensitive."""
         for method in ["webb", "Webb", "WEBB", "WeBb"]:
             result = causers.linear_regression(
                 webb_test_data, "x", "y",
@@ -1085,12 +1090,12 @@ class TestWebbWeights:
 
 
 # =============================================================================
-# TASK-015/016: Webb Integration Tests for Linear Regression
+# Webb Integration Tests for Linear Regression
 # =============================================================================
 
 
 class TestWebbBootstrapLinear:
-    """Integration tests for linear_regression with Webb weights (REQ-020)."""
+    """Integration tests for linear_regression with Webb weights."""
     
     @pytest.fixture
     def linear_test_data(self):
@@ -1186,7 +1191,7 @@ class TestWebbBootstrapLinear:
 
 
 # =============================================================================
-# TASK-017: Rademacher Regression Tests (REQ-040)
+# Rademacher Regression Tests
 # =============================================================================
 
 
@@ -1219,7 +1224,7 @@ class TestRademacherRegression:
         })
     
     def test_rademacher_case_insensitive(self, regression_test_data):
-        """Verify bootstrap_method='rademacher' is case-insensitive (REQ-004)."""
+        """Verify bootstrap_method='rademacher' is case-insensitive."""
         for method in ["rademacher", "Rademacher", "RADEMACHER"]:
             result = causers.linear_regression(
                 regression_test_data, "x", "y",
@@ -1233,7 +1238,7 @@ class TestRademacherRegression:
                 f"Failed for bootstrap_method='{method}'"
     
     def test_rademacher_produces_identical_results_with_seed(self, regression_test_data):
-        """Same seed produces identical Rademacher results (REQ-011)."""
+        """Same seed produces identical Rademacher results."""
         result1 = causers.linear_regression(
             regression_test_data, "x", "y",
             cluster="cluster_id",
@@ -1257,7 +1262,7 @@ class TestRademacherRegression:
         assert result1.intercept_se == result2.intercept_se
     
     def test_cluster_se_type_is_bootstrap_rademacher(self, regression_test_data):
-        """Verify cluster_se_type is 'bootstrap_rademacher' for Rademacher (REQ-041)."""
+        """Verify cluster_se_type is 'bootstrap_rademacher' for Rademacher."""
         result = causers.linear_regression(
             regression_test_data, "x", "y",
             cluster="cluster_id",
@@ -1270,7 +1275,7 @@ class TestRademacherRegression:
 
 
 # =============================================================================
-# TASK-018: Validation Tests Against wildboottest (REQ-021)
+# Validation Tests Against wildboottest
 # =============================================================================
 
 
@@ -1304,7 +1309,7 @@ class TestWebbWildboottestValidation:
         })
     
     def test_webb_matches_wildboottest(self, validation_data):
-        """Compare Webb bootstrap SE with wildboottest (REQ-021).
+        """Compare Webb bootstrap SE with wildboottest.
         
         Note: Due to potential RNG differences, we use loose tolerance.
         The test validates that inference is consistent rather than exact match.
@@ -1374,12 +1379,12 @@ class TestWebbWildboottestValidation:
 
 
 # =============================================================================
-# TASK-019: Edge Case Tests for bootstrap_method
+# Edge Case Tests for bootstrap_method
 # =============================================================================
 
 
 class TestBootstrapMethodEdgeCases:
-    """Edge case tests for bootstrap_method parameter (REQ-005, REQ-006, REQ-007)."""
+    """Edge case tests for bootstrap_method parameter."""
     
     @pytest.fixture
     def edge_case_data(self):
@@ -1391,7 +1396,7 @@ class TestBootstrapMethodEdgeCases:
         })
     
     def test_invalid_bootstrap_method_raises_error(self, edge_case_data):
-        """Invalid bootstrap_method should raise ValueError (REQ-005)."""
+        """Invalid bootstrap_method should raise ValueError."""
         with pytest.raises(ValueError, match=r"bootstrap_method"):
             causers.linear_regression(
                 edge_case_data, "x", "y",
@@ -1402,7 +1407,7 @@ class TestBootstrapMethodEdgeCases:
             )
     
     def test_bootstrap_method_without_bootstrap_flag(self, edge_case_data):
-        """bootstrap_method with bootstrap=False should raise ValueError (REQ-006).
+        """bootstrap_method with bootstrap=False should raise ValueError.
         
         Note: This test verifies that specifying a non-default bootstrap_method
         when bootstrap=False raises an error, since the method would be ignored.
@@ -1419,7 +1424,7 @@ class TestBootstrapMethodEdgeCases:
                 )
     
     def test_bootstrap_method_without_cluster(self, edge_case_data):
-        """bootstrap_method without cluster should raise ValueError (REQ-007)."""
+        """bootstrap_method without cluster should raise ValueError."""
         df = edge_case_data.drop("cluster_id")
         
         with pytest.raises(ValueError, match=r"cluster"):
@@ -1467,7 +1472,7 @@ class TestBootstrapMethodEdgeCases:
 
 
 # =============================================================================
-# Parallel Bootstrap Tests (Phase 1 - TASK-003)
+# Parallel Bootstrap Tests
 # =============================================================================
 
 

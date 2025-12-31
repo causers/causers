@@ -17,10 +17,17 @@ Usage:
 import sys
 import time
 import warnings
-from typing import Callable, Dict, Any, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 import polars as pl
+
+
+# ============================================================
+# Constants
+# ============================================================
+
+SEED = 42
 
 
 # ============================================================
@@ -68,9 +75,6 @@ def time_function(
 # ============================================================
 # Data generation
 # ============================================================
-
-SEED = 42
-
 
 def generate_linear_data(n_samples: int, seed: int = SEED) -> Tuple[pl.DataFrame, np.ndarray, np.ndarray]:
     """Generate linear regression test data."""

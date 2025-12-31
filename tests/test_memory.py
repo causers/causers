@@ -1,57 +1,63 @@
 """Memory usage tests for causers package.
 
 This module validates the memory requirements specified in:
-- REQ-016: Memory constraint of 1.5x input size
+- Memory constraint of 1.5x input size
 """
 
+# Standard library imports
 import gc
-import pytest
-import polars as pl
-import numpy as np
-from causers import linear_regression
-import tracemalloc
 import sys
+import tracemalloc
+
+# Third-party imports
+import numpy as np
+import polars as pl
+import pytest
+
+# Local imports
+from causers import linear_regression
+
+
+def get_dataframe_memory(df):
+    """Calculate the memory usage of a Polars DataFrame.
+    
+    Args:
+        df: Polars DataFrame
+        
+    Returns:
+        Memory usage in bytes
+    """
+    # Get memory usage from Polars (estimated)
+    # For each column: n_rows * dtype_size
+    total_bytes = 0
+    for col in df.columns:
+        dtype = df[col].dtype
+        n_rows = len(df)
+        
+        # Estimate bytes per element based on dtype
+        if dtype == pl.Float64:
+            bytes_per_element = 8
+        elif dtype == pl.Float32:
+            bytes_per_element = 4
+        elif dtype == pl.Int64:
+            bytes_per_element = 8
+        elif dtype == pl.Int32:
+            bytes_per_element = 4
+        else:
+            bytes_per_element = 8  # Default to 8 bytes
+        
+        total_bytes += n_rows * bytes_per_element
+    
+    return total_bytes
 
 
 class TestMemoryUsage:
     """Test suite for memory usage validation."""
     
-    def get_dataframe_memory(self, df):
-        """Calculate the memory usage of a Polars DataFrame.
-        
-        Args:
-            df: Polars DataFrame
-            
-        Returns:
-            Memory usage in bytes
-        """
-        # Get memory usage from Polars (estimated)
-        # For each column: n_rows * dtype_size
-        total_bytes = 0
-        for col in df.columns:
-            dtype = df[col].dtype
-            n_rows = len(df)
-            
-            # Estimate bytes per element based on dtype
-            if dtype == pl.Float64:
-                bytes_per_element = 8
-            elif dtype == pl.Float32:
-                bytes_per_element = 4
-            elif dtype == pl.Int64:
-                bytes_per_element = 8
-            elif dtype == pl.Int32:
-                bytes_per_element = 4
-            else:
-                bytes_per_element = 8  # Default to 8 bytes
-            
-            total_bytes += n_rows * bytes_per_element
-        
-        return total_bytes
-    
     def test_memory_usage_small_dataset(self):
         """Test memory usage on small dataset (10,000 rows).
         
-        Validates REQ-016: Memory usage should be <1.5x input size.
+        Validates memory usage should be <1.5x input size.
         """
         n = 10_000
         np.random.seed(42)
@@ -64,7 +70,7 @@ class TestMemoryUsage:
         })
         
         # Calculate input data size
-        input_size = self.get_dataframe_memory(df)
+        input_size = get_dataframe_memory(df)
         
         # Start memory tracking
         tracemalloc.start()
@@ -89,14 +95,14 @@ class TestMemoryUsage:
         print(f"  Memory allocated: {total_allocated / 1024:.1f} KB")
         print(f"  Memory ratio: {memory_ratio:.2f}x")
         
-        # REQ-016: Memory usage should be <1.5x input size
+        # Memory usage should be <1.5x input size
         # Note: For small datasets, overhead may be proportionally larger
-        assert memory_ratio < 2.0, f"REQ-016: Memory ratio {memory_ratio:.2f}x exceeds 2.0x for small data"
+        assert memory_ratio < 2.0, f"Memory ratio {memory_ratio:.2f}x exceeds 2.0x for small data"
     
     def test_memory_usage_medium_dataset(self):
         """Test memory usage on medium dataset (100,000 rows).
         
-        Validates REQ-016: Memory usage should be <1.5x input size.
+        Validates memory usage should be <1.5x input size.
         """
         n = 100_000
         np.random.seed(42)
@@ -109,7 +115,7 @@ class TestMemoryUsage:
         })
         
         # Calculate input data size
-        input_size = self.get_dataframe_memory(df)
+        input_size = get_dataframe_memory(df)
         
         # Force garbage collection before measurement
         gc.collect()
@@ -137,13 +143,13 @@ class TestMemoryUsage:
         print(f"  Memory allocated: {total_allocated / (1024**2):.1f} MB")
         print(f"  Memory ratio: {memory_ratio:.2f}x")
         
-        # REQ-016: Memory usage should be <1.5x input size
-        assert memory_ratio < 1.5, f"REQ-016 VIOLATION: Memory ratio {memory_ratio:.2f}x exceeds 1.5x"
+        # Memory usage should be <1.5x input size
+        assert memory_ratio < 1.5, f"Memory ratio {memory_ratio:.2f}x exceeds 1.5x"
     
     def test_memory_usage_large_dataset(self):
         """Test memory usage on large dataset (1,000,000 rows).
         
-        Validates REQ-016: Memory usage should be <1.5x input size.
+        Validates memory usage should be <1.5x input size.
         This is the critical test for the memory requirement.
         """
         n = 1_000_000
@@ -157,7 +163,7 @@ class TestMemoryUsage:
         })
         
         # Calculate input data size
-        input_size = self.get_dataframe_memory(df)
+        input_size = get_dataframe_memory(df)
         
         # Force garbage collection before measurement
         gc.collect()
@@ -185,9 +191,9 @@ class TestMemoryUsage:
         print(f"  Memory allocated: {total_allocated / (1024**2):.1f} MB")
         print(f"  Memory ratio: {memory_ratio:.2f}x")
         
-        # REQ-016: Memory usage should be <1.5x input size
-        assert memory_ratio < 1.5, f"REQ-016 VIOLATION: Memory ratio {memory_ratio:.2f}x exceeds 1.5x"
-        print(f"REQ-016 PASSED: Memory ratio {memory_ratio:.2f}x is within 1.5x limit")
+        # Memory usage should be <1.5x input size
+        assert memory_ratio < 1.5, f"Memory ratio {memory_ratio:.2f}x exceeds 1.5x"
+        print(f"Memory ratio {memory_ratio:.2f}x is within 1.5x limit")
     
     def test_memory_no_leaks(self):
         """Test that repeated calls don't leak memory.
@@ -254,7 +260,7 @@ class TestMemoryUsage:
         })
         
         # Calculate input data size
-        input_size = self.get_dataframe_memory(df)
+        input_size = get_dataframe_memory(df)
         
         # Start tracking with peak measurement
         tracemalloc.start()
@@ -301,7 +307,7 @@ class TestMemoryUsage:
             pl.col("y").cast(pl.Float64)
         ])
         
-        input_size = self.get_dataframe_memory(df_f64)
+        input_size = get_dataframe_memory(df_f64)
         
         # Measure memory
         tracemalloc.start()

@@ -13,6 +13,12 @@ use std::fmt;
 use faer::linalg::matmul::matmul;
 use faer::{Col, Mat, Parallelism};
 
+use crate::linalg::{matrix_multiply, matrix_vector_multiply};
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
 /// Error type for cluster operations
 #[derive(Debug, Clone)]
 pub enum ClusterError {
@@ -50,6 +56,10 @@ impl fmt::Display for ClusterError {
 }
 
 impl std::error::Error for ClusterError {}
+
+// ============================================================================
+// Core Data Structures
+// ============================================================================
 
 /// Cluster membership information for grouped observations.
 ///
@@ -97,13 +107,17 @@ pub enum BootstrapWeightType {
 ///
 /// Reference: MacKinnon & Webb (2018), Webb (2014)
 pub const WEBB_WEIGHTS: [f64; 6] = [
-    -1.224744871391589,  // -√(3/2)
-    -0.7071067811865476, // -√(1/2)
-    -0.4082482904638631, // -√(1/6)
-    0.4082482904638631,  //  √(1/6)
-    0.7071067811865476,  //  √(1/2)
-    1.224744871391589,   //  √(3/2)
+    -1.224744871391589,               // -√(3/2)
+    -std::f64::consts::FRAC_1_SQRT_2, // -√(1/2)
+    -0.4082482904638631,              // -√(1/6)
+    0.4082482904638631,               //  √(1/6)
+    std::f64::consts::FRAC_1_SQRT_2,  //  √(1/2)
+    1.224744871391589,                //  √(3/2)
 ];
+
+// ============================================================================
+// Random Number Generator (RNG)
+// ============================================================================
 
 /// Simple PRNG using SplitMix64 algorithm.
 ///
@@ -128,6 +142,14 @@ impl SplitMix64 {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
         z ^ (z >> 31)
+    }
+
+    /// Generate the next random u64 value (alias for `next`).
+    ///
+    /// This alias exists for compatibility with code that uses `next_u64()`.
+    #[inline]
+    pub fn next_u64(&mut self) -> u64 {
+        self.next()
     }
 
     /// Generate Rademacher weight: +1.0 or -1.0 with equal probability.
@@ -161,6 +183,10 @@ impl SplitMix64 {
         }
     }
 }
+
+// ============================================================================
+// Welford's Online Variance Algorithm
+// ============================================================================
 
 /// Running statistics for Welford's online variance algorithm.
 ///
@@ -216,6 +242,10 @@ impl WelfordState {
     }
 }
 
+// ============================================================================
+// Cluster Index Construction
+// ============================================================================
+
 /// Build cluster index structure from cluster IDs.
 ///
 /// Parses cluster IDs into a ClusterInfo structure with indices grouped by cluster.
@@ -267,62 +297,9 @@ pub fn build_cluster_indices(cluster_ids: &[i64]) -> Result<ClusterInfo, Cluster
     })
 }
 
-/// Multiply a matrix by a vector: result = A × v
-///
-/// # Arguments
-/// * `a` - Matrix of shape (m × n)
-/// * `v` - Vector of length n
-///
-/// # Returns
-/// * `Vec<f64>` - Result vector of length m
-fn matrix_vector_multiply(a: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
-    let m = a.len();
-    let mut result = Vec::with_capacity(m);
-
-    for row in a.iter() {
-        let mut sum = 0.0;
-        for (j, &val) in row.iter().enumerate() {
-            sum += val * v[j];
-        }
-        result.push(sum);
-    }
-
-    result
-}
-
-/// Multiply two matrices: C = A × B
-///
-/// # Arguments
-/// * `a` - Matrix of shape (m × k)
-/// * `b` - Matrix of shape (k × n)
-///
-/// # Returns
-/// * `Vec<Vec<f64>>` - Result matrix of shape (m × n)
-fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let m = a.len();
-    if m == 0 {
-        return vec![];
-    }
-    let k = a[0].len();
-    if k == 0 || b.is_empty() {
-        return vec![vec![]; m];
-    }
-    let n = b[0].len();
-
-    let mut result = vec![vec![0.0; n]; m];
-
-    for (i, a_row) in a.iter().enumerate() {
-        for j in 0..n {
-            let mut sum = 0.0;
-            for (l, &a_val) in a_row.iter().enumerate() {
-                sum += a_val * b[l][j];
-            }
-            result[i][j] = sum;
-        }
-    }
-
-    result
-}
+// ============================================================================
+// Analytical Clustered Standard Errors (Sandwich Estimator)
+// ============================================================================
 
 /// Compute analytical clustered standard errors using the sandwich estimator.
 ///
@@ -343,6 +320,10 @@ fn matrix_multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
 /// This is the legacy Vec<Vec<f64>> implementation kept for rollback capability.
 /// See `compute_cluster_se_analytical_faer` for the optimized version.
 #[allow(dead_code)]
+#[deprecated(
+    since = "0.5.0",
+    note = "Legacy Vec<Vec> implementation kept for rollback capability. Use faer-based version instead."
+)]
 pub fn compute_cluster_se_analytical(
     design_matrix: &[Vec<f64>],
     residuals: &[f64],
@@ -569,6 +550,10 @@ pub fn compute_cluster_se_analytical_faer(
     }
 }
 
+// ============================================================================
+// Wild Cluster Bootstrap Standard Errors
+// ============================================================================
+
 /// Compute wild cluster bootstrap standard errors.
 ///
 /// Uses the "type 11" bootstrap: y* = ŷ + w_g × e where w_g is drawn from
@@ -594,6 +579,10 @@ pub fn compute_cluster_se_analytical_faer(
 // Wild cluster bootstrap requires all statistical context parameters. Struct would reduce clarity.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
+#[deprecated(
+    since = "0.5.0",
+    note = "Legacy Vec<Vec> implementation kept for rollback capability. Use faer-based version instead."
+)]
 pub fn compute_cluster_se_bootstrap(
     design_matrix: &[Vec<f64>],
     fitted_values: &[f64],
@@ -810,9 +799,14 @@ pub fn compute_cluster_se_bootstrap_faer(
     }
 }
 
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linalg::vec_to_mat;
     use approx::assert_relative_eq;
 
     #[test]
@@ -1131,19 +1125,6 @@ mod tests {
     // ========================================================================
     // Tests for faer-optimized functions
     // ========================================================================
-
-    /// Helper function to convert Vec<Vec<f64>> to faer::Mat
-    fn vec_to_mat(v: &[Vec<f64>]) -> Mat<f64> {
-        let nrows = v.len();
-        let ncols = if nrows > 0 { v[0].len() } else { 0 };
-        let mut mat: Mat<f64> = Mat::zeros(nrows, ncols);
-        for (i, row) in v.iter().enumerate() {
-            for (j, &val) in row.iter().enumerate() {
-                mat.write(i, j, val);
-            }
-        }
-        mat
-    }
 
     #[test]
     fn test_analytical_se_faer_matches_legacy() {
