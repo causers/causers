@@ -26,6 +26,7 @@ use pyo3_polars::PyDataFrame;
 // ============================================================================
 // Module Declarations
 // ============================================================================
+mod balance;
 mod cluster;
 mod dml;
 mod fixed_effects;
@@ -53,6 +54,7 @@ use logistic::{
     compute_hc3_logistic_faer, compute_logistic_mle, compute_null_log_likelihood,
     compute_pseudo_r_squared, LogisticError, LogisticRegressionResult,
 };
+use balance::{BalanceError, BalanceResult, CovariateType};
 use sdid::{synthetic_did_impl, SyntheticDIDResult};
 use stats::LinearRegressionResult;
 use synth_control::{
@@ -89,6 +91,8 @@ fn _causers(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(synthetic_control_impl, m)?)?;
     m.add_function(wrap_pyfunction!(dml_impl, m)?)?;
     m.add_function(wrap_pyfunction!(two_stage_least_squares, m)?)?;
+    m.add_class::<BalanceResult>()?;
+    m.add_function(wrap_pyfunction!(balance_check_impl, m)?)?;
     Ok(())
 }
 
@@ -2348,6 +2352,407 @@ fn two_stage_least_squares(
         // through a Python logging mechanism
         let _ = warning;
     }
+
+    Ok(result)
+}
+
+// ============================================================================
+// Covariate Balance Checking Implementation
+// ============================================================================
+
+/// Compute covariate balance statistics between treatment and control groups.
+///
+/// This function extracts data from a Polars DataFrame, identifies treatment/control
+/// groups, processes covariates (including categorical expansion and boolean conversion),
+/// and computes balance statistics with optional weighting.
+///
+/// # Arguments
+///
+/// * `py` - Python GIL token (used for GIL release during computation)
+/// * `df` - Polars DataFrame containing the data
+/// * `treatment_col` - Column name for the treatment indicator
+/// * `covariate_cols` - Column names for covariates to check balance
+/// * `weights` - Optional column name for observation weights
+/// * `treatment_value_int` - Treatment value as integer (exactly one of int/float/str must be Some)
+/// * `treatment_value_float` - Treatment value as float
+/// * `treatment_value_str` - Treatment value as string
+/// * `control_value_int` - Control value as integer (optional)
+/// * `control_value_float` - Control value as float (optional)
+/// * `control_value_str` - Control value as string (optional)
+/// * `max_categorical_levels` - Maximum unique levels for categorical columns
+///
+/// # Returns
+///
+/// BalanceResult with all computed statistics.
+///
+/// # Errors
+///
+/// Returns PyValueError for invalid inputs (missing columns, null values, etc.)
+#[pyfunction]
+#[pyo3(signature = (
+    df,
+    treatment_col,
+    covariate_cols,
+    weights=None,
+    treatment_value_int=None,
+    treatment_value_float=None,
+    treatment_value_str=None,
+    control_value_int=None,
+    control_value_float=None,
+    control_value_str=None,
+    max_categorical_levels=1000
+))]
+#[allow(clippy::too_many_arguments)]
+fn balance_check_impl(
+    py: Python<'_>,
+    df: PyDataFrame,
+    treatment_col: &str,
+    covariate_cols: Vec<String>,
+    weights: Option<&str>,
+    treatment_value_int: Option<i64>,
+    treatment_value_float: Option<f64>,
+    treatment_value_str: Option<&str>,
+    control_value_int: Option<i64>,
+    control_value_float: Option<f64>,
+    control_value_str: Option<&str>,
+    max_categorical_levels: usize,
+) -> PyResult<BalanceResult> {
+    let df_ref = df.as_ref();
+
+    // ---- Validate column names ----
+    validate_column_name(treatment_col)?;
+    for col in &covariate_cols {
+        validate_column_name(col)?;
+    }
+    if let Some(w) = weights {
+        validate_column_name(w)?;
+    }
+
+    // Validate treatment column exists
+    if df_ref.column(treatment_col).is_err() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            BalanceError::ColumnNotFound {
+                column: treatment_col.to_string(),
+            }
+            .to_string(),
+        ));
+    }
+
+    // ---- Determine treatment value type ----
+    let treatment_value_count = treatment_value_int.is_some() as u8
+        + treatment_value_float.is_some() as u8
+        + treatment_value_str.is_some() as u8;
+
+    if treatment_value_count != 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Exactly one of treatment_value_int, treatment_value_float, or treatment_value_str must be provided",
+        ));
+    }
+
+    // ---- Identify treatment/control groups ----
+    // Returns (mask, n_treated, n_control) where mask[i] = true for treatment.
+    // When control_value is specified, observations matching neither treatment nor control
+    // have mask[i] = false but are NOT counted in n_control.
+    // We also need an inclusion mask to filter out excluded observations.
+    let treatment_series = df_ref
+        .column(treatment_col)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    let (raw_mask, n_treated, n_control, included) = if let Some(tv) = treatment_value_int {
+        let cv = control_value_int;
+        // Extract as nullable i64
+        let col_values: Vec<Option<i64>> = treatment_series
+            .i64()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+            .iter()
+            .collect();
+
+        let (mask, nt, nc) = balance::identify_groups_int(&col_values, tv, cv)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+        // Build inclusion mask: included[i] = true if observation is in treatment OR control
+        let included: Vec<bool> = col_values
+            .iter()
+            .map(|val| {
+                match val {
+                    None => false,
+                    Some(v) => {
+                        if *v == tv {
+                            true // treatment
+                        } else if let Some(c) = cv {
+                            *v == c // control only if matches control_value
+                        } else {
+                            true // all non-treatment are control when no control_value
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        (mask, nt, nc, included)
+    } else if let Some(tv) = treatment_value_float {
+        let cv = control_value_float;
+        let col_values: Vec<Option<f64>> = treatment_series
+            .f64()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+            .iter()
+            .collect();
+
+        let (mask, nt, nc) = balance::identify_groups_float(&col_values, tv, cv)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+        const EPSILON: f64 = 1e-10;
+        let included: Vec<bool> = col_values
+            .iter()
+            .map(|val| match val {
+                None => false,
+                Some(v) => {
+                    if (*v - tv).abs() < EPSILON {
+                        true
+                    } else if let Some(c) = cv {
+                        (*v - c).abs() < EPSILON
+                    } else {
+                        true
+                    }
+                }
+            })
+            .collect();
+
+        (mask, nt, nc, included)
+    } else if let Some(tv) = treatment_value_str {
+        let cv = control_value_str;
+        // Extract as string - handle both String and Categorical dtypes
+        let str_series = if matches!(
+            treatment_series.dtype(),
+            DataType::Categorical(_, _) | DataType::Enum(_, _)
+        ) {
+            treatment_series
+                .cast(&DataType::String)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+        } else {
+            treatment_series.clone()
+        };
+
+        let str_ca = str_series
+            .str()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+        let col_values_owned: Vec<Option<String>> =
+            str_ca.iter().map(|opt| opt.map(|s| s.to_string())).collect();
+
+        let col_values_ref: Vec<Option<&str>> = col_values_owned
+            .iter()
+            .map(|opt| opt.as_deref())
+            .collect();
+
+        let (mask, nt, nc) = balance::identify_groups_str(&col_values_ref, tv, cv)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+        let included: Vec<bool> = col_values_ref
+            .iter()
+            .map(|val| match val {
+                None => false,
+                Some(v) => {
+                    if *v == tv {
+                        true
+                    } else if let Some(c) = cv {
+                        *v == c
+                    } else {
+                        true
+                    }
+                }
+            })
+            .collect();
+
+        (mask, nt, nc, included)
+    } else {
+        unreachable!("treatment_value_count == 1 is guaranteed above");
+    };
+
+    // Build index mapping: indices of included observations
+    let included_indices: Vec<usize> = included
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &inc)| if inc { Some(i) } else { None })
+        .collect();
+
+    // Filter treatment mask to only included observations
+    let filtered_mask: Vec<bool> = included_indices.iter().map(|&i| raw_mask[i]).collect();
+
+    // ---- Validate and extract covariate data ----
+    let mut covariate_data: Vec<(String, Vec<f64>)> = Vec::new();
+
+    for col_name in &covariate_cols {
+        // Check column exists
+        let series = df_ref.column(col_name.as_str()).map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(
+                BalanceError::ColumnNotFound {
+                    column: col_name.clone(),
+                }
+                .to_string(),
+            )
+        })?;
+
+        // Check for null values
+        if series.null_count() > 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                BalanceError::NullValuesInCovariate {
+                    column: col_name.clone(),
+                }
+                .to_string(),
+            ));
+        }
+
+        // Determine covariate type from dtype
+        let cov_type = match series.dtype() {
+            DataType::Float32
+            | DataType::Float64
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => CovariateType::Numeric,
+            DataType::Boolean => CovariateType::Boolean,
+            DataType::String | DataType::Categorical(_, _) | DataType::Enum(_, _) => {
+                CovariateType::Categorical
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    BalanceError::NonNumericCovariate {
+                        column: col_name.clone(),
+                    }
+                    .to_string(),
+                ));
+            }
+        };
+
+        match cov_type {
+            CovariateType::Numeric => {
+                // Cast to f64 and collect
+                let f64_series = series
+                    .cast(&DataType::Float64)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                let ca = f64_series
+                    .f64()
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                let all_values: Vec<f64> = ca.into_no_null_iter().collect();
+                // Filter to included observations
+                let filtered: Vec<f64> =
+                    included_indices.iter().map(|&i| all_values[i]).collect();
+                covariate_data.push((col_name.clone(), filtered));
+            }
+            CovariateType::Boolean => {
+                let ca = series
+                    .bool()
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                let all_bools: Vec<bool> = ca.into_no_null_iter().collect();
+                let all_f64 = balance::boolean_to_numeric(&all_bools);
+                let filtered: Vec<f64> =
+                    included_indices.iter().map(|&i| all_f64[i]).collect();
+                covariate_data.push((col_name.clone(), filtered));
+            }
+            CovariateType::Categorical => {
+                // Cast to string if needed
+                let str_series = if matches!(
+                    series.dtype(),
+                    DataType::Categorical(_, _) | DataType::Enum(_, _)
+                ) {
+                    series
+                        .cast(&DataType::String)
+                        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+                } else {
+                    series.clone()
+                };
+
+                let ca = str_series
+                    .str()
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                let all_strings: Vec<&str> =
+                    ca.into_no_null_iter().collect();
+
+                // Filter to included observations
+                let filtered_strings: Vec<&str> =
+                    included_indices.iter().map(|&i| all_strings[i]).collect();
+
+                // Validate cardinality
+                let unique_count = filtered_strings
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                balance::validate_categorical_cardinality(
+                    unique_count,
+                    col_name,
+                    max_categorical_levels,
+                )
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+                // Expand to dummy columns
+                let expanded = balance::expand_categorical(&filtered_strings, col_name);
+                for (dummy_name, dummy_values) in expanded {
+                    covariate_data.push((dummy_name, dummy_values));
+                }
+            }
+        }
+    }
+
+    // ---- Extract weights if specified ----
+    let filtered_weights: Option<Vec<f64>> = if let Some(w_col) = weights {
+        let w_series = df_ref.column(w_col).map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(
+                BalanceError::WeightsColumnNotFound {
+                    column: w_col.to_string(),
+                }
+                .to_string(),
+            )
+        })?;
+
+        // Validate no nulls
+        if w_series.null_count() > 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                BalanceError::NullValuesInWeights {
+                    column: w_col.to_string(),
+                }
+                .to_string(),
+            ));
+        }
+
+        let w_f64 = w_series
+            .cast(&DataType::Float64)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let w_ca = w_f64
+            .f64()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let all_weights: Vec<f64> = w_ca.into_no_null_iter().collect();
+
+        // Validate no negative values
+        if all_weights.iter().any(|&w| w < 0.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                BalanceError::NegativeWeights.to_string(),
+            ));
+        }
+
+        // Filter to included observations
+        let filtered: Vec<f64> = included_indices.iter().map(|&i| all_weights[i]).collect();
+        Some(filtered)
+    } else {
+        None
+    };
+
+    // ---- Release GIL for heavy computation ----
+    let result = py
+        .detach(|| {
+            balance::compute_balance(
+                &filtered_mask,
+                n_treated,
+                n_control,
+                &covariate_data,
+                filtered_weights.as_deref(),
+            )
+        })
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     Ok(result)
 }

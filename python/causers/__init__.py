@@ -10,6 +10,7 @@ on Polars DataFrames.
 # ============================================================
 
 from typing import List as _List, Optional as _Optional, Union as _Union
+import math as _math
 import warnings as _warnings
 import polars as _pl
 from polars.exceptions import ColumnNotFoundError as _ColumnNotFoundError
@@ -30,7 +31,7 @@ _POOR_FIT_RMSE_RATIO = 0.1  # Warn if RMSE > 10% of outcome std
 # EXPORTS
 # ============================================================
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # Import the Rust extension module
 from causers._causers import (
@@ -46,6 +47,8 @@ from causers._causers import (
     synthetic_control_impl as _synthetic_control_impl,
     dml_impl as _dml_impl,
     two_stage_least_squares as _two_stage_least_squares_rust,
+    balance_check_impl as _balance_check_impl,
+    BalanceResult as _BalanceResult,
 )
 
 # Re-export main functions
@@ -66,6 +69,9 @@ __all__ = [
     "synthetic_control",
     "dml",
     "two_stage_least_squares",
+    # Balance checking
+    "balance_check",
+    "BalanceCheckResult",
     # Utilities
     "about",
 ]
@@ -2162,5 +2168,406 @@ def two_stage_least_squares(
             UserWarning,
             stacklevel=2,
         )
-    
+
+    return result
+
+
+# ============================================================
+# BALANCE CHECK
+# ============================================================
+
+
+class BalanceCheckResult:
+    """Python wrapper around the Rust BalanceResult with convenience methods.
+
+    This class wraps the native ``BalanceResult`` returned by Rust and adds
+    ``summary()``, ``imbalanced()``, and ``to_dataframe()`` helper methods.
+    All attributes of the underlying Rust object are accessible directly
+    (e.g. ``result.smd``, ``result.n_treated``).
+
+    Attributes
+    ----------
+    mean_treated : dict[str, float]
+        Mean of each covariate in the treatment group.
+    mean_control : dict[str, float]
+        Mean of each covariate in the control group.
+    var_treated : dict[str, float]
+        Variance of each covariate in the treatment group.
+    var_control : dict[str, float]
+        Variance of each covariate in the control group.
+    sd_treated : dict[str, float]
+        Standard deviation of each covariate in the treatment group.
+    sd_control : dict[str, float]
+        Standard deviation of each covariate in the control group.
+    smd : dict[str, float]
+        Standardized Mean Difference for each covariate.
+    variance_ratio : dict[str, float]
+        Variance ratio (treated / control) for each covariate.
+    n_treated : int
+        Number of observations in the treatment group.
+    n_control : int
+        Number of observations in the control group.
+    ess_treated : float or None
+        Effective sample size for the treatment group (weighted analysis only).
+    ess_control : float or None
+        Effective sample size for the control group (weighted analysis only).
+    covariates : list[str]
+        Covariate names (after categorical expansion).
+    is_weighted : bool
+        Whether weighted statistics were computed.
+    """
+
+    def __init__(self, _inner: _BalanceResult) -> None:
+        self._inner = _inner
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def __repr__(self) -> str:
+        return repr(self._inner)
+
+    def summary(self) -> _pl.DataFrame:
+        """Return a Polars DataFrame summarizing balance statistics.
+
+        Columns: covariate, mean_treated, mean_control, sd_treated,
+        sd_control, smd, variance_ratio.
+
+        Returns
+        -------
+        pl.DataFrame
+            One row per covariate with key balance statistics.
+        """
+        rows = []
+        for cov in self._inner.covariates:
+            rows.append({
+                "covariate": cov,
+                "mean_treated": self._inner.mean_treated.get(cov),
+                "mean_control": self._inner.mean_control.get(cov),
+                "sd_treated": self._inner.sd_treated.get(cov),
+                "sd_control": self._inner.sd_control.get(cov),
+                "smd": self._inner.smd.get(cov),
+                "variance_ratio": self._inner.variance_ratio.get(cov),
+            })
+        return _pl.DataFrame(rows)
+
+    def imbalanced(self, threshold: float = 0.1) -> _List[str]:
+        """Return covariate names with |SMD| exceeding *threshold*.
+
+        Parameters
+        ----------
+        threshold : float, default 0.1
+            Absolute SMD threshold for flagging imbalance.
+
+        Returns
+        -------
+        list[str]
+            Covariate names whose absolute SMD exceeds the threshold.
+            Covariates with NaN SMD (e.g. from zero variance in both
+            groups) are excluded.
+        """
+        out = []
+        for cov in self._inner.covariates:
+            smd_val = self._inner.smd.get(cov, 0.0)
+            if _math.isnan(smd_val):
+                continue
+            if abs(smd_val) > threshold:
+                out.append(cov)
+        return out
+
+    def to_dataframe(self) -> _pl.DataFrame:
+        """Export all per-covariate statistics as a Polars DataFrame.
+
+        Columns: covariate, mean_treated, mean_control, var_treated,
+        var_control, sd_treated, sd_control, smd, variance_ratio.
+
+        Returns
+        -------
+        pl.DataFrame
+            One row per covariate with all computed statistics.
+        """
+        rows = []
+        for cov in self._inner.covariates:
+            rows.append({
+                "covariate": cov,
+                "mean_treated": self._inner.mean_treated.get(cov),
+                "mean_control": self._inner.mean_control.get(cov),
+                "var_treated": self._inner.var_treated.get(cov),
+                "var_control": self._inner.var_control.get(cov),
+                "sd_treated": self._inner.sd_treated.get(cov),
+                "sd_control": self._inner.sd_control.get(cov),
+                "smd": self._inner.smd.get(cov),
+                "variance_ratio": self._inner.variance_ratio.get(cov),
+            })
+        return _pl.DataFrame(rows)
+
+
+def balance_check(
+    df: _Union[_pl.DataFrame, "pd.DataFrame"],
+    treatment_col: str,
+    covariate_cols: _Union[str, _List[str]],
+    weights: _Optional[str] = None,
+    treatment_value=None,
+    control_value=None,
+    max_categorical_levels: int = 1000,
+) -> BalanceCheckResult:
+    """Check covariate balance between treatment and control groups.
+
+    Computes standardized mean differences (SMD), variance ratios, and
+    group-level summary statistics for each covariate.  Supports weighted
+    analysis (e.g. inverse-propensity weights) and automatic treatment /
+    control value detection for binary indicators.
+
+    Parameters
+    ----------
+    df : pl.DataFrame or pd.DataFrame
+        The DataFrame containing the data.  Accepts both Polars and pandas.
+    treatment_col : str
+        Column that identifies the treatment assignment.
+    covariate_cols : str or list[str]
+        Column name(s) of the covariates to check for balance.
+    weights : str, optional
+        Column name containing observation weights (e.g. IPW weights).
+        When provided, weighted means / variances are computed.
+    treatment_value : int, float, str, or None
+        Value in ``treatment_col`` that denotes the *treated* group.
+        If ``None``, auto-detected from the column: when exactly two
+        unique non-null values exist the larger value is used.
+    control_value : int, float, str, or None
+        Value in ``treatment_col`` that denotes the *control* group.
+        If ``None``, auto-detected (the value that is not
+        ``treatment_value``).
+    max_categorical_levels : int, default 1000
+        Maximum number of unique levels allowed for categorical columns
+        before raising an error.
+
+    Returns
+    -------
+    BalanceCheckResult
+        Result object exposing all per-covariate statistics plus the
+        convenience methods ``summary()``, ``imbalanced()``, and
+        ``to_dataframe()``.
+
+    Raises
+    ------
+    ValueError
+        - If ``treatment_col`` or any covariate column is missing.
+        - If auto-detection finds != 2 unique non-null treatment values.
+        - If the treatment column contains only one unique value.
+
+    Warns
+    -----
+    UserWarning
+        - Large imbalance: |SMD| > 0.25 for any covariate.
+        - Extreme variance ratio: VR < 0.5 or VR > 2.0.
+        - Small treatment or control group (n < 10).
+        - Low effective sample size (ESS < 10) in weighted analysis.
+
+    Examples
+    --------
+    Basic balance check with a binary treatment:
+
+    >>> import polars as pl
+    >>> import causers
+    >>> df = pl.DataFrame({
+    ...     "treated": [1, 1, 1, 0, 0, 0],
+    ...     "age":     [25, 30, 35, 40, 45, 50],
+    ...     "income":  [50000, 60000, 55000, 48000, 52000, 47000],
+    ... })
+    >>> result = causers.balance_check(df, "treated", ["age", "income"])
+    >>> print(result.smd)
+    {...}
+
+    Using the convenience methods:
+
+    >>> summary_df = result.summary()
+    >>> imbalanced_covs = result.imbalanced(threshold=0.1)
+    >>> full_df = result.to_dataframe()
+
+    Weighted balance check:
+
+    >>> df = df.with_columns(pl.lit([1.0, 1.0, 1.0, 0.5, 0.8, 0.7]).alias("w"))
+    >>> result = causers.balance_check(df, "treated", ["age", "income"], weights="w")
+    >>> print(result.is_weighted)
+    True
+
+    See Also
+    --------
+    BalanceCheckResult : Result class with balance statistics and helpers.
+    """
+    # ------------------------------------------------------------------
+    # Normalize covariate_cols
+    # ------------------------------------------------------------------
+    if isinstance(covariate_cols, str):
+        cov_cols_list = [covariate_cols]
+    else:
+        cov_cols_list = list(covariate_cols)
+
+    # ------------------------------------------------------------------
+    # pandas conversion
+    # ------------------------------------------------------------------
+    required_cols = [treatment_col] + cov_cols_list
+    if weights is not None:
+        required_cols.append(weights)
+    df = _convert_dataframe_if_pandas(df, required_cols)
+
+    # ------------------------------------------------------------------
+    # Auto-detect treatment / control values
+    # ------------------------------------------------------------------
+    tv_int = tv_float = tv_str = None
+    cv_int = cv_float = cv_str = None
+
+    if treatment_value is None:
+        # Auto-detect from column
+        unique_vals = df[treatment_col].drop_nulls().unique().sort().to_list()
+        if len(unique_vals) != 2:
+            raise ValueError(
+                f"Cannot auto-detect treatment/control values: "
+                f"treatment column '{treatment_col}' has {len(unique_vals)} "
+                f"unique non-null value(s); expected exactly 2."
+            )
+        # Use the larger value as treatment
+        control_value = unique_vals[0]
+        treatment_value = unique_vals[1]
+
+    # Route treatment_value to the correct typed parameter
+    if isinstance(treatment_value, bool):
+        tv_int = int(treatment_value)
+    elif isinstance(treatment_value, int):
+        tv_int = treatment_value
+    elif isinstance(treatment_value, float):
+        tv_float = treatment_value
+    elif isinstance(treatment_value, str):
+        tv_str = treatment_value
+    else:
+        raise TypeError(
+            f"treatment_value must be int, float, or str; got {type(treatment_value).__name__}"
+        )
+
+    # Route control_value to the correct typed parameter
+    if control_value is not None:
+        if isinstance(control_value, bool):
+            cv_int = int(control_value)
+        elif isinstance(control_value, int):
+            cv_int = control_value
+        elif isinstance(control_value, float):
+            cv_float = control_value
+        elif isinstance(control_value, str):
+            cv_str = control_value
+        else:
+            raise TypeError(
+                f"control_value must be int, float, or str; got {type(control_value).__name__}"
+            )
+
+    # ------------------------------------------------------------------
+    # Call the Rust implementation
+    # ------------------------------------------------------------------
+    inner = _balance_check_impl(
+        df,
+        treatment_col,
+        cov_cols_list,
+        weights,
+        tv_int,
+        tv_float,
+        tv_str,
+        cv_int,
+        cv_float,
+        cv_str,
+        max_categorical_levels,
+    )
+
+    result = BalanceCheckResult(inner)
+
+    # ------------------------------------------------------------------
+    # Post-call warnings
+    # ------------------------------------------------------------------
+
+    # Per-covariate warnings (single pass)
+    for cov in result.covariates:
+        smd_val = result.smd.get(cov, 0.0)
+        vr = result.variance_ratio.get(cov)
+        vt = result.var_treated.get(cov)
+        vc = result.var_control.get(cov)
+
+        # Large imbalance (FR-BAL-64)
+        if not _math.isnan(smd_val) and abs(smd_val) > 0.25:
+            _warnings.warn(
+                f"Large imbalance detected for covariate '{cov}': SMD = {smd_val:.4f}",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # Extreme variance ratio (FR-BAL-65)
+        if vr is not None and not _math.isnan(vr) and (vr < 0.5 or vr > 2.0):
+            _warnings.warn(
+                f"Extreme variance ratio for covariate '{cov}': {vr:.4f}",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # Zero variance in exactly one group (FR-BAL-62)
+        if vt is not None and vc is not None:
+            vt_zero = vt == 0.0
+            vc_zero = vc == 0.0
+            if vt_zero and not vc_zero:
+                _warnings.warn(
+                    f"Covariate '{cov}' has zero variance in treatment group",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            elif vc_zero and not vt_zero:
+                _warnings.warn(
+                    f"Covariate '{cov}' has zero variance in control group",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        # Numerically unstable weighted variance (FR-BAL-69a)
+        if result.is_weighted:
+            if vt is not None and _math.isnan(vt):
+                _warnings.warn(
+                    f"Weighted variance for '{cov}' in treatment group is numerically "
+                    f"unstable (ESS \u2248 1); returning NaN",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            if vc is not None and _math.isnan(vc):
+                _warnings.warn(
+                    f"Weighted variance for '{cov}' in control group is numerically "
+                    f"unstable (ESS \u2248 1); returning NaN",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+    # Small samples
+    if result.n_treated < 10:
+        _warnings.warn(
+            f"Small treatment group: n_treated = {result.n_treated}. "
+            f"Balance statistics may be unreliable.",
+            UserWarning,
+            stacklevel=2,
+        )
+    if result.n_control < 10:
+        _warnings.warn(
+            f"Small control group: n_control = {result.n_control}. "
+            f"Balance statistics may be unreliable.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    # Low effective sample size
+    if result.ess_treated is not None and result.ess_treated < 10:
+        _warnings.warn(
+            f"Low effective sample size in treatment group: ESS = {result.ess_treated:.2f}. "
+            f"Weighted balance statistics may be unreliable.",
+            UserWarning,
+            stacklevel=2,
+        )
+    if result.ess_control is not None and result.ess_control < 10:
+        _warnings.warn(
+            f"Low effective sample size in control group: ESS = {result.ess_control:.2f}. "
+            f"Weighted balance statistics may be unreliable.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     return result

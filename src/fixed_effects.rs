@@ -574,19 +574,19 @@ pub fn compute_mundlak_terms(
     fe_infos: &[FixedEffectInfo],
 ) -> Vec<f64> {
     let n_fe = fe_infos.len();
-    
+
     // Early return for empty input
     if n_rows == 0 || n_cols == 0 || n_fe == 0 {
         return vec![];
     }
-    
+
     // Output: N × (K × D) in row-major order
     let mut mundlak = vec![0.0; n_rows * n_cols * n_fe];
-    
+
     for (d, fe_info) in fe_infos.iter().enumerate() {
         // Allocate temporary for group sums (will be converted to means)
         let mut group_sums = vec![0.0; fe_info.n_groups * n_cols];
-        
+
         // First pass: accumulate sums per group
         for i in 0..n_rows {
             let g = fe_info.obs_to_group[i];
@@ -594,7 +594,7 @@ pub fn compute_mundlak_terms(
                 group_sums[g * n_cols + j] += x_flat[i * n_cols + j];
             }
         }
-        
+
         // Convert sums to means
         for g in 0..fe_info.n_groups {
             let size = fe_info.sizes[g] as f64;
@@ -602,7 +602,7 @@ pub fn compute_mundlak_terms(
                 group_sums[g * n_cols + j] /= size;
             }
         }
-        
+
         // Second pass: map means back to observations
         for i in 0..n_rows {
             let g = fe_info.obs_to_group[i];
@@ -611,7 +611,7 @@ pub fn compute_mundlak_terms(
             }
         }
     }
-    
+
     mundlak
 }
 
@@ -1175,8 +1175,8 @@ mod tests {
             assert_relative_eq!(mundlak[7], 6.0, epsilon = 1e-10); // time mean x2
 
             // Obs 2 (entity=1, time=0)
-            assert_relative_eq!(mundlak[8], 6.0, epsilon = 1e-10);  // entity mean x1
-            assert_relative_eq!(mundlak[9], 7.0, epsilon = 1e-10);  // entity mean x2
+            assert_relative_eq!(mundlak[8], 6.0, epsilon = 1e-10); // entity mean x1
+            assert_relative_eq!(mundlak[9], 7.0, epsilon = 1e-10); // entity mean x2
             assert_relative_eq!(mundlak[10], 3.0, epsilon = 1e-10); // time mean x1
             assert_relative_eq!(mundlak[11], 4.0, epsilon = 1e-10); // time mean x2
 
@@ -1230,8 +1230,7 @@ mod tests {
             let time_ids: Vec<usize> = (0..n_rows).map(|i| i % 20).collect();
             let fe2_info = build_fe_indices(&time_ids, "time").unwrap();
 
-            let mundlak_2way =
-                compute_mundlak_terms(&x_flat, n_rows, n_cols, &[fe_info, fe2_info]);
+            let mundlak_2way = compute_mundlak_terms(&x_flat, n_rows, n_cols, &[fe_info, fe2_info]);
             assert_eq!(mundlak_2way.len(), n_rows * n_cols * 2);
         }
 

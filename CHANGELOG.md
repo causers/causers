@@ -6,6 +6,111 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.8.0] - 2026-02-01
+
+### 🎯 Overview
+
+Version 0.8.0 adds covariate balance diagnostics for assessing treatment–control group comparability.
+
+---
+
+### ✨ Features
+
+#### Covariate Balance Checking
+
+New `balance_check()` function for evaluating covariate balance between treatment and control groups:
+
+```python
+import polars as pl
+import causers
+
+df = pl.DataFrame({
+    "treated": [1, 1, 1, 0, 0, 0],
+    "age":     [25, 30, 35, 40, 45, 50],
+    "income":  [50000, 60000, 55000, 48000, 52000, 47000],
+})
+
+result = causers.balance_check(df, "treated", ["age", "income"])
+print(result.summary())
+```
+
+**Computed Statistics (per covariate):**
+- Group means (`mean_treated`, `mean_control`)
+- Group variances (`var_treated`, `var_control`)
+- Group standard deviations (`sd_treated`, `sd_control`)
+- Standardized Mean Difference (`smd`) — pooled SD denominator
+- Variance ratio (`variance_ratio`) — treated / control
+- Effective sample sizes (`ess_treated`, `ess_control`) — weighted analysis only
+
+**Supported Features:**
+- **Weighted analysis**: Pass `weights` column (e.g., inverse-propensity weights) for weighted means, variances, and ESS
+- **Automatic categorical expansion**: String columns are one-hot encoded automatically (up to `max_categorical_levels` unique values)
+- **Boolean covariates**: Treated as numeric (0/1)
+- **Auto-detection**: Binary treatment values auto-detected when `treatment_value`/`control_value` are not specified
+
+**Convenience Methods on `BalanceCheckResult`:**
+- `summary()` — Polars DataFrame with key statistics per covariate
+- `imbalanced(threshold=0.1)` — List of covariate names with |SMD| above threshold
+- `to_dataframe()` — Full Polars DataFrame with all computed statistics
+
+**Automatic Warnings:**
+- Large imbalance: |SMD| > 0.25
+- Extreme variance ratio: VR < 0.5 or VR > 2.0
+- Small group sizes: n < 10
+- Low effective sample size: ESS < 10 (weighted)
+
+---
+
+### 📖 API Changes
+
+**New Functions:**
+- `balance_check(df, treatment_col, covariate_cols, weights=None, treatment_value=None, control_value=None, max_categorical_levels=1000)` — Covariate balance diagnostics
+
+**New Classes:**
+- `BalanceCheckResult` — Wrapper with `summary()`, `imbalanced()`, `to_dataframe()`, and direct attribute access
+
+**New Errors:**
+- `ValueError`: Column not found, non-numeric covariate, no treatment variation, null values, negative weights, zero total weight, empty groups, multi-valued treatment, high-cardinality categorical
+- `TypeError`: Invalid `treatment_value` or `control_value` type
+
+**New Warnings:**
+- `UserWarning`: Large imbalance (|SMD| > 0.25), extreme variance ratio, small groups (n < 10), low ESS (< 10), zero variance in one group, numerically unstable weighted variance
+
+---
+
+### 📦 Dependencies
+
+**New dev dependencies:**
+- `nbconvert>=7.0` — Notebook execution for benchmark examples
+- `ipykernel>=6.0` — Jupyter kernel for notebook benchmarks
+
+No new runtime dependencies.
+
+---
+
+### 📊 Benchmark Notebook
+
+New `examples/benchmarks/balance_diagnostics.ipynb` with:
+- Correctness parity test (SMD/VR vs manual NumPy, match to 1e-6)
+- Timing benchmarks: 100K/50 covs, 1M/100 covs, 100K/50 covs weighted
+- Weighted analysis demo with IPW weights and ESS
+- Categorical covariate expansion demo
+
+---
+
+### ⚠️ Breaking Changes
+
+None. All existing code continues to work unchanged.
+
+---
+
+### 📚 References
+
+- Austin, P.C. (2011). An Introduction to Propensity Score Methods for Reducing the Effects of Confounding in Observational Studies. *Multivariate Behavioral Research*, 46(3), 399-424.
+- Welford, B.P. (1962). Note on a method for calculating corrected sums of squares and products. *Technometrics*, 4(3), 419-420.
+
+---
+
 ## [0.7.0] - 2025-12-30
 
 ### 🎯 Overview
@@ -1046,6 +1151,7 @@ MIT License - see LICENSE file for details.
 
 ---
 
+[0.8.0]: https://github.com/causers/causers/releases/tag/v0.8.0
 [0.7.0]: https://github.com/causers/causers/releases/tag/v0.7.0
 [0.6.0]: https://github.com/causers/causers/releases/tag/v0.6.0
 [0.5.1]: https://github.com/causers/causers/releases/tag/v0.5.1

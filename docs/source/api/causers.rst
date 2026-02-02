@@ -18,6 +18,12 @@ Functions
 
 .. autofunction:: causers.synthetic_control
 
+.. autofunction:: causers.dml
+
+.. autofunction:: causers.two_stage_least_squares
+
+.. autofunction:: causers.balance_check
+
 .. autofunction:: causers.about
 
 Result Classes
@@ -36,5 +42,17 @@ Result Classes
    :undoc-members:
 
 .. autoclass:: causers.SyntheticControlResult
+   :members:
+   :undoc-members:
+
+.. autoclass:: causers.DMLResult
+   :members:
+   :undoc-members:
+
+.. autoclass:: causers.TwoStageLSResult
+   :members:
+   :undoc-members:
+
+.. autoclass:: causers.BalanceCheckResult
    :members:
    :undoc-members:

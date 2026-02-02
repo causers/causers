@@ -3,150 +3,121 @@
 [![PyPI Version](https://img.shields.io/pypi/v/causers)](https://pypi.org/project/causers/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/causers)](https://pypi.org/project/causers/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Coverage: 100%](https://img.shields.io/badge/Coverage-100%25-brightgreen.svg)](https://github.com/causers/causers)
 [![Documentation Status](https://readthedocs.org/projects/causers/badge/?version=latest)](https://causers.readthedocs.io/en/latest/?badge=latest)
 
-A high-performance statistical package for Polars (and pandas) DataFrames, powered by Rust.
+`causers` is a statistical library for Python that implements regression and causal inference methods directly on Polars DataFrames. It is written in Rust to ensure efficient performance and memory safety.
 
-## 🚀 Overview
+## Purpose
 
-`causers` provides blazing-fast statistical operations for both Polars and pandas DataFrames, leveraging Rust's performance through PyO3 bindings. Designed for data scientists and analysts who need production-grade performance without sacrificing ease of use.
+Data scientists working with Polars often face a friction point when they need to run statistical models: they must convert their efficient Polars DataFrames into pandas or NumPy arrays to use libraries like `statsmodels` or `scikit-learn`. This conversion can be costly in terms of memory and time, especially for large datasets.
 
-### ✨ Key Features
+`causers` solves this by providing native statistical routines that operate directly on Polars data. It uses Rust's linear algebra capabilities to perform computations efficiently, supporting standard errors, fixed effects, and bootstrap methods without the overhead of data conversion.
 
-- **🏎️ High Performance**: Linear regression on 1M rows in ~250ms with HC3 standard errors
-- **📊 Multiple Regression**: Support for multiple covariates with matrix-based OLS
-- **🔮 Logistic Regression**: Binary outcome regression with Newton-Raphson MLE, fixed effects via Mundlak strategy
-- **📈 Robust Standard Errors**: HC3 heteroskedasticity-consistent standard errors included
-- **🎯 Flexible Models**: Optional intercept for fully saturated models
-- **🏢 Clustered Standard Errors**: Cluster-robust SE for panel/grouped data
-- **🔄 Bootstrap Methods**: Wild cluster bootstrap (linear) and score bootstrap (logistic)
-- **📋 Two-Way Fixed Effects**: Panel data regression with entity and time fixed effects
-- **🧪 Synthetic DID**: Synthetic Difference-in-Differences for causal inference with panel data
-- **🎯 Synthetic Control**: Classic SC with 4 method variants (traditional, penalized, robust, augmented)
-- **🔬 Two-Stage Least Squares (IV)**: Instrumental variables estimation for causal inference with endogeneity
-- **🤖 Double Machine Learning**: Debiased/orthogonalized ML for causal inference with cross-fitting
-- **🔧 Native Polars Integration**: Zero-copy operations on Polars DataFrames
-- **🐼 pandas Support**: Seamlessly pass pandas DataFrames - automatic conversion with minimal overhead
-- **🦀 Rust-Powered**: Core computations in Rust for maximum throughput
-- **🐍 Pythonic API**: Clean, intuitive interface with full type hints
-- **🌍 Cross-Platform**: Works on Linux, macOS (Intel/ARM), and Windows
+## Installation
 
-## 📦 Installation
-
-### From PyPI (Recommended)
+You can install `causers` via pip. Pre-built wheels are available for Linux, macOS, and Windows.
 
 ```bash
+# Standard installation
 pip install causers
 
-# With pandas support
+# To include pandas support (if you need to pass pandas DataFrames)
 pip install causers[pandas]
 ```
 
-### From Source (Development)
+## Usage
 
-```bash
-# Prerequisites: Python 3.8+ and Rust 1.70+
-git clone https://github.com/causers/causers.git
-cd causers
+Here is a practical example of running a linear regression with robust standard errors on a Polars DataFrame.
 
-# Install build dependencies
-pip install "maturin>=1.4,<2.0" "polars>=0.52" numpy
+```python
+import polars as pl
+import causers
 
-# Build and install in development mode
-maturin develop --release
+# Create a sample DataFrame
+df = pl.DataFrame({
+    "x1": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    "x2": [0.5, 0.5, 1.0, 1.0, 1.5, 1.5],
+    "y": [2.1, 3.9, 6.2, 7.8, 10.1, 12.0],
+    "group": [1, 1, 2, 2, 3, 3]
+})
+
+# Run OLS regression: y ~ x1 + x2
+# Using HC3 robust standard errors by default
+result = causers.linear_regression(df, x_cols=["x1", "x2"], y_col="y")
+
+print(f"R²: {result.r_squared:.4f}")
+for i, (coef, se) in enumerate(zip(result.coefficients, result.standard_errors)):
+    print(f"x{i+1}: {coef:.4f} ± {se:.4f}")
+
+# Run with cluster-robust standard errors
+clustered_result = causers.linear_regression(
+    df, x_cols=["x1", "x2"], y_col="y", cluster="group"
+)
 ```
 
-## Quick Start
+The library supports Python type hints, so your IDE should provide autocompletion for function arguments and result objects.
 
-For comprehensive examples demonstrating all causers functions with realistic data, see benchmarking examples at `examples/benchmarks/` or [read the docs](https://causers.readthedocs.io/en/stable/).
+## Features
 
-## 🛠️ Development
+### Regression Models
+*   **Linear Regression (OLS):** Supports single and multiple covariates.
+*   **Logistic Regression:** Implemented via Newton-Raphson optimization for binary outcomes.
+*   **Robust Inference:** HC3 heteroskedasticity-consistent standard errors are used by default for OLS.
 
-### Prerequisites
+### Panel Data & Fixed Effects
+*   **Fixed Effects:** Absorb high-dimensional fixed effects (e.g., unit and time) efficiently.
+*   **Clustered Standard Errors:** Compute cluster-robust standard errors for grouped data.
+*   **Bootstrap Inference:** Implements **Wild Cluster Bootstrap** for linear models and **Score Bootstrap** for logistic models (recommended for small cluster counts).
+*   **Mundlak Approach:** Supports fixed effects in logistic regression via the Mundlak transformation.
 
-- Python 3.8 or higher
-- Rust 1.70 or higher
-- Polars 0.52 or higher
+### Causal Inference
+*   **Synthetic Difference-in-Differences (SDID):** Implements the Arkhangelsky et al. (2021) estimator with placebo bootstrap for inference.
+*   **Synthetic Control (SC):** Includes Traditional, Penalized, Robust, and Augmented variants.
+*   **Double Machine Learning (DML):** Debiased inference using cross-fitting (Chernozhukov et al., 2018).
+*   **Instrumental Variables (2SLS):** Two-Stage Least Squares estimation for endogeneity correction.
 
-### Building from Source
+### Diagnostics
+*   **Covariate Balance (`balance_check`):** Computes group means, variances, standard deviations, Standardized Mean Differences (SMD), variance ratios, and effective sample sizes (ESS) for treatment vs. control groups. Supports weighted analysis (e.g., inverse-propensity weights), automatic categorical expansion, and boolean covariates.
+
+### Performance
+*   **Rust Core:** All heavy lifting (matrix factorization, optimization loops) happens in Rust.
+*   **Parallelism:** Bootstrap methods (like Wild Cluster Bootstrap) utilize multi-threading via Rayon.
+*   **Memory Efficiency:** Zero-copy data access where possible.
+
+## Documentation
+
+Full documentation, including API references and theoretical background for the implemented methods, is available at [causers.readthedocs.io](https://causers.readthedocs.io).
+
+## Development
+
+To build `causers` from source, you will need the Rust toolchain (cargo) and a Python environment.
 
 ```bash
 # Clone the repository
 git clone https://github.com/causers/causers.git
 cd causers
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# Create a virtual environment
+python -m venv .venv
+source .venv/bin/activate
 
-# Install development dependencies
+# Install development dependencies and build the Rust extension
 pip install -e ".[dev]"
-
-# Build the Rust extension
 maturin develop --release
 ```
 
 ### Running Tests
 
-```bash
-# Install test dependencies (required for running tests)
-pip install -e ".[test]"
-
-# Run all tests with coverage
-pytest tests/ --cov=causers --cov-report=html
-
-# Run specific test categories
-pytest tests/test_performance.py -v  # Performance benchmarks
-pytest tests/test_edge_cases.py -v   # Edge case handling
-
-# Run Rust tests
-cargo test
-```
-
-### Code Quality
+The test suite uses `pytest`.
 
 ```bash
-# Format Python code
-black python/ tests/
+# Run all tests
+pytest tests/
 
-# Lint Python code
-ruff check python/ tests/
-
-# Type check
-mypy python/
-
-# Format Rust code
-cargo fmt
-
-# Lint Rust code
-cargo clippy
+# Run performance benchmarks (skipped by default)
+pytest tests/test_performance.py
 ```
 
-## 📜 License
+## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- [Polars](https://github.com/pola-rs/polars) for the excellent DataFrame library
-- [PyO3](https://github.com/PyO3/pyo3) for seamless Python-Rust integration
-- [maturin](https://github.com/PyO3/maturin) for simplified packaging
-
-## 📚 Resources
-
-- [Documentation](https://causers.readthedocs.io)
-- [API Reference](https://causers.readthedocs.io/en/stable/api/causers.html)
-- [GitHub Issues](https://github.com/causers/causers/issues)
-- [Discussions](https://github.com/causers/causers/discussions)
-
-## 🐛 Found a Bug?
-
-Please [open an issue](https://github.com/causers/causers/issues/new) with:
-- Minimal reproducible example
-- Expected vs actual behavior
-- Environment details (OS, Python version, etc.)
-
----
-
-Made with ❤️ and 🦀 by the causers team
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

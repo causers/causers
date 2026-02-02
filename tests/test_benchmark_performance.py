@@ -2767,6 +2767,248 @@ def test_iv2sls_faster_than_statsmodels():
 
 
 # ============================================================
+# Balance Check Benchmarks
+# ============================================================
+
+def generate_balance_data(
+    n_obs: int,
+    n_covariates: int,
+    weighted: bool = False,
+    seed: int = SEED
+) -> pl.DataFrame:
+    """Generate data for balance check benchmarks.
+
+    Args:
+        n_obs: Number of observations
+        n_covariates: Number of numeric covariates
+        weighted: Whether to include a weights column
+        seed: Random seed
+
+    Returns:
+        Polars DataFrame with treatment, covariates, and optionally weights
+    """
+    np.random.seed(seed)
+
+    # Binary treatment, roughly 50/50
+    treatment = np.random.binomial(1, 0.5, n_obs).astype(float)
+
+    # Numeric covariates
+    cov_data = {f"cov{i}": np.random.randn(n_obs).tolist() for i in range(n_covariates)}
+
+    data = {"treatment": treatment.tolist(), **cov_data}
+
+    if weighted:
+        weights = np.random.uniform(0.1, 2.0, n_obs)
+        data["w"] = weights.tolist()
+
+    return pl.DataFrame(data)
+
+
+def benchmark_balance_100k() -> Dict[str, Any]:
+    """Benchmark balance_check with 100K rows, 50 covariates.
+
+    Performance target: < 100ms median.
+    """
+    from causers import balance_check
+
+    print("\n" + "=" * 80)
+    print("BALANCE CHECK: 100K rows, 50 covariates (unweighted)")
+    print("=" * 80)
+
+    n_obs = 100_000
+    n_covariates = 50
+    target_ms = 100.0
+
+    df = generate_balance_data(n_obs, n_covariates)
+    cov_cols = [f"cov{i}" for i in range(n_covariates)]
+
+    def run_causers(_df=df, _cov_cols=cov_cols):
+        return balance_check(_df, "treatment", _cov_cols)
+
+    timing = time_function(run_causers, warmup=2, n_iter=10)
+
+    meets_target = timing["median_ms"] < target_ms
+    status = "PASS" if meets_target else "FAIL"
+    print(f"  Median: {timing['median_ms']:.2f}ms  (target: <{target_ms:.0f}ms)  [{status}]")
+    print(f"  Min: {timing['min_ms']:.2f}ms  Max: {timing['max_ms']:.2f}ms")
+
+    return {
+        "Config": "100K rows, 50 covariates",
+        "n_obs": n_obs,
+        "n_covariates": n_covariates,
+        "weighted": False,
+        "causers_ms": timing["median_ms"],
+        "target_ms": target_ms,
+        "meets_target": meets_target,
+    }
+
+
+def benchmark_balance_1m() -> Dict[str, Any]:
+    """Benchmark balance_check with 1M rows, 100 covariates.
+
+    Performance target: < 1000ms median.
+    """
+    from causers import balance_check
+
+    print("\n" + "=" * 80)
+    print("BALANCE CHECK: 1M rows, 100 covariates (unweighted)")
+    print("=" * 80)
+
+    n_obs = 1_000_000
+    n_covariates = 100
+    target_ms = 1000.0
+
+    df = generate_balance_data(n_obs, n_covariates)
+    cov_cols = [f"cov{i}" for i in range(n_covariates)]
+
+    def run_causers(_df=df, _cov_cols=cov_cols):
+        return balance_check(_df, "treatment", _cov_cols)
+
+    timing = time_function(run_causers, warmup=1, n_iter=5)
+
+    meets_target = timing["median_ms"] < target_ms
+    status = "PASS" if meets_target else "FAIL"
+    print(f"  Median: {timing['median_ms']:.2f}ms  (target: <{target_ms:.0f}ms)  [{status}]")
+    print(f"  Min: {timing['min_ms']:.2f}ms  Max: {timing['max_ms']:.2f}ms")
+
+    return {
+        "Config": "1M rows, 100 covariates",
+        "n_obs": n_obs,
+        "n_covariates": n_covariates,
+        "weighted": False,
+        "causers_ms": timing["median_ms"],
+        "target_ms": target_ms,
+        "meets_target": meets_target,
+    }
+
+
+def benchmark_balance_weighted_100k() -> Dict[str, Any]:
+    """Benchmark balance_check with 100K rows, 50 covariates, weighted.
+
+    Performance target: < 150ms median.
+    """
+    from causers import balance_check
+
+    print("\n" + "=" * 80)
+    print("BALANCE CHECK: 100K rows, 50 covariates (weighted)")
+    print("=" * 80)
+
+    n_obs = 100_000
+    n_covariates = 50
+    target_ms = 150.0
+
+    df = generate_balance_data(n_obs, n_covariates, weighted=True)
+    cov_cols = [f"cov{i}" for i in range(n_covariates)]
+
+    def run_causers(_df=df, _cov_cols=cov_cols):
+        return balance_check(_df, "treatment", _cov_cols, weights="w")
+
+    timing = time_function(run_causers, warmup=2, n_iter=10)
+
+    meets_target = timing["median_ms"] < target_ms
+    status = "PASS" if meets_target else "FAIL"
+    print(f"  Median: {timing['median_ms']:.2f}ms  (target: <{target_ms:.0f}ms)  [{status}]")
+    print(f"  Min: {timing['min_ms']:.2f}ms  Max: {timing['max_ms']:.2f}ms")
+
+    return {
+        "Config": "100K rows, 50 covariates, weighted",
+        "n_obs": n_obs,
+        "n_covariates": n_covariates,
+        "weighted": True,
+        "causers_ms": timing["median_ms"],
+        "target_ms": target_ms,
+        "meets_target": meets_target,
+    }
+
+
+def benchmark_balance_vs_numpy() -> Dict[str, Any]:
+    """Benchmark balance_check vs a pure-numpy SMD implementation.
+
+    N=100,000 rows, K=10 covariates.
+    Prints the speedup factor of causers over numpy.
+    """
+    from causers import balance_check
+
+    print("\n" + "=" * 80)
+    print("BALANCE CHECK: causers vs numpy reference (100K rows, 10 covariates)")
+    print("=" * 80)
+
+    n_obs = 100_000
+    n_covariates = 10
+    np.random.seed(SEED)
+
+    # Generate raw arrays for the numpy reference
+    treatment = np.random.binomial(1, 0.5, n_obs).astype(float)
+    covariates = np.random.randn(n_obs, n_covariates)
+
+    # Build polars DataFrame for causers
+    cov_cols = [f"cov{i}" for i in range(n_covariates)]
+    cov_data = {f"cov{i}": covariates[:, i].tolist() for i in range(n_covariates)}
+    df = pl.DataFrame({"treatment": treatment.tolist(), **cov_data})
+
+    # --- numpy reference: group means, pooled SD, SMD ---
+    def numpy_balance(_treatment=treatment, _covariates=covariates):
+        treated_mask = _treatment == 1.0
+        control_mask = ~treated_mask
+        treated_cov = _covariates[treated_mask]
+        control_cov = _covariates[control_mask]
+
+        treated_mean = treated_cov.mean(axis=0)
+        control_mean = control_cov.mean(axis=0)
+        treated_var = treated_cov.var(axis=0, ddof=1)
+        control_var = control_cov.var(axis=0, ddof=1)
+
+        pooled_sd = np.sqrt((treated_var + control_var) / 2.0)
+        smd = (treated_mean - control_mean) / np.where(pooled_sd > 0, pooled_sd, 1.0)
+        return smd
+
+    def run_causers(_df=df, _cov_cols=cov_cols):
+        return balance_check(_df, "treatment", _cov_cols)
+
+    causers_timing = time_function(run_causers, warmup=2, n_iter=10)
+    numpy_timing = time_function(numpy_balance, warmup=2, n_iter=10)
+
+    speedup = numpy_timing["median_ms"] / causers_timing["median_ms"]
+
+    print(f"  causers : {causers_timing['median_ms']:.2f}ms  (min {causers_timing['min_ms']:.2f}, max {causers_timing['max_ms']:.2f})")
+    print(f"  numpy   : {numpy_timing['median_ms']:.2f}ms  (min {numpy_timing['min_ms']:.2f}, max {numpy_timing['max_ms']:.2f})")
+    status = "FASTER" if speedup > 1.0 else "SLOWER"
+    print(f"  Speedup : {speedup:.2f}x  [{status}]")
+
+    return {
+        "Config": "vs numpy (100K, 10 covariates)",
+        "n_obs": n_obs,
+        "n_covariates": n_covariates,
+        "causers_ms": causers_timing["median_ms"],
+        "numpy_ms": numpy_timing["median_ms"],
+        "speedup": speedup,
+        "faster": speedup > 1.0,
+    }
+
+
+def print_balance_benchmark_summary(results: List[Dict[str, Any]]) -> None:
+    """Print formatted summary table for balance check benchmarks."""
+    if not results:
+        return
+
+    print("\n" + "=" * 80)
+    print("BALANCE CHECK PERFORMANCE BENCHMARKS SUMMARY")
+    print("=" * 80)
+
+    # Header
+    print(f"{'Config':<45} | {'causers (ms)':<12} | {'Target (ms)':<12} | {'Status':<8}")
+    print("-" * 45 + "-|-" + "-" * 12 + "-|-" + "-" * 12 + "-|-" + "-" * 8)
+
+    for r in results:
+        if "target_ms" in r:
+            status = "PASS" if r.get("meets_target", False) else "FAIL"
+            print(f"{r['Config']:<45} | {r['causers_ms']:<12.2f} | {r['target_ms']:<12.0f} | {status:<8}")
+        elif "speedup" in r:
+            status = "FASTER" if r.get("faster", False) else "SLOWER"
+            print(f"{r['Config']:<45} | {r['causers_ms']:<12.2f} | {'n/a':<12} | {r['speedup']:.2f}x {status}")
+
+
+# ============================================================
 # Main Function
 # ============================================================
 
@@ -2823,7 +3065,14 @@ def main() -> int:
     
     # Run IV/2SLS benchmarks
     iv2sls_results = benchmark_iv2sls()
-    
+
+    # Run balance check benchmarks
+    balance_results = []
+    balance_results.append(benchmark_balance_100k())
+    balance_results.append(benchmark_balance_1m())
+    balance_results.append(benchmark_balance_weighted_100k())
+    balance_results.append(benchmark_balance_vs_numpy())
+
     # Print detailed summaries
     print_comprehensive_lr_summary(lr_comprehensive_results)
     print_comprehensive_lr_fe_summary(lr_fe_results)
@@ -2832,7 +3081,8 @@ def main() -> int:
     print_synthetic_control_summary(sc_results)
     print_dml_benchmark_summary(dml_results)
     print_iv2sls_benchmark_summary(iv2sls_results)
-    
+    print_balance_benchmark_summary(balance_results)
+
     # Print summary and get pass/fail
     # Include logit_fe_results in the overall assessment
     all_logit_fe = logit_fe_results if logit_fe_results else []

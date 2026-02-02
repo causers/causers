@@ -385,9 +385,7 @@ impl CrossFitter {
     /// If seed is None, uses deterministic row-order assignment.
     pub fn new(n_samples: usize, n_folds: usize, seed: Option<u64>) -> Result<Self, DMLError> {
         if n_folds < 2 {
-            return Err(DMLError::InvalidFolds {
-                n_folds,
-            });
+            return Err(DMLError::InvalidFolds { n_folds });
         }
 
         if n_folds >= n_samples {
@@ -871,7 +869,9 @@ fn validate_binary_treatment(d: &[f64]) -> Result<(), DMLError> {
 
     // For binary treatment, we expect exactly 0 and 1
     // Check if all values are 0 or 1
-    let is_binary = d.iter().all(|&v| (v - 0.0).abs() < 1e-10 || (v - 1.0).abs() < 1e-10);
+    let is_binary = d
+        .iter()
+        .all(|&v| (v - 0.0).abs() < 1e-10 || (v - 1.0).abs() < 1e-10);
 
     if !is_binary && unique_count > 2 {
         // This is a multi-valued categorical treatment - not supported
@@ -1201,10 +1201,8 @@ pub fn compute_dml(
 
     // Build cluster info if cluster_ids provided
     let cluster_info: Option<ClusterInfo> = if let Some(ids) = cluster_ids {
-        let info = build_cluster_indices(ids).map_err(|_| {
-            DMLError::NumericalInstability {
-                message: "Failed to build cluster indices".to_string(),
-            }
+        let info = build_cluster_indices(ids).map_err(|_| DMLError::NumericalInstability {
+            message: "Failed to build cluster indices".to_string(),
         })?;
         if info.n_clusters < 2 {
             return Err(DMLError::InsufficientClusters {
@@ -1522,7 +1520,8 @@ mod tests {
             sizes: vec![2, 2],
         };
 
-        let var = neyman_orthogonal_variance_clustered(&y_residual, &d_residual, theta, &cluster_info);
+        let var =
+            neyman_orthogonal_variance_clustered(&y_residual, &d_residual, theta, &cluster_info);
 
         // Variance should be positive and finite
         assert!(var > 0.0);
@@ -1544,7 +1543,8 @@ mod tests {
         };
 
         let iid_var = neyman_orthogonal_variance(&y_residual, &d_residual, theta);
-        let cluster_var = neyman_orthogonal_variance_clustered(&y_residual, &d_residual, theta, &cluster_info);
+        let cluster_var =
+            neyman_orthogonal_variance_clustered(&y_residual, &d_residual, theta, &cluster_info);
 
         // With strong within-cluster correlation, cluster variance should be larger
         // This is a characteristic property of cluster-robust SEs

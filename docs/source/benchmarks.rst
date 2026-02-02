@@ -33,6 +33,18 @@ Each benchmark notebook compares a ``causers`` function against its reference im
      - azcausal SDID
      - rtol=1e-6
      - rtol=0.5 (bootstrap)
+   * - ``dml``
+     - Manual cross-fitting
+     - rtol=1e-4
+     - rtol=1e-2
+   * - ``two_stage_least_squares``
+     - statsmodels IV2SLS
+     - rtol=1e-6
+     - rtol=1e-5
+   * - ``balance_check``
+     - Manual NumPy
+     - rtol=1e-6 (SMD)
+     - N/A (variance ratio rtol=1e-6)
 
 Methodology
 -----------
@@ -71,3 +83,6 @@ Benchmark Notebooks
    ../../examples/benchmarks/logistic_regression
    ../../examples/benchmarks/synthetic_control
    ../../examples/benchmarks/synthetic_did
+   ../../examples/benchmarks/dml
+   ../../examples/benchmarks/iv_2sls
+   ../../examples/benchmarks/balance_diagnostics

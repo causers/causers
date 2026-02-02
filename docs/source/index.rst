@@ -32,8 +32,12 @@ Features
 * Linear regression with HC3 robust standard errors
 * Logistic regression with Newton-Raphson MLE
 * Cluster-robust standard errors (analytical and bootstrap)
+* Fixed effects (within-transformation for OLS, Mundlak for logistic)
 * Synthetic Difference-in-Differences (SDID)
 * Synthetic Control (SC) with 4 method variants
+* Double Machine Learning (DML) with cross-fitting
+* Two-Stage Least Squares (IV/2SLS) with weak instrument diagnostics
+* Covariate balance diagnostics (SMD, variance ratios, weighted ESS)
 
 Indices and tables
 ==================

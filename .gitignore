@@ -14,6 +14,9 @@ dist/
 .governor/
 wheels/
 
+# Jupyter
+.ipynb_checkpoints/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -40,13 +43,14 @@ Cargo.lock
 # Environment
 .devcontainer
 .env
+.claude
 .roo
 .venv
+CLAUDE.md
 env/
 venv/
 ENV/
-env.bak/
-venv.bak/
+scripts/claude-hooks/
 scratch
 
 # IDE

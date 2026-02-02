@@ -270,7 +270,7 @@ impl TwoStageLSResult {
     fn p_values(&self) -> Vec<f64> {
         let df = self.degrees_of_freedom();
         let t_stats = self.t_statistics();
-        
+
         // Create t-distribution with df degrees of freedom
         // If df <= 0, fall back to large sample (normal approximation)
         if df <= 0.0 {
@@ -333,9 +333,10 @@ impl TwoStageLSResult {
     fn confidence_intervals(&self, alpha: f64) -> PyResult<Vec<(f64, f64)>> {
         // Validate alpha
         if alpha <= 0.0 || alpha >= 1.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("alpha must be in (0, 1); got {}", alpha)
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "alpha must be in (0, 1); got {}",
+                alpha
+            )));
         }
 
         let df = self.degrees_of_freedom();
@@ -370,33 +371,52 @@ impl TwoStageLSResult {
         let df = self.degrees_of_freedom();
 
         let mut s = String::new();
-        
+
         // Header
         s.push_str("\n");
-        s.push_str("                          IV-2SLS Regression Results                           \n");
-        s.push_str("==============================================================================\n");
-        
+        s.push_str(
+            "                          IV-2SLS Regression Results                           \n",
+        );
+        s.push_str(
+            "==============================================================================\n",
+        );
+
         // Model info
-        s.push_str(&format!("Dep. Variable:           Y          No. Observations:       {:>10}\n", self.n_samples));
-        s.push_str(&format!("Model:                   IV-2SLS    Df Residuals:           {:>10.0}\n", df));
-        s.push_str(&format!("R-squared:               {:.4}      Df Model:               {:>10}\n",
-            self.r_squared, self.coefficients.len()));
+        s.push_str(&format!(
+            "Dep. Variable:           Y          No. Observations:       {:>10}\n",
+            self.n_samples
+        ));
+        s.push_str(&format!(
+            "Model:                   IV-2SLS    Df Residuals:           {:>10.0}\n",
+            df
+        ));
+        s.push_str(&format!(
+            "R-squared:               {:.4}      Df Model:               {:>10}\n",
+            self.r_squared,
+            self.coefficients.len()
+        ));
         s.push_str(&format!("SE Type:                 {:10}\n", self.se_type));
-        
+
         if let Some(n_clust) = self.n_clusters {
             s.push_str(&format!("No. Clusters:            {:>10}\n", n_clust));
         }
-        
-        s.push_str("------------------------------------------------------------------------------\n");
-        
+
+        s.push_str(
+            "------------------------------------------------------------------------------\n",
+        );
+
         // First-stage diagnostics
         s.push_str("First-Stage Diagnostics:\n");
         for (i, f_stat) in self.first_stage_f.iter().enumerate() {
             let weak_indicator = if *f_stat < 10.0 { " [WEAK]" } else { "" };
-            s.push_str(&format!("  Endogenous {}: F-statistic = {:.2}{}\n",
-                i + 1, f_stat, weak_indicator));
+            s.push_str(&format!(
+                "  Endogenous {}: F-statistic = {:.2}{}\n",
+                i + 1,
+                f_stat,
+                weak_indicator
+            ));
         }
-        
+
         if let Some(cd) = self.cragg_donald {
             let sy_info = match self.stock_yogo_critical {
                 Some(critical) if cd < critical => format!(" < {:.2} (10% bias)", critical),
@@ -405,30 +425,38 @@ impl TwoStageLSResult {
             };
             s.push_str(&format!("  Cragg-Donald Statistic: {:.2}{}\n", cd, sy_info));
         }
-        
-        s.push_str("------------------------------------------------------------------------------\n");
-        
+
+        s.push_str(
+            "------------------------------------------------------------------------------\n",
+        );
+
         // Coefficient table header
         s.push_str(&format!(
             "{:>12} {:>10} {:>10} {:>8} {:>8} {:>12} {:>12}\n",
             "", "coef", "std err", "t", "P>|t|", "[0.025", "0.975]"
         ));
-        s.push_str("------------------------------------------------------------------------------\n");
-        
+        s.push_str(
+            "------------------------------------------------------------------------------\n",
+        );
+
         // Intercept (if present)
         if let (Some(intercept), Some(intercept_se)) = (self.intercept, self.intercept_se) {
-            let int_t = if intercept_se > 0.0 { intercept / intercept_se } else { 0.0 };
+            let int_t = if intercept_se > 0.0 {
+                intercept / intercept_se
+            } else {
+                0.0
+            };
             let int_p = self.compute_p_value_single(int_t, df);
             let t_crit = self.compute_t_critical(0.05, df);
             let int_ci_low = intercept - t_crit * intercept_se;
             let int_ci_high = intercept + t_crit * intercept_se;
-            
+
             s.push_str(&format!(
                 "{:>12} {:>10.4} {:>10.4} {:>8.3} {:>8.3} {:>12.3} {:>12.3}\n",
                 "const", intercept, intercept_se, int_t, int_p, int_ci_low, int_ci_high
             ));
         }
-        
+
         // Coefficient rows
         for (i, ((((coef, se), t), p), ci)) in self
             .coefficients
@@ -444,42 +472,50 @@ impl TwoStageLSResult {
             } else {
                 format!("z{}", i + 1 - self.n_endogenous)
             };
-            
+
             s.push_str(&format!(
                 "{:>12} {:>10.4} {:>10.4} {:>8.3} {:>8.3} {:>12.3} {:>12.3}\n",
                 var_name, coef, se, t, p, ci.0, ci.1
             ));
         }
-        
-        s.push_str("==============================================================================\n");
-        
+
+        s.push_str(
+            "==============================================================================\n",
+        );
+
         // Significance codes
         let stars: Vec<&str> = p_values
             .iter()
             .map(|&p| {
-                if p < 0.001 { "***" }
-                else if p < 0.01 { "**" }
-                else if p < 0.05 { "*" }
-                else if p < 0.1 { "." }
-                else { "" }
+                if p < 0.001 {
+                    "***"
+                } else if p < 0.01 {
+                    "**"
+                } else if p < 0.05 {
+                    "*"
+                } else if p < 0.1 {
+                    "."
+                } else {
+                    ""
+                }
             })
             .collect();
-        
+
         if stars.iter().any(|s| !s.is_empty()) {
             s.push_str("Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1\n");
         }
-        
+
         // Warnings
         if self.first_stage_f.iter().any(|&f| f < 10.0) {
             s.push_str("\nWarning: Weak instruments detected (first-stage F < 10).\n");
         }
-        
+
         if let (Some(cd), Some(critical)) = (self.cragg_donald, self.stock_yogo_critical) {
             if cd < critical {
                 s.push_str("\nWarning: Cragg-Donald statistic below Stock-Yogo critical value.\n");
             }
         }
-        
+
         s
     }
 }
@@ -504,12 +540,12 @@ impl TwoStageLSResult {
                 let target = 1.0 - alpha / 2.0;
                 let mut low = 0.0;
                 let mut high = 10.0;
-                
+
                 // Expand high if needed
                 while t_dist.cdf(high) < target && high < 1000.0 {
                     high *= 2.0;
                 }
-                
+
                 // Binary search
                 for _ in 0..100 {
                     let mid = (low + high) / 2.0;
@@ -519,7 +555,7 @@ impl TwoStageLSResult {
                         high = mid;
                     }
                 }
-                
+
                 (low + high) / 2.0
             }
             Err(_) => normal_quantile_approx(1.0 - alpha / 2.0),
@@ -530,17 +566,29 @@ impl TwoStageLSResult {
     fn compute_p_value_single(&self, t_stat: f64, df: f64) -> f64 {
         if df <= 0.0 {
             let abs_t = t_stat.abs();
-            return if abs_t.is_infinite() { 0.0 } else { 2.0 * (1.0 - normal_cdf_approx(abs_t)) };
+            return if abs_t.is_infinite() {
+                0.0
+            } else {
+                2.0 * (1.0 - normal_cdf_approx(abs_t))
+            };
         }
 
         match StudentsT::new(0.0, 1.0, df) {
             Ok(t_dist) => {
                 let abs_t = t_stat.abs();
-                if abs_t.is_infinite() { 0.0 } else { 2.0 * (1.0 - t_dist.cdf(abs_t)) }
+                if abs_t.is_infinite() {
+                    0.0
+                } else {
+                    2.0 * (1.0 - t_dist.cdf(abs_t))
+                }
             }
             Err(_) => {
                 let abs_t = t_stat.abs();
-                if abs_t.is_infinite() { 0.0 } else { 2.0 * (1.0 - normal_cdf_approx(abs_t)) }
+                if abs_t.is_infinite() {
+                    0.0
+                } else {
+                    2.0 * (1.0 - normal_cdf_approx(abs_t))
+                }
             }
         }
     }
@@ -558,13 +606,21 @@ fn normal_cdf_approx(x: f64) -> f64 {
     let pdf = (-x * x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt();
     let cdf = 1.0 - pdf * t * (d1 + t * (d2 + t * (d3 + t * (d4 + t * d5))));
 
-    if x >= 0.0 { cdf } else { 1.0 - cdf }
+    if x >= 0.0 {
+        cdf
+    } else {
+        1.0 - cdf
+    }
 }
 
 /// Standard normal quantile (inverse CDF) approximation using Abramowitz and Stegun (26.2.23).
 fn normal_quantile_approx(p: f64) -> f64 {
-    if p <= 0.0 { return f64::NEG_INFINITY; }
-    if p >= 1.0 { return f64::INFINITY; }
+    if p <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if p >= 1.0 {
+        return f64::INFINITY;
+    }
 
     let t = if p < 0.5 {
         (-2.0 * p.ln()).sqrt()
@@ -581,7 +637,11 @@ fn normal_quantile_approx(p: f64) -> f64 {
 
     let z = t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t);
 
-    if p < 0.5 { -z } else { z }
+    if p < 0.5 {
+        -z
+    } else {
+        z
+    }
 }
 
 // ============================================================================
@@ -1203,7 +1263,7 @@ fn compute_cragg_donald(
         // Variance of D̃_j = diag(D̃'D̃) / n
         total_var += dtd.read(j, j) / n;
     }
-    let sigma2 = total_var / (n_endog as f64);  // Average variance across endogenous vars
+    let sigma2 = total_var / (n_endog as f64); // Average variance across endogenous vars
 
     if sigma2 <= 0.0 {
         return None;
